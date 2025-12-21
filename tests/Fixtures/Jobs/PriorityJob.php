@@ -19,7 +19,7 @@ use Lettermint\RabbitMQ\Contracts\HasPriority;
     quorum: false,
     maxPriority: 10,
 )]
-class PriorityJob implements ShouldQueue, HasPriority
+class PriorityJob implements HasPriority, ShouldQueue
 {
     use InteractsWithQueue;
     use Queueable;

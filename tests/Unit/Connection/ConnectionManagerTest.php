@@ -98,14 +98,7 @@ describe('ConnectionManager with mocked connection', function () {
     it('reuses existing connected connection', function () {
         $mockConnection = mockAMQPConnection(connected: true);
 
-        $manager = new class([
-            'default' => 'test',
-            'connections' => [
-                'test' => [
-                    'hosts' => [['host' => 'localhost']],
-                ],
-            ],
-        ], $mockConnection) extends ConnectionManager
+        $manager = new class(['default' => 'test', 'connections' => ['test' => ['hosts' => [['host' => 'localhost']]]]], $mockConnection) extends ConnectionManager
         {
             public function __construct(array $config, private $mockConnection)
             {
@@ -129,14 +122,7 @@ describe('ConnectionManager with mocked connection', function () {
         $mockConnection->shouldReceive('reconnect')->once()->andReturn(true);
         $mockConnection->shouldReceive('isConnected')->andReturn(false, true);
 
-        $manager = new class([
-            'default' => 'test',
-            'connections' => [
-                'test' => [
-                    'hosts' => [['host' => 'localhost']],
-                ],
-            ],
-        ], $mockConnection) extends ConnectionManager
+        $manager = new class(['default' => 'test', 'connections' => ['test' => ['hosts' => [['host' => 'localhost']]]]], $mockConnection) extends ConnectionManager
         {
             public function __construct(array $config, private $mockConnection)
             {
@@ -159,17 +145,7 @@ describe('ConnectionManager with mocked connection', function () {
         $primaryFailed = false;
         $mockConnection = mockAMQPConnection(connected: true);
 
-        $manager = new class([
-            'default' => 'test',
-            'connections' => [
-                'test' => [
-                    'hosts' => [
-                        ['host' => 'primary'],
-                        ['host' => 'fallback'],
-                    ],
-                ],
-            ],
-        ], $mockConnection, $primaryFailed) extends ConnectionManager
+        $manager = new class(['default' => 'test', 'connections' => ['test' => ['hosts' => [['host' => 'primary'], ['host' => 'fallback']]]]], $mockConnection, $primaryFailed) extends ConnectionManager
         {
             private bool $firstAttempt = true;
 
@@ -199,17 +175,7 @@ describe('ConnectionManager with mocked connection', function () {
     });
 
     it('throws after all hosts fail', function () {
-        $manager = new class([
-            'default' => 'test',
-            'connections' => [
-                'test' => [
-                    'hosts' => [
-                        ['host' => 'host1'],
-                        ['host' => 'host2'],
-                    ],
-                ],
-            ],
-        ]) extends ConnectionManager
+        $manager = new class(['default' => 'test', 'connections' => ['test' => ['hosts' => [['host' => 'host1'], ['host' => 'host2']]]]]) extends ConnectionManager
         {
             protected function createConnectionToHost(array $host, array $options, array $ssl): \AMQPConnection
             {
@@ -227,9 +193,7 @@ describe('ConnectionManager with mocked connection', function () {
         // isConnected() called: 1) connection() check, 2) disconnect() check, 3) isConnected('test') assertion
         $mockConnection->shouldReceive('isConnected')->andReturn(true, true, false);
 
-        $manager = new class([
-            'connections' => ['test' => ['hosts' => [['host' => 'localhost']]]],
-        ], $mockConnection) extends ConnectionManager
+        $manager = new class(['connections' => ['test' => ['hosts' => [['host' => 'localhost']]]]], $mockConnection) extends ConnectionManager
         {
             public function __construct(array $config, private $mockConnection)
             {

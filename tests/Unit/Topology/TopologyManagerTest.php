@@ -7,7 +7,6 @@ use Lettermint\RabbitMQ\Attributes\Exchange;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Discovery\AttributeScanner;
 use Lettermint\RabbitMQ\Enums\ExchangeType;
-use Lettermint\RabbitMQ\Exceptions\TopologyException;
 use Lettermint\RabbitMQ\Topology\TopologyManager;
 
 describe('TopologyManager', function () {
@@ -279,12 +278,8 @@ describe('TopologyManager', function () {
             $mockQueue = mockAMQPQueue('test-queue');
             $mockQueue->shouldReceive('purge')->once()->andReturn(42);
 
-            $manager = new class(
-                $this->channelManager,
-                $this->scanner,
-                $this->config,
-                $mockQueue
-            ) extends TopologyManager {
+            $manager = new class($this->channelManager, $this->scanner, $this->config, $mockQueue) extends TopologyManager
+            {
                 public function __construct(
                     ChannelManager $channelManager,
                     AttributeScanner $scanner,
@@ -309,12 +304,8 @@ describe('TopologyManager', function () {
             $mockQueue = mockAMQPQueue('test-queue');
             $mockQueue->shouldReceive('delete')->once();
 
-            $manager = new class(
-                $this->channelManager,
-                $this->scanner,
-                $this->config,
-                $mockQueue
-            ) extends TopologyManager {
+            $manager = new class($this->channelManager, $this->scanner, $this->config, $mockQueue) extends TopologyManager
+            {
                 public function __construct(
                     ChannelManager $channelManager,
                     AttributeScanner $scanner,

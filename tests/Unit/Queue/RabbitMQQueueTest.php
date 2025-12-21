@@ -8,7 +8,6 @@ use Lettermint\RabbitMQ\Attributes\ConsumesQueue;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Contracts\HasPriority;
 use Lettermint\RabbitMQ\Discovery\AttributeScanner;
-use Lettermint\RabbitMQ\Exceptions\PublishException;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
 use Lettermint\RabbitMQ\Tests\Fixtures\Jobs\PriorityJob;
 use Lettermint\RabbitMQ\Tests\Fixtures\Jobs\SimpleJob;
@@ -150,12 +149,8 @@ describe('RabbitMQQueue', function () {
             $mockQueue->shouldReceive('get')->once()->andReturn($envelope);
 
             // Create a testable queue that returns our mocked queue
-            $queue = new class(
-                $this->channelManager,
-                $this->scanner,
-                $this->config,
-                $mockQueue
-            ) extends RabbitMQQueue {
+            $queue = new class($this->channelManager, $this->scanner, $this->config, $mockQueue) extends RabbitMQQueue
+            {
                 public function __construct(
                     ChannelManager $channelManager,
                     AttributeScanner $scanner,

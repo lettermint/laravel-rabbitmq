@@ -90,6 +90,7 @@ if (! class_exists('AMQPConnection')) {
     class AMQPConnection
     {
         protected array $credentials = [];
+
         protected bool $connected = false;
 
         public function __construct(?array $credentials = null)
@@ -100,36 +101,42 @@ if (! class_exists('AMQPConnection')) {
         public function connect(): bool
         {
             $this->connected = true;
+
             return true;
         }
 
         public function pconnect(): bool
         {
             $this->connected = true;
+
             return true;
         }
 
         public function reconnect(): bool
         {
             $this->connected = true;
+
             return true;
         }
 
         public function preconnect(): bool
         {
             $this->connected = true;
+
             return true;
         }
 
         public function disconnect(): bool
         {
             $this->connected = false;
+
             return true;
         }
 
         public function pdisconnect(): bool
         {
             $this->connected = false;
+
             return true;
         }
 
@@ -161,30 +168,35 @@ if (! class_exists('AMQPConnection')) {
         public function setHost(string $host): AMQPConnection
         {
             $this->credentials['host'] = $host;
+
             return $this;
         }
 
         public function setPort(int $port): AMQPConnection
         {
             $this->credentials['port'] = $port;
+
             return $this;
         }
 
         public function setLogin(string $login): AMQPConnection
         {
             $this->credentials['login'] = $login;
+
             return $this;
         }
 
         public function setPassword(string $password): AMQPConnection
         {
             $this->credentials['password'] = $password;
+
             return $this;
         }
 
         public function setVhost(string $vhost): AMQPConnection
         {
             $this->credentials['vhost'] = $vhost;
+
             return $this;
         }
 
@@ -219,7 +231,9 @@ if (! class_exists('AMQPChannel')) {
     class AMQPChannel
     {
         protected ?AMQPConnection $connection = null;
+
         protected bool $connected = true;
+
         protected int $id = 1;
 
         public function __construct(AMQPConnection $connection)
@@ -267,9 +281,7 @@ if (! class_exists('AMQPChannel')) {
             return true;
         }
 
-        public function waitForConfirm(float $timeout = 0.0): void
-        {
-        }
+        public function waitForConfirm(float $timeout = 0.0): void {}
 
         public function startTransaction(): bool
         {
@@ -292,8 +304,11 @@ if (! class_exists('AMQPQueue')) {
     class AMQPQueue
     {
         protected ?AMQPChannel $channel = null;
+
         protected string $name = '';
+
         protected int $flags = AMQP_DURABLE;
+
         protected array $arguments = [];
 
         public function __construct(AMQPChannel $channel)
@@ -304,6 +319,7 @@ if (! class_exists('AMQPQueue')) {
         public function setName(string $name): bool
         {
             $this->name = $name;
+
             return true;
         }
 
@@ -315,6 +331,7 @@ if (! class_exists('AMQPQueue')) {
         public function setFlags(int $flags): bool
         {
             $this->flags = $flags;
+
             return true;
         }
 
@@ -326,12 +343,14 @@ if (! class_exists('AMQPQueue')) {
         public function setArguments(array $arguments): bool
         {
             $this->arguments = $arguments;
+
             return true;
         }
 
         public function setArgument(string $key, mixed $value): bool
         {
             $this->arguments[$key] = $value;
+
             return true;
         }
 
@@ -370,9 +389,7 @@ if (! class_exists('AMQPQueue')) {
             return null;
         }
 
-        public function consume(?callable $callback = null, int $flags = AMQP_NOPARAM, ?string $tag = null): void
-        {
-        }
+        public function consume(?callable $callback = null, int $flags = AMQP_NOPARAM, ?string $tag = null): void {}
 
         public function cancel(string $tag = ''): bool
         {
@@ -405,9 +422,13 @@ if (! class_exists('AMQPExchange')) {
     class AMQPExchange
     {
         protected ?AMQPChannel $channel = null;
+
         protected string $name = '';
+
         protected string $type = 'topic';
+
         protected int $flags = AMQP_DURABLE;
+
         protected array $arguments = [];
 
         public function __construct(AMQPChannel $channel)
@@ -418,6 +439,7 @@ if (! class_exists('AMQPExchange')) {
         public function setName(string $name): bool
         {
             $this->name = $name;
+
             return true;
         }
 
@@ -429,6 +451,7 @@ if (! class_exists('AMQPExchange')) {
         public function setType(string $type): bool
         {
             $this->type = $type;
+
             return true;
         }
 
@@ -440,6 +463,7 @@ if (! class_exists('AMQPExchange')) {
         public function setFlags(int $flags): bool
         {
             $this->flags = $flags;
+
             return true;
         }
 
@@ -451,12 +475,14 @@ if (! class_exists('AMQPExchange')) {
         public function setArguments(array $arguments): bool
         {
             $this->arguments = $arguments;
+
             return true;
         }
 
         public function setArgument(string $key, mixed $value): bool
         {
             $this->arguments[$key] = $value;
+
             return true;
         }
 
@@ -501,23 +527,41 @@ if (! class_exists('AMQPEnvelope')) {
     class AMQPEnvelope
     {
         protected string $body = '';
+
         protected int $deliveryTag = 0;
+
         protected string $routingKey = '';
+
         protected string $exchange = '';
+
         protected bool $redelivered = false;
+
         protected string $contentType = 'text/plain';
+
         protected string $contentEncoding = '';
+
         protected array $headers = [];
+
         protected int $deliveryMode = 2;
+
         protected int $priority = 0;
+
         protected string $correlationId = '';
+
         protected string $replyTo = '';
+
         protected string $expiration = '';
+
         protected string $messageId = '';
+
         protected int $timestamp = 0;
+
         protected string $type = '';
+
         protected string $userId = '';
+
         protected string $appId = '';
+
         protected string $clusterId = '';
 
         public function getBody(): string
