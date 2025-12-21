@@ -21,8 +21,8 @@ jobs:
       fail-fast: true
       matrix:
         os: [ubuntu-latest]
-        php: [8.4, 8.3]
-        laravel: [12.*, 11.*, 10.*]
+        php: [8.5, 8.4, 8.3]
+        laravel: [12.*, 11.*]
         stability: [prefer-lowest, prefer-stable]
         include:
           - laravel: 12.*
@@ -52,13 +52,7 @@ jobs:
         run: |
           composer require "laravel/framework:${{ matrix.laravel }}" "orchestra/testbench:${{ matrix.testbench }}" --no-interaction --no-update
 
-      - name: Require Pest 2.x and plugins for Laravel 10
-        if: startsWith(matrix.laravel, '10.')
-        run: |
-          composer require "pestphp/pest:^2.34" "pestphp/pest-plugin-laravel:^2.6" "pestphp/pest-plugin-arch:^2.7" --dev --no-interaction --no-update
-
       - name: Require Pest 3.x and plugins for Laravel 11+
-        if: "!startsWith(matrix.laravel, '10.')"
         run: |
           composer require "pestphp/pest:^3.0" "pestphp/pest-plugin-laravel:^3.0" "pestphp/pest-plugin-arch:^3.0" --dev --no-interaction --no-update
 
