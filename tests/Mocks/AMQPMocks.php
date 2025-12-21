@@ -12,44 +12,6 @@ use AMQPQueue;
 use Mockery;
 use Mockery\MockInterface;
 
-// Define AMQP constants if ext-amqp is not loaded
-if (! defined('AMQP_DURABLE')) {
-    define('AMQP_DURABLE', 2);
-}
-if (! defined('AMQP_PASSIVE')) {
-    define('AMQP_PASSIVE', 1);
-}
-if (! defined('AMQP_EXCLUSIVE')) {
-    define('AMQP_EXCLUSIVE', 4);
-}
-if (! defined('AMQP_AUTODELETE')) {
-    define('AMQP_AUTODELETE', 8);
-}
-if (! defined('AMQP_INTERNAL')) {
-    define('AMQP_INTERNAL', 16);
-}
-if (! defined('AMQP_NOWAIT')) {
-    define('AMQP_NOWAIT', 32);
-}
-if (! defined('AMQP_AUTOACK')) {
-    define('AMQP_AUTOACK', 64);
-}
-if (! defined('AMQP_IFEMPTY')) {
-    define('AMQP_IFEMPTY', 128);
-}
-if (! defined('AMQP_IFUNUSED')) {
-    define('AMQP_IFUNUSED', 256);
-}
-if (! defined('AMQP_MANDATORY')) {
-    define('AMQP_MANDATORY', 512);
-}
-if (! defined('AMQP_IMMEDIATE')) {
-    define('AMQP_IMMEDIATE', 1024);
-}
-if (! defined('AMQP_NOPARAM')) {
-    define('AMQP_NOPARAM', 0);
-}
-
 /**
  * Factory for creating mock AMQP extension classes.
  *
