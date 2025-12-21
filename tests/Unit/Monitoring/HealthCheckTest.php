@@ -6,166 +6,153 @@ use Illuminate\Support\Facades\Log;
 use Lettermint\RabbitMQ\Connection\ConnectionManager;
 use Lettermint\RabbitMQ\Monitoring\HealthCheck;
 
-describe('HealthCheck', function () {
-    beforeEach(function () {
-        $this->mockConnection = mockAMQPConnection(true);
+beforeEach(function () {
+    $this->mockConnection = mockAMQPConnection(true);
 
-        $this->connectionManager = Mockery::mock(ConnectionManager::class);
-        $this->connectionManager->shouldReceive('connection')
-            ->andReturn($this->mockConnection)
-            ->byDefault();
-    });
+    $this->connectionManager = Mockery::mock(ConnectionManager::class);
+    $this->connectionManager->shouldReceive('connection')
+        ->andReturn($this->mockConnection)
+        ->byDefault();
+});
 
-    describe('check', function () {
-        it('returns healthy when connection is active', function () {
-            $healthCheck = new HealthCheck($this->connectionManager);
+test('check returns healthy when connection is active', function () {
+    $healthCheck = new HealthCheck($this->connectionManager);
 
-            $result = $healthCheck->check();
+    $result = $healthCheck->check();
 
-            expect($result['healthy'])->toBeTrue();
-            expect($result['checks']['connection']['healthy'])->toBeTrue();
-            expect($result['checks']['connection']['message'])->toBe('Connected to RabbitMQ');
-        });
+    expect($result['healthy'])->toBeTrue();
+    expect($result['checks']['connection']['healthy'])->toBeTrue();
+    expect($result['checks']['connection']['message'])->toBe('Connected to RabbitMQ');
+});
 
-        it('returns unhealthy when connection fails', function () {
-            $this->connectionManager->shouldReceive('connection')
-                ->andThrow(new \Exception('Connection refused'));
+test('check returns unhealthy when connection fails', function () {
+    $this->connectionManager->shouldReceive('connection')
+        ->andThrow(new \Exception('Connection refused'));
 
-            $healthCheck = new HealthCheck($this->connectionManager);
+    $healthCheck = new HealthCheck($this->connectionManager);
 
-            $result = $healthCheck->check();
+    $result = $healthCheck->check();
 
-            expect($result['healthy'])->toBeFalse();
-            expect($result['checks']['connection']['healthy'])->toBeFalse();
-            expect($result['checks']['connection']['message'])->toContain('Failed to connect');
-        });
+    expect($result['healthy'])->toBeFalse();
+    expect($result['checks']['connection']['healthy'])->toBeFalse();
+    expect($result['checks']['connection']['message'])->toContain('Failed to connect');
+});
 
-        it('returns unhealthy when connection exists but not connected', function () {
-            $this->mockConnection->shouldReceive('isConnected')->andReturn(false);
+test('check returns unhealthy when connection exists but not connected', function () {
+    $this->mockConnection->shouldReceive('isConnected')->andReturn(false);
 
-            $healthCheck = new HealthCheck($this->connectionManager);
+    $healthCheck = new HealthCheck($this->connectionManager);
 
-            $result = $healthCheck->check();
+    $result = $healthCheck->check();
 
-            expect($result['healthy'])->toBeFalse();
-            expect($result['checks']['connection']['healthy'])->toBeFalse();
-            expect($result['checks']['connection']['message'])->toContain('not connected');
-        });
+    expect($result['healthy'])->toBeFalse();
+    expect($result['checks']['connection']['healthy'])->toBeFalse();
+    expect($result['checks']['connection']['message'])->toContain('not connected');
+});
 
-        it('logs warning when connection exists but not connected', function () {
-            Log::spy();
+test('check logs warning when connection exists but not connected', function () {
+    Log::spy();
 
-            $this->mockConnection->shouldReceive('isConnected')->andReturn(false);
+    $this->mockConnection->shouldReceive('isConnected')->andReturn(false);
 
-            $healthCheck = new HealthCheck($this->connectionManager);
-            $healthCheck->check();
+    $healthCheck = new HealthCheck($this->connectionManager);
+    $healthCheck->check();
 
-            Log::shouldHaveReceived('warning')
-                ->withArgs(fn ($msg) => str_contains($msg, 'not connected'));
-        });
-    });
+    Log::shouldHaveReceived('warning')
+        ->withArgs(fn ($msg) => str_contains($msg, 'not connected'));
+});
 
-    describe('ping', function () {
-        it('returns true when connected', function () {
-            $healthCheck = new HealthCheck($this->connectionManager);
+test('ping returns true when connected', function () {
+    $healthCheck = new HealthCheck($this->connectionManager);
 
-            expect($healthCheck->ping())->toBeTrue();
-        });
+    expect($healthCheck->ping())->toBeTrue();
+});
 
-        it('returns false when disconnected', function () {
-            $this->mockConnection->shouldReceive('isConnected')->andReturn(false);
+test('ping returns false when disconnected', function () {
+    $this->mockConnection->shouldReceive('isConnected')->andReturn(false);
 
-            $healthCheck = new HealthCheck($this->connectionManager);
+    $healthCheck = new HealthCheck($this->connectionManager);
 
-            expect($healthCheck->ping())->toBeFalse();
-        });
+    expect($healthCheck->ping())->toBeFalse();
+});
 
-        it('returns false on exception', function () {
-            $this->connectionManager->shouldReceive('connection')
-                ->andThrow(new \Exception('Connection failed'));
+test('ping returns false on exception', function () {
+    $this->connectionManager->shouldReceive('connection')
+        ->andThrow(new \Exception('Connection failed'));
 
-            $healthCheck = new HealthCheck($this->connectionManager);
+    $healthCheck = new HealthCheck($this->connectionManager);
 
-            expect($healthCheck->ping())->toBeFalse();
-        });
+    expect($healthCheck->ping())->toBeFalse();
+});
 
-        it('logs warning when ping fails', function () {
-            Log::spy();
+test('ping logs warning when ping fails', function () {
+    Log::spy();
 
-            $this->connectionManager->shouldReceive('connection')
-                ->andThrow(new \Exception('Connection failed'));
+    $this->connectionManager->shouldReceive('connection')
+        ->andThrow(new \Exception('Connection failed'));
 
-            $healthCheck = new HealthCheck($this->connectionManager);
-            $healthCheck->ping();
+    $healthCheck = new HealthCheck($this->connectionManager);
+    $healthCheck->ping();
 
-            Log::shouldHaveReceived('warning')
-                ->withArgs(fn ($msg) => str_contains($msg, 'ping failed'));
-        });
-    });
+    Log::shouldHaveReceived('warning')
+        ->withArgs(fn ($msg) => str_contains($msg, 'ping failed'));
+});
 
-    describe('kubernetes', function () {
-        it('returns UP status when healthy', function () {
-            $healthCheck = new HealthCheck($this->connectionManager);
+test('kubernetes returns UP status when healthy', function () {
+    $healthCheck = new HealthCheck($this->connectionManager);
 
-            $result = $healthCheck->kubernetes();
+    $result = $healthCheck->kubernetes();
 
-            expect($result['status'])->toBe('UP');
-            expect($result['components']['rabbitmq']['status'])->toBe('UP');
-        });
+    expect($result['status'])->toBe('UP');
+    expect($result['components']['rabbitmq']['status'])->toBe('UP');
+});
 
-        it('returns DOWN status when unhealthy', function () {
-            $this->connectionManager->shouldReceive('connection')
-                ->andThrow(new \Exception('Connection failed'));
+test('kubernetes returns DOWN status when unhealthy', function () {
+    $this->connectionManager->shouldReceive('connection')
+        ->andThrow(new \Exception('Connection failed'));
 
-            $healthCheck = new HealthCheck($this->connectionManager);
+    $healthCheck = new HealthCheck($this->connectionManager);
 
-            $result = $healthCheck->kubernetes();
+    $result = $healthCheck->kubernetes();
 
-            expect($result['status'])->toBe('DOWN');
-            expect($result['components']['rabbitmq']['status'])->toBe('DOWN');
-        });
+    expect($result['status'])->toBe('DOWN');
+    expect($result['components']['rabbitmq']['status'])->toBe('DOWN');
+});
 
-        it('includes check details in components', function () {
-            $healthCheck = new HealthCheck($this->connectionManager);
+test('kubernetes includes check details in components', function () {
+    $healthCheck = new HealthCheck($this->connectionManager);
 
-            $result = $healthCheck->kubernetes();
+    $result = $healthCheck->kubernetes();
 
-            expect($result['components']['rabbitmq'])->toHaveKey('details');
-            expect($result['components']['rabbitmq']['details'])->toHaveKey('connection');
-        });
-    });
+    expect($result['components']['rabbitmq'])->toHaveKey('details');
+    expect($result['components']['rabbitmq']['details'])->toHaveKey('connection');
+});
 
-    describe('liveness', function () {
-        it('always returns true', function () {
-            $healthCheck = new HealthCheck($this->connectionManager);
+test('liveness always returns true', function () {
+    $healthCheck = new HealthCheck($this->connectionManager);
 
-            expect($healthCheck->liveness())->toBeTrue();
-        });
+    expect($healthCheck->liveness())->toBeTrue();
+});
 
-        it('returns true even when RabbitMQ is down', function () {
-            $this->connectionManager->shouldReceive('connection')
-                ->andThrow(new \Exception('Connection failed'));
+test('liveness returns true even when RabbitMQ is down', function () {
+    $this->connectionManager->shouldReceive('connection')
+        ->andThrow(new \Exception('Connection failed'));
 
-            $healthCheck = new HealthCheck($this->connectionManager);
+    $healthCheck = new HealthCheck($this->connectionManager);
 
-            // Liveness should still be true - service is alive
-            expect($healthCheck->liveness())->toBeTrue();
-        });
-    });
+    expect($healthCheck->liveness())->toBeTrue();
+});
 
-    describe('readiness', function () {
-        it('returns true when connected', function () {
-            $healthCheck = new HealthCheck($this->connectionManager);
+test('readiness returns true when connected', function () {
+    $healthCheck = new HealthCheck($this->connectionManager);
 
-            expect($healthCheck->readiness())->toBeTrue();
-        });
+    expect($healthCheck->readiness())->toBeTrue();
+});
 
-        it('returns false when not connected', function () {
-            $this->mockConnection->shouldReceive('isConnected')->andReturn(false);
+test('readiness returns false when not connected', function () {
+    $this->mockConnection->shouldReceive('isConnected')->andReturn(false);
 
-            $healthCheck = new HealthCheck($this->connectionManager);
+    $healthCheck = new HealthCheck($this->connectionManager);
 
-            expect($healthCheck->readiness())->toBeFalse();
-        });
-    });
+    expect($healthCheck->readiness())->toBeFalse();
 });
