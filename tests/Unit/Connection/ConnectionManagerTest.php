@@ -7,10 +7,6 @@ use Lettermint\RabbitMQ\Connection\ConnectionManager;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
 
 describe('ConnectionManager', function () {
-    beforeEach(function () {
-        Log::spy();
-    });
-
     describe('configuration', function () {
         it('returns default connection name from config', function () {
             $manager = new ConnectionManager([
@@ -91,12 +87,8 @@ describe('ConnectionManager', function () {
 });
 
 describe('ConnectionManager with mocked connection', function () {
-    beforeEach(function () {
-        Log::spy();
-    });
-
     it('reuses existing connected connection', function () {
-        $mockConnection = mockAMQPConnection(connected: true);
+        $mockConnection = mockAMQPConnection(true);
 
         $manager = new class(['default' => 'test', 'connections' => ['test' => ['hosts' => [['host' => 'localhost']]]]], $mockConnection) extends ConnectionManager
         {
@@ -118,7 +110,9 @@ describe('ConnectionManager with mocked connection', function () {
     });
 
     it('reconnects when connection is disconnected', function () {
-        $mockConnection = mockAMQPConnection(connected: false);
+        Log::spy();
+
+        $mockConnection = mockAMQPConnection(false);
         $mockConnection->shouldReceive('reconnect')->once()->andReturn(true);
         $mockConnection->shouldReceive('isConnected')->andReturn(false, true);
 
@@ -142,8 +136,10 @@ describe('ConnectionManager with mocked connection', function () {
     });
 
     it('logs warning when using fallback host', function () {
+        Log::spy();
+
         $primaryFailed = false;
-        $mockConnection = mockAMQPConnection(connected: true);
+        $mockConnection = mockAMQPConnection(true);
 
         $manager = new class(['default' => 'test', 'connections' => ['test' => ['hosts' => [['host' => 'primary'], ['host' => 'fallback']]]]], $mockConnection, $primaryFailed) extends ConnectionManager
         {
@@ -188,7 +184,7 @@ describe('ConnectionManager with mocked connection', function () {
     });
 
     it('disconnects specific connection', function () {
-        $mockConnection = mockAMQPConnection(connected: true);
+        $mockConnection = mockAMQPConnection(true);
         $mockConnection->shouldReceive('disconnect')->once();
         // isConnected() called: 1) connection() check, 2) disconnect() check, 3) isConnected('test') assertion
         $mockConnection->shouldReceive('isConnected')->andReturn(true, true, false);

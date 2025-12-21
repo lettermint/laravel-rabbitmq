@@ -8,9 +8,7 @@ use Lettermint\RabbitMQ\Monitoring\HealthCheck;
 
 describe('HealthCheck', function () {
     beforeEach(function () {
-        Log::spy();
-
-        $this->mockConnection = mockAMQPConnection(connected: true);
+        $this->mockConnection = mockAMQPConnection(true);
 
         $this->connectionManager = Mockery::mock(ConnectionManager::class);
         $this->connectionManager->shouldReceive('connection')
@@ -55,6 +53,8 @@ describe('HealthCheck', function () {
         });
 
         it('logs warning when connection exists but not connected', function () {
+            Log::spy();
+
             $this->mockConnection->shouldReceive('isConnected')->andReturn(false);
 
             $healthCheck = new HealthCheck($this->connectionManager);
@@ -90,6 +90,8 @@ describe('HealthCheck', function () {
         });
 
         it('logs warning when ping fails', function () {
+            Log::spy();
+
             $this->connectionManager->shouldReceive('connection')
                 ->andThrow(new \Exception('Connection failed'));
 

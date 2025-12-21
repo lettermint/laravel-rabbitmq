@@ -11,8 +11,6 @@ use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
 
 describe('RabbitMQJob', function () {
     beforeEach(function () {
-        Log::spy();
-
         $this->container = new Container;
         $this->mockQueue = mockAMQPQueue('test-queue');
 
@@ -158,6 +156,8 @@ describe('RabbitMQJob', function () {
         });
 
         it('handles invalid JSON gracefully', function () {
+            Log::spy();
+
             $envelope = mockAMQPEnvelope(['body' => 'not-valid-json']);
 
             $job = new RabbitMQJob(

@@ -7,10 +7,6 @@ use Lettermint\RabbitMQ\Connection\CircuitBreaker;
 use Lettermint\RabbitMQ\Enums\CircuitBreakerState;
 
 describe('CircuitBreaker', function () {
-    beforeEach(function () {
-        Log::spy();
-    });
-
     describe('initial state', function () {
         it('starts in closed state', function () {
             $breaker = new CircuitBreaker;
@@ -73,6 +69,8 @@ describe('CircuitBreaker', function () {
         });
 
         it('logs error when circuit opens', function () {
+            Log::spy();
+
             $breaker = new CircuitBreaker(failureThreshold: 2);
 
             $breaker->recordFailure();
@@ -122,6 +120,8 @@ describe('CircuitBreaker', function () {
         });
 
         it('logs when entering half-open state', function () {
+            Log::spy();
+
             $breaker = new CircuitBreaker(failureThreshold: 1, recoveryTimeout: 0.01);
 
             $breaker->recordFailure();
@@ -172,6 +172,8 @@ describe('CircuitBreaker', function () {
         });
 
         it('logs when closing after recovery', function () {
+            Log::spy();
+
             $breaker = new CircuitBreaker(failureThreshold: 1, recoveryTimeout: 0.01);
 
             $breaker->recordFailure();
@@ -214,6 +216,8 @@ describe('CircuitBreaker', function () {
         });
 
         it('logs warning when reopening after failed recovery', function () {
+            Log::spy();
+
             $breaker = new CircuitBreaker(failureThreshold: 1, recoveryTimeout: 0.01);
 
             $breaker->recordFailure();
@@ -243,6 +247,8 @@ describe('CircuitBreaker', function () {
         });
 
         it('logs when manually reset', function () {
+            Log::spy();
+
             $breaker = new CircuitBreaker(failureThreshold: 1);
 
             $breaker->recordFailure();

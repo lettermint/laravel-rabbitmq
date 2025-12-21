@@ -8,8 +8,6 @@ use Lettermint\RabbitMQ\Monitoring\QueueMetrics;
 
 describe('QueueMetrics', function () {
     beforeEach(function () {
-        Log::spy();
-
         $this->mockChannel = mockAMQPChannel();
 
         $this->channelManager = Mockery::mock(ChannelManager::class);
@@ -33,6 +31,8 @@ describe('QueueMetrics', function () {
         });
 
         it('logs warning on error', function () {
+            Log::spy();
+
             $this->channelManager->shouldReceive('topologyChannel')
                 ->andThrow(new \Exception('Channel failed'));
 
