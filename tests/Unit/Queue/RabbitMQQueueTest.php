@@ -3,7 +3,6 @@
 declare(strict_types=1);
 
 use Illuminate\Container\Container;
-use Illuminate\Support\Facades\Log;
 use Lettermint\RabbitMQ\Attributes\ConsumesQueue;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Contracts\HasPriority;
@@ -14,8 +13,6 @@ use Lettermint\RabbitMQ\Tests\Fixtures\Jobs\SimpleJob;
 
 describe('RabbitMQQueue', function () {
     beforeEach(function () {
-        Log::spy();
-
         $this->mockChannel = mockAMQPChannel();
         $this->mockExchange = mockAMQPExchange('test-exchange', $this->mockChannel);
 
