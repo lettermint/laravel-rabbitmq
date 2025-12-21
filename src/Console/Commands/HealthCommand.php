@@ -33,7 +33,7 @@ class HealthCommand extends Command
 
         foreach ($results['checks'] as $check => $status) {
             $icon = $status['healthy'] ? '<fg=green>✓</>' : '<fg=red>✗</>';
-            $message = $status['message'] ?? '';
+            $message = $status['message'];
 
             $this->line("  {$icon} {$check}: {$message}");
         }

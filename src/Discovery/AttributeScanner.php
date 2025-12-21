@@ -136,8 +136,10 @@ class AttributeScanner
             return null;
         }
 
-        /** @var class-string|null */
-        return $namespace !== null ? "{$namespace}\\{$class}" : $class;
+        /** @var class-string */
+        $fqcn = $namespace !== null ? "{$namespace}\\{$class}" : $class;
+
+        return $fqcn;
     }
 
     /**
@@ -189,8 +191,8 @@ class AttributeScanner
             }
         }
 
-        // Fall back to first attribute for this class
-        return $classAttributes->first()['attribute'] ?? null;
+        // Fall back to first attribute for this class (collection is not empty at this point)
+        return $classAttributes->first()['attribute'];
     }
 
     /**

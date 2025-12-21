@@ -96,6 +96,7 @@ class QueuesCommand extends Command
             );
 
             // Sleep in smaller increments to be more responsive to signals
+            // @phpstan-ignore booleanNot.alwaysTrue (signal handler modifies $shouldStop by reference)
             for ($i = 0; $i < $interval && ! $shouldStop; $i++) {
                 sleep(1);
 

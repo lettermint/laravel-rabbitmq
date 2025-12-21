@@ -97,7 +97,7 @@ class ConsumeCommand extends Command
         Event::listen(JobFailed::class, function (JobFailed $event) {
             $this->components->error("Failed: {$event->job->resolveName()}");
 
-            if ($this->getOutput()->isVerbose() && $event->exception) {
+            if ($this->getOutput()->isVerbose()) {
                 $this->line("  <fg=red>Error:</> {$event->exception->getMessage()}");
             }
         });

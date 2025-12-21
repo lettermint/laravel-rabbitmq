@@ -206,6 +206,7 @@ node_modules/
 **/*.DesktopClient/ModelManifest.xml
 **/*.Server/GeneratedArtifacts
 **/*.Server/ModelManifest.xml
+.phpunit.cache/
 _Pvt_Extensions
 .paket/paket.exe
 paket-files/
