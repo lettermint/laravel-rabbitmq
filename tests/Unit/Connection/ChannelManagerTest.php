@@ -8,7 +8,7 @@ use Lettermint\RabbitMQ\Exceptions\ConnectionException;
 
 describe('ChannelManager', function () {
     beforeEach(function () {
-        $this->mockConnection = mockAMQPConnection(connected: true);
+        $this->mockConnection = mockAMQPConnection(true);
         $this->mockChannel = mockAMQPChannel($this->mockConnection);
 
         $this->connectionManager = Mockery::mock(ConnectionManager::class);

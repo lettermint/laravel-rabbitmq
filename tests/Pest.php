@@ -47,9 +47,9 @@ function mockAMQPConnection(bool $connected = true): Mockery\MockInterface
 /**
  * Create a mock AMQPChannel.
  */
-function mockAMQPChannel(): Mockery\MockInterface
+function mockAMQPChannel(?Mockery\MockInterface $connection = null): Mockery\MockInterface
 {
-    return Lettermint\RabbitMQ\Tests\Mocks\AMQPMocks::channel();
+    return Lettermint\RabbitMQ\Tests\Mocks\AMQPMocks::channel($connection);
 }
 
 /**
