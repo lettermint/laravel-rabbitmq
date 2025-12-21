@@ -88,52 +88,7 @@ describe('RabbitMQQueue', function () {
         });
     });
 
-    describe('size', function () {
-        it('returns 0 (ext-amqp limitation)', function () {
-            $queue = new RabbitMQQueue(
-                $this->channelManager,
-                $this->scanner,
-                $this->config
-            );
-
-            expect($queue->size('test-queue'))->toBe(0);
-        })->skip('Requires RabbitMQ connection - ext-amqp validates channel');
-    });
-
-    describe('pushRaw', function () {
-        it('publishes payload to queue', function () {
-            $this->mockChannel->shouldReceive('confirmSelect')->never();
-
-            $queue = new RabbitMQQueue(
-                $this->channelManager,
-                $this->scanner,
-                $this->config
-            );
-
-            $payload = json_encode(['uuid' => 'test-uuid', 'displayName' => 'TestJob']);
-
-            $result = $queue->pushRaw($payload, 'test-queue');
-
-            expect($result)->toBe('test-uuid');
-        })->skip('Requires RabbitMQ connection - ext-amqp validates channel');
-    });
-
     describe('pop', function () {
-        it('returns null when queue is empty', function () {
-            $this->mockChannel->shouldReceive('get')->andReturn(null);
-
-            $queue = new RabbitMQQueue(
-                $this->channelManager,
-                $this->scanner,
-                $this->config
-            );
-            $queue->setContainer(new Container);
-
-            $job = $queue->pop('test-queue');
-
-            expect($job)->toBeNull();
-        })->skip('Requires RabbitMQ connection - ext-amqp validates channel');
-
         it('returns job when message available', function () {
             $envelope = mockAMQPEnvelope([
                 'body' => json_encode([

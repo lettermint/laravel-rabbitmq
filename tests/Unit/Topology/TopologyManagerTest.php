@@ -105,37 +105,6 @@ describe('TopologyManager', function () {
     });
 
     describe('exchange declaration', function () {
-        it('declares exchange from attribute', function () {
-            $exchange = new Exchange(name: 'test-exchange', type: ExchangeType::Topic);
-
-            $manager = new TopologyManager(
-                $this->channelManager,
-                $this->scanner,
-                $this->config
-            );
-
-            // Should not throw
-            $manager->declareExchange($this->mockChannel, $exchange);
-
-            expect(true)->toBeTrue();
-        })->skip('Requires RabbitMQ connection - ext-amqp validates channel');
-
-        it('skips already declared exchanges', function () {
-            $exchange = new Exchange(name: 'test-exchange', type: ExchangeType::Topic);
-
-            $manager = new TopologyManager(
-                $this->channelManager,
-                $this->scanner,
-                $this->config
-            );
-
-            $manager->declareExchange($this->mockChannel, $exchange);
-            $manager->declareExchange($this->mockChannel, $exchange);
-
-            // Second call should be a no-op
-            expect(true)->toBeTrue();
-        })->skip('Requires RabbitMQ connection - ext-amqp validates channel');
-
         it('includes exchange-to-exchange binding in result', function () {
             $parentExchange = new Exchange(name: 'parent', type: ExchangeType::Topic);
             $childExchange = new Exchange(
@@ -167,41 +136,6 @@ describe('TopologyManager', function () {
     });
 
     describe('queue declaration', function () {
-        it('declares queue from attribute', function () {
-            $queue = new ConsumesQueue(
-                queue: 'test-queue',
-                bindings: ['test-exchange' => 'test.*']
-            );
-
-            $manager = new TopologyManager(
-                $this->channelManager,
-                $this->scanner,
-                $this->config
-            );
-
-            $manager->declareQueue($this->mockChannel, $queue);
-
-            expect(true)->toBeTrue();
-        })->skip('Requires RabbitMQ connection - ext-amqp validates channel');
-
-        it('skips already declared queues', function () {
-            $queue = new ConsumesQueue(
-                queue: 'test-queue',
-                bindings: ['test-exchange' => 'test.*']
-            );
-
-            $manager = new TopologyManager(
-                $this->channelManager,
-                $this->scanner,
-                $this->config
-            );
-
-            $manager->declareQueue($this->mockChannel, $queue);
-            $manager->declareQueue($this->mockChannel, $queue);
-
-            expect(true)->toBeTrue();
-        })->skip('Requires RabbitMQ connection - ext-amqp validates channel');
-
         it('includes queue bindings in result', function () {
             $queueAttr = new ConsumesQueue(
                 queue: 'notifications:push',
@@ -328,39 +262,28 @@ describe('TopologyManager', function () {
     });
 
     describe('reset', function () {
-        it('resets declared state', function () {
-            $exchange = new Exchange(name: 'test', type: ExchangeType::Topic);
-            $queue = new ConsumesQueue(queue: 'test-queue');
-
+        it('clears declared exchanges and queues tracking', function () {
             $manager = new TopologyManager(
                 $this->channelManager,
                 $this->scanner,
                 $this->config
             );
 
-            $manager->declareExchange($this->mockChannel, $exchange);
-            $manager->declareQueue($this->mockChannel, $queue);
+            // Use reflection to verify internal state
+            $reflection = new ReflectionClass($manager);
+
+            $exchangesProp = $reflection->getProperty('declaredExchanges');
+            $exchangesProp->setAccessible(true);
+            $exchangesProp->setValue($manager, ['test-exchange' => true]);
+
+            $queuesProp = $reflection->getProperty('declaredQueues');
+            $queuesProp->setAccessible(true);
+            $queuesProp->setValue($manager, ['test-queue' => true]);
 
             $manager->reset();
 
-            // After reset, declaring again should not be skipped
-            // This is hard to verify without inspection, but reset should work
-            expect(true)->toBeTrue();
-        })->skip('Requires RabbitMQ connection - ext-amqp validates channel');
-    });
-
-    describe('queue info', function () {
-        it('returns queue info structure', function () {
-            $manager = new TopologyManager(
-                $this->channelManager,
-                $this->scanner,
-                $this->config
-            );
-
-            $info = $manager->getQueueInfo('test-queue');
-
-            expect($info)->toHaveKeys(['name', 'messages', 'consumers']);
-            expect($info['name'])->toBe('test-queue');
-        })->skip('Requires RabbitMQ connection - ext-amqp validates channel');
+            expect($exchangesProp->getValue($manager))->toBeEmpty();
+            expect($queuesProp->getValue($manager))->toBeEmpty();
+        });
     });
 });

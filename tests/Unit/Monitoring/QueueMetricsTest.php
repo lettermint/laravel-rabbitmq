@@ -19,34 +19,6 @@ describe('QueueMetrics', function () {
     });
 
     describe('getQueueStats', function () {
-        it('returns null values when stats unavailable', function () {
-            $metrics = new QueueMetrics($this->channelManager);
-
-            $stats = $metrics->getQueueStats('test-queue');
-
-            expect($stats['messages'])->toBeNull();
-            expect($stats['consumers'])->toBeNull();
-            expect($stats['rate'])->toBeNull();
-        })->skip('Requires RabbitMQ connection - ext-amqp validates channel');
-
-        it('indicates queue is connected on success', function () {
-            $metrics = new QueueMetrics($this->channelManager);
-
-            $stats = $metrics->getQueueStats('test-queue');
-
-            expect($stats['connected'])->toBeTrue();
-            expect($stats['error'])->toBeNull();
-        })->skip('Requires RabbitMQ connection - ext-amqp validates channel');
-
-        it('includes notice about ext-amqp limitations', function () {
-            $metrics = new QueueMetrics($this->channelManager);
-
-            $stats = $metrics->getQueueStats('test-queue');
-
-            expect($stats['notice'])->toContain('ext-amqp');
-            expect($stats['notice'])->toContain('Management API');
-        })->skip('Requires RabbitMQ connection - ext-amqp validates channel');
-
         it('indicates not connected on error', function () {
             $this->channelManager->shouldReceive('topologyChannel')
                 ->andThrow(new \Exception('Channel failed'));
@@ -73,17 +45,6 @@ describe('QueueMetrics', function () {
     });
 
     describe('getAllQueueStats', function () {
-        it('returns stats for all queues', function () {
-            $metrics = new QueueMetrics($this->channelManager);
-
-            $stats = $metrics->getAllQueueStats(['queue-1', 'queue-2', 'queue-3']);
-
-            expect($stats)->toHaveKeys(['queue-1', 'queue-2', 'queue-3']);
-            expect($stats['queue-1']['connected'])->toBeTrue();
-            expect($stats['queue-2']['connected'])->toBeTrue();
-            expect($stats['queue-3']['connected'])->toBeTrue();
-        })->skip('Requires RabbitMQ connection - ext-amqp validates channel');
-
         it('returns empty array for empty input', function () {
             $metrics = new QueueMetrics($this->channelManager);
 
