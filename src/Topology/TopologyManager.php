@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Lettermint\RabbitMQ\Topology;
 
 use AMQPChannel;
+use AMQPChannelException;
 use AMQPExchange;
 use AMQPExchangeException;
 use AMQPQueue;
@@ -14,6 +15,7 @@ use Lettermint\RabbitMQ\Attributes\ConsumesQueue;
 use Lettermint\RabbitMQ\Attributes\Exchange;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Discovery\AttributeScanner;
+use Lettermint\RabbitMQ\Enums\TopologyEntityType;
 use Lettermint\RabbitMQ\Exceptions\TopologyException;
 
 /**
@@ -95,7 +97,7 @@ class TopologyManager
             }
         }
 
-        // Second: Declare exchange-to-exchange bindings
+        // Third: Declare exchange-to-exchange bindings
         foreach ($topology['exchanges'] as $name => $exchange) {
             if ($exchange->bindTo !== null) {
                 $result['bindings'][] = "{$exchange->bindTo} -> {$name} [{$exchange->bindRoutingKey}]";
@@ -106,7 +108,7 @@ class TopologyManager
             }
         }
 
-        // Third: Declare queues and their bindings
+        // Fourth: Declare queues and their bindings
         foreach ($topology['queues'] as $queueName => $queueData) {
             /** @var ConsumesQueue $attribute */
             $attribute = $queueData['attribute'];
@@ -174,7 +176,7 @@ class TopologyManager
         } catch (AMQPExchangeException $e) {
             throw new TopologyException(
                 "Failed to declare exchange [{$exchange->name}]: ".$e->getMessage(),
-                entityType: 'exchange',
+                entityType: TopologyEntityType::Exchange,
                 entityName: $exchange->name,
                 previous: $e
             );
@@ -203,7 +205,7 @@ class TopologyManager
         } catch (AMQPExchangeException $e) {
             throw new TopologyException(
                 "Failed to declare DLQ exchange [{$name}]: ".$e->getMessage(),
-                entityType: 'exchange',
+                entityType: TopologyEntityType::Exchange,
                 entityName: $name,
                 previous: $e
             );
@@ -238,7 +240,7 @@ class TopologyManager
             throw new TopologyException(
                 "Failed to declare delayed exchange [{$name}]: ".$e->getMessage().
                 ' (Is the rabbitmq_delayed_message_exchange plugin installed?)',
-                entityType: 'exchange',
+                entityType: TopologyEntityType::Exchange,
                 entityName: $name,
                 previous: $e
             );
@@ -268,7 +270,7 @@ class TopologyManager
         } catch (AMQPExchangeException $e) {
             throw new TopologyException(
                 "Failed to bind exchange [{$exchange->name}] to [{$exchange->bindTo}]: ".$e->getMessage(),
-                entityType: 'binding',
+                entityType: TopologyEntityType::Binding,
                 entityName: "{$exchange->bindTo}->{$exchange->name}",
                 previous: $e
             );
@@ -297,7 +299,7 @@ class TopologyManager
         } catch (AMQPQueueException $e) {
             throw new TopologyException(
                 "Failed to declare queue [{$attribute->queue}]: ".$e->getMessage(),
-                entityType: 'queue',
+                entityType: TopologyEntityType::Queue,
                 entityName: $attribute->queue,
                 previous: $e
             );
@@ -336,7 +338,7 @@ class TopologyManager
         } catch (AMQPQueueException $e) {
             throw new TopologyException(
                 "Failed to declare DLQ queue [{$dlqQueueName}]: ".$e->getMessage(),
-                entityType: 'queue',
+                entityType: TopologyEntityType::Queue,
                 entityName: $dlqQueueName,
                 previous: $e
             );
@@ -361,7 +363,7 @@ class TopologyManager
         } catch (AMQPQueueException $e) {
             throw new TopologyException(
                 "Failed to bind queue [{$queueName}] to [{$exchangeName}]: ".$e->getMessage(),
-                entityType: 'binding',
+                entityType: TopologyEntityType::Binding,
                 entityName: "{$exchangeName}->{$queueName}",
                 previous: $e
             );
@@ -406,46 +408,83 @@ class TopologyManager
 
     /**
      * Delete a queue (use with caution).
+     *
+     * @throws TopologyException When queue deletion fails
      */
     public function deleteQueue(string $queueName): void
     {
-        $channel = $this->channelManager->topologyChannel();
-        $queue = new AMQPQueue($channel);
-        $queue->setName($queueName);
-        $queue->delete();
+        try {
+            $channel = $this->channelManager->topologyChannel();
+            $queue = new AMQPQueue($channel);
+            $queue->setName($queueName);
+            $queue->delete();
 
-        unset($this->declaredQueues[$queueName]);
+            unset($this->declaredQueues[$queueName]);
+        } catch (AMQPQueueException|AMQPChannelException $e) {
+            throw new TopologyException(
+                "Failed to delete queue [{$queueName}]: ".$e->getMessage(),
+                entityType: TopologyEntityType::Queue,
+                entityName: $queueName,
+                previous: $e
+            );
+        }
     }
 
     /**
      * Purge all messages from a queue.
+     *
+     * @throws TopologyException When queue purge fails
      */
     public function purgeQueue(string $queueName): int
     {
-        $channel = $this->channelManager->topologyChannel();
-        $queue = new AMQPQueue($channel);
-        $queue->setName($queueName);
+        try {
+            $channel = $this->channelManager->topologyChannel();
+            $queue = new AMQPQueue($channel);
+            $queue->setName($queueName);
 
-        return $queue->purge();
+            return $queue->purge();
+        } catch (AMQPQueueException|AMQPChannelException $e) {
+            throw new TopologyException(
+                "Failed to purge queue [{$queueName}]: ".$e->getMessage(),
+                entityType: TopologyEntityType::Queue,
+                entityName: $queueName,
+                previous: $e
+            );
+        }
     }
 
     /**
-     * Get queue information (message count, consumer count, etc.).
+     * Get queue information.
      *
-     * @return array{messages: int, consumers: int, name: string}
+     * Note: Due to ext-amqp limitations, message and consumer counts
+     * are not available via declareQueue(). Use RabbitMQ Management API
+     * for accurate statistics.
+     *
+     * @return array{messages: int|null, consumers: int|null, name: string}
+     *
+     * @throws TopologyException When queue access fails
      */
     public function getQueueInfo(string $queueName): array
     {
-        $channel = $this->channelManager->topologyChannel();
-        $queue = new AMQPQueue($channel);
-        $queue->setName($queueName);
-        $queue->declareQueue(); // This returns the current state
+        try {
+            $channel = $this->channelManager->topologyChannel();
+            $queue = new AMQPQueue($channel);
+            $queue->setName($queueName);
+            $queue->declareQueue();
 
-        return [
-            'name' => $queueName,
-            'messages' => 0, // ext-amqp doesn't expose this directly via declareQueue
-            'consumers' => 0,
-        ];
+            return [
+                'name' => $queueName,
+                'messages' => null,
+                'consumers' => null,
+            ];
+        } catch (AMQPQueueException|AMQPChannelException $e) {
+            throw new TopologyException(
+                "Failed to get queue info for [{$queueName}]: ".$e->getMessage(),
+                entityType: TopologyEntityType::Queue,
+                entityName: $queueName,
+                previous: $e
+            );
+        }
     }
 
     /**

@@ -4,10 +4,8 @@ declare(strict_types=1);
 
 namespace Lettermint\RabbitMQ\Queue;
 
-use AMQPChannelException;
 use AMQPEnvelope;
 use AMQPQueue;
-use AMQPQueueException;
 use Illuminate\Container\Container;
 use Illuminate\Contracts\Queue\Job as JobContract;
 use Illuminate\Queue\Jobs\Job;
@@ -67,12 +65,15 @@ class RabbitMQJob extends Job implements JobContract
     }
 
     /**
-     * Release the job back into the queue after a delay.
+     * Release the job back into the queue.
      *
      * Rejects the message without requeue - the Dead Letter Queue (DLQ)
-     * configuration handles retry logic with appropriate delays.
+     * configuration handles retry logic. Note: The $delay parameter is
+     * passed to parent::release() for Laravel compatibility but is not
+     * directly used; retry delays are controlled by the DLQ/ConsumesQueue
+     * retryDelays configuration.
      *
-     * @param  int  $delay  Seconds to delay before the job is available again
+     * @param  int  $delay  Delay hint (not directly used, see DLQ configuration)
      *
      * @throws ConnectionException When message rejection fails
      */
@@ -83,7 +84,7 @@ class RabbitMQJob extends Job implements JobContract
         try {
             // Reject without requeue - let DLQ handle retry with configured delay
             $this->rabbitmq->reject($this->envelope, $this->amqpQueue, false);
-        } catch (AMQPQueueException|AMQPChannelException $e) {
+        } catch (ConnectionException $e) {
             Log::error('Failed to release/reject RabbitMQ message', [
                 'queue' => $this->queueName,
                 'job_id' => $this->getJobId(),
@@ -92,10 +93,7 @@ class RabbitMQJob extends Job implements JobContract
                 'error' => $e->getMessage(),
             ]);
 
-            throw new ConnectionException(
-                "Failed to release job [{$this->getJobId()}]: {$e->getMessage()}",
-                previous: $e
-            );
+            throw $e;
         }
     }
 
@@ -112,7 +110,7 @@ class RabbitMQJob extends Job implements JobContract
 
         try {
             $this->rabbitmq->ack($this->envelope, $this->amqpQueue);
-        } catch (AMQPQueueException|AMQPChannelException $e) {
+        } catch (ConnectionException $e) {
             // CRITICAL: Job completed but ack failed - potential duplicate processing
             Log::critical('Job completed but acknowledgment failed - potential duplicate processing', [
                 'queue' => $this->queueName,
@@ -124,10 +122,7 @@ class RabbitMQJob extends Job implements JobContract
 
             // Report to error tracking (Sentry, etc.) but don't throw
             // because the job itself succeeded
-            report(new \RuntimeException(
-                "Job [{$this->getJobId()}] completed but ack failed - potential duplicate processing: {$e->getMessage()}",
-                previous: $e
-            ));
+            report($e);
         }
     }
 
@@ -178,10 +173,13 @@ class RabbitMQJob extends Job implements JobContract
     /**
      * Get the decoded payload.
      *
-     * Handles JSON decode errors gracefully with logging. Invalid payloads
-     * return an empty array to prevent downstream errors during job processing.
+     * Throws an exception on JSON decode failure to prevent processing
+     * of malformed messages. The exception will cause the job to fail
+     * and be sent to the DLQ.
      *
      * @return array<string, mixed>
+     *
+     * @throws \RuntimeException When payload cannot be decoded
      */
     protected function decoded(): array
     {
@@ -190,18 +188,22 @@ class RabbitMQJob extends Job implements JobContract
             $decoded = json_decode($body, true);
 
             if (json_last_error() !== JSON_ERROR_NONE) {
-                Log::error('Failed to decode RabbitMQ message payload', [
+                $errorMsg = json_last_error_msg();
+
+                Log::critical('Failed to decode RabbitMQ message payload - job will be rejected', [
                     'queue' => $this->queueName,
                     'delivery_tag' => $this->envelope->getDeliveryTag(),
                     'message_id' => $this->envelope->getMessageId(),
-                    'json_error' => json_last_error_msg(),
+                    'json_error' => $errorMsg,
                     'body_preview' => substr($body, 0, 200),
                 ]);
 
-                $this->decoded = [];
-            } else {
-                $this->decoded = $decoded ?? [];
+                throw new \RuntimeException(
+                    "Cannot process job: invalid JSON payload - {$errorMsg}"
+                );
             }
+
+            $this->decoded = $decoded ?? [];
         }
 
         return $this->decoded;

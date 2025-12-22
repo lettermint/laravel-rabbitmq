@@ -178,7 +178,8 @@ return [
 
     'publisher' => [
         'confirm' => env('RABBITMQ_PUBLISHER_CONFIRM', true),
-        'mandatory' => true, // Return unroutable messages
+        // Note: mandatory routing (returning unroutable messages) is planned for a future release
+        'mandatory' => false,
     ],
 
     /*

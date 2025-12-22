@@ -4,7 +4,10 @@ declare(strict_types=1);
 
 namespace Lettermint\RabbitMQ\Consumers;
 
+use AMQPChannelException;
+use AMQPConnectionException;
 use AMQPQueue;
+use AMQPQueueException;
 use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Queue\Events\JobExceptionOccurred;
@@ -13,8 +16,10 @@ use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Queue\Events\Looping;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Log;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Discovery\AttributeScanner;
+use Lettermint\RabbitMQ\Exceptions\ConnectionException;
 use Lettermint\RabbitMQ\Queue\RabbitMQJob;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
 use Throwable;
@@ -33,6 +38,12 @@ class Consumer
 
     protected int $prefetch = 10;
 
+    /**
+     * Job timeout in seconds.
+     *
+     * Note: This is reserved for future implementation. Currently, job timeouts
+     * are handled at the Laravel job level via the $timeout property on job classes.
+     */
     protected int $timeout = 60;
 
     protected int $maxJobs = 0;
@@ -61,14 +72,28 @@ class Consumer
 
     /**
      * Start consuming messages from the queue.
+     *
+     * @throws ConnectionException When consumer fails to initialize or connection is lost
      */
     public function consume(): void
     {
         $startTime = Carbon::now();
         $jobsProcessed = 0;
 
-        $channel = $this->channelManager->consumeChannel();
-        $channel->setPrefetchCount($this->prefetch);
+        try {
+            $channel = $this->channelManager->consumeChannel();
+            $channel->setPrefetchCount($this->prefetch);
+        } catch (AMQPConnectionException|AMQPChannelException $e) {
+            Log::error('RabbitMQ consumer failed to start', [
+                'queue' => $this->queue,
+                'error' => $e->getMessage(),
+            ]);
+
+            throw new ConnectionException(
+                "Consumer failed to initialize for queue '{$this->queue}': {$e->getMessage()}",
+                previous: $e
+            );
+        }
 
         $amqpQueue = new AMQPQueue($channel);
         $amqpQueue->setName($this->queue);
@@ -86,7 +111,20 @@ class Consumer
             $this->events->dispatch(new Looping($this->connection, $this->queue));
 
             // Get a message from the queue
-            $envelope = $amqpQueue->get();
+            try {
+                $envelope = $amqpQueue->get();
+            } catch (AMQPConnectionException|AMQPChannelException|AMQPQueueException $e) {
+                Log::error('RabbitMQ failed to get message from queue', [
+                    'queue' => $this->queue,
+                    'jobs_processed' => $jobsProcessed,
+                    'error' => $e->getMessage(),
+                ]);
+
+                throw new ConnectionException(
+                    "Consumer lost connection to queue '{$this->queue}': {$e->getMessage()}",
+                    previous: $e
+                );
+            }
 
             if ($envelope === null) {
                 if ($this->stopWhenEmpty) {
@@ -173,13 +211,28 @@ class Consumer
 
     /**
      * Mark the job as failed.
+     *
+     * @throws ConnectionException When rejection fails and consumer cannot safely continue
      */
     protected function failJob(RabbitMQJob $job, Throwable $e): void
     {
         $this->events->dispatch(new JobFailed($this->connection, $job, $e));
 
-        // Reject without requeue - will go to DLQ
-        $this->rabbitmq->reject($job->getEnvelope(), $job->getAMQPQueue(), false);
+        try {
+            // Reject without requeue - will go to DLQ
+            $this->rabbitmq->reject($job->getEnvelope(), $job->getAMQPQueue(), false);
+        } catch (ConnectionException $rejectException) {
+            Log::critical('Failed to reject job after failure - message state undefined', [
+                'queue' => $this->queue,
+                'job_id' => $job->getJobId(),
+                'job_name' => $job->getName(),
+                'original_error' => $e->getMessage(),
+                'reject_error' => $rejectException->getMessage(),
+            ]);
+
+            // Re-throw to stop the consumer - we cannot safely continue
+            throw $rejectException;
+        }
     }
 
     /**

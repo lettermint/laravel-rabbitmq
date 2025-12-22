@@ -147,7 +147,7 @@ test('decodes payload correctly', function () {
     expect($job->payload())->toBe($payload);
 });
 
-test('handles invalid JSON gracefully', function () {
+test('throws exception on invalid JSON', function () {
     Log::spy();
 
     $envelope = mockAMQPEnvelope(['body' => 'not-valid-json']);
@@ -161,9 +161,9 @@ test('handles invalid JSON gracefully', function () {
         'test-queue'
     );
 
-    expect($job->payload())->toBe([]);
+    expect(fn () => $job->payload())->toThrow(RuntimeException::class, 'invalid JSON payload');
 
-    Log::shouldHaveReceived('error')
+    Log::shouldHaveReceived('critical')
         ->withArgs(fn ($msg) => str_contains($msg, 'decode'));
 });
 

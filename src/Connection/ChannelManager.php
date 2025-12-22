@@ -70,7 +70,8 @@ class ChannelManager
     /**
      * Get a channel specifically for publishing.
      *
-     * This channel is configured with publisher confirms if enabled.
+     * Note: Publisher confirms are configured at publish time in RabbitMQQueue,
+     * not during channel creation.
      *
      * @throws ConnectionException
      */

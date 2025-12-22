@@ -166,6 +166,16 @@ final class ConsumesQueue
             );
         }
 
+        // Validate retryDelays - runtime check needed as PHP doesn't enforce array element types
+        foreach ($this->retryDelays as $index => $delay) {
+            /** @phpstan-ignore function.alreadyNarrowedType */
+            if (! is_int($delay) || $delay < 1) {
+                throw new InvalidArgumentException(
+                    "retryDelays must contain positive integers, got invalid value at index {$index}"
+                );
+            }
+        }
+
         // Convert string to enum for retryStrategy
         $this->retryStrategyEnum = $retryStrategy instanceof RetryStrategy
             ? $retryStrategy

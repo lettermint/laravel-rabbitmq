@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Illuminate\Support\Facades\Log;
 use Lettermint\RabbitMQ\Connection\ConnectionManager;
+use Lettermint\RabbitMQ\Exceptions\ConnectionException;
 use Lettermint\RabbitMQ\Monitoring\HealthCheck;
 
 beforeEach(function () {
@@ -27,7 +28,7 @@ test('check returns healthy when connection is active', function () {
 
 test('check returns unhealthy when connection fails', function () {
     $this->connectionManager->shouldReceive('connection')
-        ->andThrow(new \Exception('Connection refused'));
+        ->andThrow(new ConnectionException('Connection refused'));
 
     $healthCheck = new HealthCheck($this->connectionManager);
 
@@ -50,7 +51,7 @@ test('check returns unhealthy when connection exists but not connected', functio
     expect($result['checks']['connection']['message'])->toContain('not connected');
 });
 
-test('check logs warning when connection exists but not connected', function () {
+test('check logs error when connection exists but not connected', function () {
     Log::spy();
 
     $this->mockConnection->shouldReceive('isConnected')->andReturn(false);
@@ -58,7 +59,7 @@ test('check logs warning when connection exists but not connected', function () 
     $healthCheck = new HealthCheck($this->connectionManager);
     $healthCheck->check();
 
-    Log::shouldHaveReceived('warning')
+    Log::shouldHaveReceived('error')
         ->withArgs(fn ($msg) => str_contains($msg, 'not connected'));
 });
 
@@ -78,23 +79,23 @@ test('ping returns false when disconnected', function () {
 
 test('ping returns false on exception', function () {
     $this->connectionManager->shouldReceive('connection')
-        ->andThrow(new \Exception('Connection failed'));
+        ->andThrow(new ConnectionException('Connection failed'));
 
     $healthCheck = new HealthCheck($this->connectionManager);
 
     expect($healthCheck->ping())->toBeFalse();
 });
 
-test('ping logs warning when ping fails', function () {
+test('ping logs error when ping fails', function () {
     Log::spy();
 
     $this->connectionManager->shouldReceive('connection')
-        ->andThrow(new \Exception('Connection failed'));
+        ->andThrow(new ConnectionException('Connection failed'));
 
     $healthCheck = new HealthCheck($this->connectionManager);
     $healthCheck->ping();
 
-    Log::shouldHaveReceived('warning')
+    Log::shouldHaveReceived('error')
         ->withArgs(fn ($msg) => str_contains($msg, 'ping failed'));
 });
 
@@ -109,7 +110,7 @@ test('kubernetes returns UP status when healthy', function () {
 
 test('kubernetes returns DOWN status when unhealthy', function () {
     $this->connectionManager->shouldReceive('connection')
-        ->andThrow(new \Exception('Connection failed'));
+        ->andThrow(new ConnectionException('Connection failed'));
 
     $healthCheck = new HealthCheck($this->connectionManager);
 
@@ -136,7 +137,7 @@ test('liveness always returns true', function () {
 
 test('liveness returns true even when RabbitMQ is down', function () {
     $this->connectionManager->shouldReceive('connection')
-        ->andThrow(new \Exception('Connection failed'));
+        ->andThrow(new ConnectionException('Connection failed'));
 
     $healthCheck = new HealthCheck($this->connectionManager);
 

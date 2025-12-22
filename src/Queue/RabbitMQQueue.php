@@ -7,7 +7,9 @@ namespace Lettermint\RabbitMQ\Queue;
 use AMQPChannelException;
 use AMQPConnectionException;
 use AMQPEnvelope;
+use AMQPException;
 use AMQPExchange;
+use AMQPExchangeException;
 use AMQPQueue;
 use AMQPQueueException;
 use DateInterval;
@@ -319,13 +321,14 @@ class RabbitMQQueue extends Queue implements QueueContract
                         'job' => is_object($job) ? get_class($job) : $job,
                         'id' => $this->getPayloadId($payload),
                     ];
-                } catch (\Exception $e) {
+                } catch (AMQPConnectionException|AMQPChannelException|AMQPExchangeException $e) {
                     $channel->rollbackTransaction();
 
                     Log::error('Batch publish failed', [
                         'queue' => $queue,
                         'failed_at_index' => $index,
                         'error' => $e->getMessage(),
+                        'exception_class' => get_class($e),
                     ]);
 
                     throw new PublishException(
@@ -347,10 +350,11 @@ class RabbitMQQueue extends Queue implements QueueContract
             return $results;
         } catch (PublishException $e) {
             throw $e;
-        } catch (\Exception $e) {
+        } catch (AMQPConnectionException|AMQPChannelException $e) {
             Log::error('Batch publish transaction failed', [
                 'queue' => $queue,
                 'error' => $e->getMessage(),
+                'exception_class' => get_class($e),
             ]);
 
             throw new PublishException(
@@ -423,7 +427,7 @@ class RabbitMQQueue extends Queue implements QueueContract
             ]);
 
             throw $e;
-        } catch (\Exception $e) {
+        } catch (AMQPException|AMQPConnectionException|AMQPChannelException|AMQPExchangeException $e) {
             Log::error('RabbitMQ publish error', [
                 'exchange' => $exchange,
                 'routing_key' => $routingKey,
