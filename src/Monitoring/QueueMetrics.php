@@ -24,8 +24,8 @@ class QueueMetrics
      * Get statistics for a specific queue.
      *
      * Uses passive queue declaration to retrieve queue statistics from RabbitMQ.
-     * This is more reliable than ext-amqp as php-amqplib exposes the full
-     * response from queue.declare.
+     * php-amqplib exposes the full response from queue.declare including
+     * message and consumer counts.
      *
      * @return array{messages: int|null, consumers: int|null, rate: float|null, connected: bool, notice: string|null, error: string|null}
      */

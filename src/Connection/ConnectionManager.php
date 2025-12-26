@@ -176,7 +176,7 @@ class ConnectionManager
         $config->setHeartbeat((int) Arr::get($options, 'heartbeat', 60));
         $config->setConnectionTimeout((float) Arr::get($options, 'connection_timeout', 30.0));
         $config->setReadTimeout((float) Arr::get($options, 'read_timeout', 300.0));
-        $config->setWriteTimeout((float) Arr::get($options, 'read_timeout', 300.0));
+        $config->setWriteTimeout((float) Arr::get($options, 'write_timeout', 300.0));
         $config->setChannelRPCTimeout((float) Arr::get($options, 'channel_rpc_timeout', 0.0));
 
         // SSL configuration

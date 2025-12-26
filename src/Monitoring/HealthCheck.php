@@ -4,10 +4,11 @@ declare(strict_types=1);
 
 namespace Lettermint\RabbitMQ\Monitoring;
 
-use AMQPConnectionException;
 use Illuminate\Support\Facades\Log;
 use Lettermint\RabbitMQ\Connection\ConnectionManager;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
+use PhpAmqpLib\Exception\AMQPConnectionClosedException;
+use PhpAmqpLib\Exception\AMQPIOException;
 
 /**
  * RabbitMQ health check service.
@@ -67,7 +68,7 @@ class HealthCheck
                 'healthy' => false,
                 'message' => 'Connection established but not connected',
             ];
-        } catch (ConnectionException|AMQPConnectionException $e) {
+        } catch (ConnectionException|AMQPIOException|AMQPConnectionClosedException $e) {
             Log::error('RabbitMQ health check failed', [
                 'error' => $e->getMessage(),
                 'exception_class' => get_class($e),
@@ -95,7 +96,7 @@ class HealthCheck
             }
 
             return $connected;
-        } catch (ConnectionException|AMQPConnectionException $e) {
+        } catch (ConnectionException|AMQPIOException|AMQPConnectionClosedException $e) {
             Log::error('RabbitMQ ping failed', [
                 'error' => $e->getMessage(),
             ]);

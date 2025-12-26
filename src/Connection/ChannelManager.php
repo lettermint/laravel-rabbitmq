@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Lettermint\RabbitMQ\Connection;
 
+use Illuminate\Support\Facades\Log;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Connection\AbstractConnection;
@@ -115,7 +116,10 @@ class ChannelManager
                     $this->channels[$key]->close();
                 }
             } catch (AMQPIOException|AMQPConnectionClosedException $e) {
-                // Channel already closed, ignore
+                Log::debug('Channel close during cleanup (expected)', [
+                    'purpose' => $purpose,
+                    'error' => $e->getMessage(),
+                ]);
             }
 
             unset($this->channels[$key]);

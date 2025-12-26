@@ -17,7 +17,7 @@ use Lettermint\RabbitMQ\Consumers\Consumer;
  * Artisan command to consume messages from a RabbitMQ queue.
  *
  * This command replaces Laravel Horizon's worker and provides direct
- * consumption from RabbitMQ queues using ext-amqp.
+ * consumption from RabbitMQ queues using php-amqplib.
  */
 class ConsumeCommand extends Command
 {

@@ -355,7 +355,11 @@ class Consumer
             try {
                 $this->channel->basic_cancel($this->consumerTag);
             } catch (AMQPIOException|AMQPChannelClosedException $e) {
-                // Channel already closed, ignore
+                Log::debug('Consumer cancel during cleanup (expected)', [
+                    'queue' => $this->queue,
+                    'consumer_tag' => $this->consumerTag,
+                    'error' => $e->getMessage(),
+                ]);
             }
         }
 
