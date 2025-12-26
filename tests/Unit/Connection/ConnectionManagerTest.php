@@ -5,6 +5,8 @@ declare(strict_types=1);
 use Illuminate\Support\Facades\Log;
 use Lettermint\RabbitMQ\Connection\ConnectionManager;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
+use PhpAmqpLib\Connection\AbstractConnection;
+use PhpAmqpLib\Exception\AMQPIOException;
 
 test('returns default connection name from config', function () {
     $manager = new ConnectionManager([
@@ -86,7 +88,7 @@ test('reuses existing connected connection', function () {
             parent::__construct($config);
         }
 
-        protected function createConnectionToHost(array $host, array $options, array $ssl): \AMQPConnection
+        protected function createConnectionToHost(array $host, array $options, array $ssl): AbstractConnection
         {
             return $this->mockConnection;
         }
@@ -112,7 +114,7 @@ test('reconnects when connection is disconnected', function () {
             parent::__construct($config);
         }
 
-        protected function createConnectionToHost(array $host, array $options, array $ssl): \AMQPConnection
+        protected function createConnectionToHost(array $host, array $options, array $ssl): AbstractConnection
         {
             return $this->mockConnection;
         }
@@ -139,12 +141,12 @@ test('logs warning when using fallback host', function () {
             parent::__construct($config);
         }
 
-        protected function createConnectionToHost(array $host, array $options, array $ssl): \AMQPConnection
+        protected function createConnectionToHost(array $host, array $options, array $ssl): AbstractConnection
         {
             if ($this->firstAttempt) {
                 $this->firstAttempt = false;
                 $this->primaryFailed = true;
-                throw new \AMQPConnectionException('Primary host failed');
+                throw new AMQPIOException('Primary host failed');
             }
 
             return $this->mockConnection;
@@ -162,9 +164,9 @@ test('logs warning when using fallback host', function () {
 test('throws after all hosts fail', function () {
     $manager = new class(['default' => 'test', 'connections' => ['test' => ['hosts' => [['host' => 'host1'], ['host' => 'host2']]]]]) extends ConnectionManager
     {
-        protected function createConnectionToHost(array $host, array $options, array $ssl): \AMQPConnection
+        protected function createConnectionToHost(array $host, array $options, array $ssl): AbstractConnection
         {
-            throw new \AMQPConnectionException('Connection failed');
+            throw new AMQPIOException('Connection failed');
         }
     };
 
@@ -174,7 +176,7 @@ test('throws after all hosts fail', function () {
 
 test('disconnects specific connection', function () {
     $mockConnection = mockAMQPConnection(true);
-    $mockConnection->shouldReceive('disconnect')->once();
+    $mockConnection->shouldReceive('close')->once();
     // isConnected() called: 1) connection() check, 2) disconnect() check, 3) isConnected('test') assertion
     $mockConnection->shouldReceive('isConnected')->andReturn(true, true, false);
 
@@ -185,7 +187,7 @@ test('disconnects specific connection', function () {
             parent::__construct($config);
         }
 
-        protected function createConnectionToHost(array $host, array $options, array $ssl): \AMQPConnection
+        protected function createConnectionToHost(array $host, array $options, array $ssl): AbstractConnection
         {
             return $this->mockConnection;
         }

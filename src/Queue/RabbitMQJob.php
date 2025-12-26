@@ -4,32 +4,33 @@ declare(strict_types=1);
 
 namespace Lettermint\RabbitMQ\Queue;
 
-use AMQPEnvelope;
-use AMQPQueue;
 use Illuminate\Container\Container;
 use Illuminate\Contracts\Queue\Job as JobContract;
 use Illuminate\Queue\Jobs\Job;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\Log;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
+use PhpAmqpLib\Channel\AMQPChannel;
+use PhpAmqpLib\Message\AMQPMessage;
+use PhpAmqpLib\Wire\AMQPTable;
 
 /**
  * RabbitMQ Job wrapper for Laravel.
  *
- * This class wraps a RabbitMQ message (AMQPEnvelope) in Laravel's Job interface,
+ * This class wraps a RabbitMQ message (AMQPMessage) in Laravel's Job interface,
  * allowing it to be processed by Laravel's queue worker.
  */
 class RabbitMQJob extends Job implements JobContract
 {
     /**
-     * The RabbitMQ envelope containing the message.
+     * The RabbitMQ message.
      */
-    protected AMQPEnvelope $envelope;
+    protected AMQPMessage $message;
 
     /**
-     * The RabbitMQ queue instance.
+     * The RabbitMQ channel for acknowledgments.
      */
-    protected AMQPQueue $amqpQueue;
+    protected AMQPChannel $channel;
 
     /**
      * The RabbitMQ queue implementation.
@@ -51,15 +52,15 @@ class RabbitMQJob extends Job implements JobContract
     public function __construct(
         Container $container,
         RabbitMQQueue $rabbitmq,
-        AMQPQueue $queue,
-        AMQPEnvelope $envelope,
+        AMQPChannel $channel,
+        AMQPMessage $message,
         string $connectionName,
         string $queueName
     ) {
         $this->container = $container;
         $this->rabbitmq = $rabbitmq;
-        $this->amqpQueue = $queue;
-        $this->envelope = $envelope;
+        $this->channel = $channel;
+        $this->message = $message;
         $this->connectionName = $connectionName;
         $this->queueName = $queueName;
     }
@@ -83,13 +84,13 @@ class RabbitMQJob extends Job implements JobContract
 
         try {
             // Reject without requeue - let DLQ handle retry with configured delay
-            $this->rabbitmq->reject($this->envelope, $this->amqpQueue, false);
+            $this->rabbitmq->reject($this->message, $this->channel, false);
         } catch (ConnectionException $e) {
             Log::error('Failed to release/reject RabbitMQ message', [
                 'queue' => $this->queueName,
                 'job_id' => $this->getJobId(),
                 'job_name' => $this->getName(),
-                'delivery_tag' => $this->envelope->getDeliveryTag(),
+                'delivery_tag' => $this->message->getDeliveryTag(),
                 'error' => $e->getMessage(),
             ]);
 
@@ -109,14 +110,14 @@ class RabbitMQJob extends Job implements JobContract
         parent::delete();
 
         try {
-            $this->rabbitmq->ack($this->envelope, $this->amqpQueue);
+            $this->rabbitmq->ack($this->message, $this->channel);
         } catch (ConnectionException $e) {
             // CRITICAL: Job completed but ack failed - potential duplicate processing
             Log::critical('Job completed but acknowledgment failed - potential duplicate processing', [
                 'queue' => $this->queueName,
                 'job_id' => $this->getJobId(),
                 'job_name' => $this->getName(),
-                'delivery_tag' => $this->envelope->getDeliveryTag(),
+                'delivery_tag' => $this->message->getDeliveryTag(),
                 'error' => $e->getMessage(),
             ]);
 
@@ -131,13 +132,15 @@ class RabbitMQJob extends Job implements JobContract
      */
     public function attempts(): int
     {
-        $headers = $this->envelope->getHeaders();
+        $headers = $this->getHeaders();
 
         // x-death header tracks routing through DLQs
         if (isset($headers['x-death']) && is_array($headers['x-death'])) {
             $totalCount = 0;
             foreach ($headers['x-death'] as $death) {
-                $totalCount += (int) ($death['count'] ?? 0);
+                // php-amqplib may return AMQPTable for nested structures
+                $deathData = $death instanceof AMQPTable ? $death->getNativeData() : $death;
+                $totalCount += (int) ($deathData['count'] ?? 0);
             }
 
             return $totalCount + 1;
@@ -151,7 +154,9 @@ class RabbitMQJob extends Job implements JobContract
      */
     public function getJobId(): ?string
     {
-        return $this->envelope->getMessageId() ?: $this->decoded()['uuid'] ?? null;
+        $messageId = $this->getMessageProperty('message_id');
+
+        return $messageId ?: $this->decoded()['uuid'] ?? null;
     }
 
     /**
@@ -159,7 +164,7 @@ class RabbitMQJob extends Job implements JobContract
      */
     public function getRawBody(): string
     {
-        return $this->envelope->getBody();
+        return $this->message->getBody();
     }
 
     /**
@@ -192,8 +197,8 @@ class RabbitMQJob extends Job implements JobContract
 
                 Log::critical('Failed to decode RabbitMQ message payload - job will be rejected', [
                     'queue' => $this->queueName,
-                    'delivery_tag' => $this->envelope->getDeliveryTag(),
-                    'message_id' => $this->envelope->getMessageId(),
+                    'delivery_tag' => $this->message->getDeliveryTag(),
+                    'message_id' => $this->getMessageProperty('message_id'),
                     'json_error' => $errorMsg,
                     'body_preview' => substr($body, 0, 200),
                 ]);
@@ -226,19 +231,31 @@ class RabbitMQJob extends Job implements JobContract
     }
 
     /**
-     * Get the underlying envelope.
+     * Get the underlying message.
      */
-    public function getEnvelope(): AMQPEnvelope
+    public function getMessage(): AMQPMessage
     {
-        return $this->envelope;
+        return $this->message;
     }
 
     /**
-     * Get the underlying AMQPQueue.
+     * Get the underlying channel.
      */
-    public function getAMQPQueue(): AMQPQueue
+    public function getChannel(): AMQPChannel
     {
-        return $this->amqpQueue;
+        return $this->channel;
+    }
+
+    /**
+     * Get a message property safely.
+     */
+    protected function getMessageProperty(string $name): mixed
+    {
+        if ($this->message->has($name)) {
+            return $this->message->get($name);
+        }
+
+        return null;
     }
 
     /**
@@ -246,7 +263,7 @@ class RabbitMQJob extends Job implements JobContract
      */
     public function getPriority(): int
     {
-        return $this->envelope->getPriority();
+        return (int) ($this->getMessageProperty('priority') ?? 0);
     }
 
     /**
@@ -254,7 +271,7 @@ class RabbitMQJob extends Job implements JobContract
      */
     public function getTimestamp(): int
     {
-        return $this->envelope->getTimestamp();
+        return (int) ($this->getMessageProperty('timestamp') ?? 0);
     }
 
     /**
@@ -264,7 +281,13 @@ class RabbitMQJob extends Job implements JobContract
      */
     public function getHeaders(): array
     {
-        return $this->envelope->getHeaders();
+        $headers = $this->getMessageProperty('application_headers');
+
+        if ($headers instanceof AMQPTable) {
+            return $headers->getNativeData();
+        }
+
+        return $headers ?? [];
     }
 
     /**
@@ -284,8 +307,12 @@ class RabbitMQJob extends Job implements JobContract
     {
         $headers = $this->getHeaders();
 
-        if (isset($headers['x-death'][0]['queue'])) {
-            return $headers['x-death'][0]['queue'];
+        if (isset($headers['x-death'][0])) {
+            $xDeath = $headers['x-death'][0];
+            // php-amqplib may return AMQPTable for nested structures
+            $xDeathData = $xDeath instanceof AMQPTable ? $xDeath->getNativeData() : $xDeath;
+
+            return $xDeathData['queue'] ?? null;
         }
 
         return null;

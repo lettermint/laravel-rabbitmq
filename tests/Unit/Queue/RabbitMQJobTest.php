@@ -11,7 +11,7 @@ use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
 
 beforeEach(function () {
     $this->container = new Container;
-    $this->mockQueue = mockAMQPQueue('test-queue');
+    $this->mockChannel = mockAMQPChannel();
 
     $channelManager = Mockery::mock(ChannelManager::class);
     $scanner = Mockery::mock(AttributeScanner::class);
@@ -20,8 +20,8 @@ beforeEach(function () {
     $this->rabbitmq->setContainer($this->container);
 });
 
-test('returns job ID from envelope message ID', function () {
-    $envelope = mockAMQPEnvelope([
+test('returns job ID from message ID', function () {
+    $message = mockAMQPMessage([
         'messageId' => 'msg-12345',
         'body' => json_encode(['uuid' => 'payload-uuid']),
     ]);
@@ -29,8 +29,8 @@ test('returns job ID from envelope message ID', function () {
     $job = new RabbitMQJob(
         $this->container,
         $this->rabbitmq,
-        $this->mockQueue,
-        $envelope,
+        $this->mockChannel,
+        $message,
         'rabbitmq',
         'test-queue'
     );
@@ -39,7 +39,7 @@ test('returns job ID from envelope message ID', function () {
 });
 
 test('falls back to payload UUID when message ID empty', function () {
-    $envelope = mockAMQPEnvelope([
+    $message = mockAMQPMessage([
         'messageId' => '',
         'body' => json_encode(['uuid' => 'payload-uuid']),
     ]);
@@ -47,8 +47,8 @@ test('falls back to payload UUID when message ID empty', function () {
     $job = new RabbitMQJob(
         $this->container,
         $this->rabbitmq,
-        $this->mockQueue,
-        $envelope,
+        $this->mockChannel,
+        $message,
         'rabbitmq',
         'test-queue'
     );
@@ -57,13 +57,13 @@ test('falls back to payload UUID when message ID empty', function () {
 });
 
 test('returns queue name', function () {
-    $envelope = mockAMQPEnvelope();
+    $message = mockAMQPMessage();
 
     $job = new RabbitMQJob(
         $this->container,
         $this->rabbitmq,
-        $this->mockQueue,
-        $envelope,
+        $this->mockChannel,
+        $message,
         'rabbitmq',
         'my-queue'
     );
@@ -71,15 +71,15 @@ test('returns queue name', function () {
     expect($job->getQueue())->toBe('my-queue');
 });
 
-test('returns raw body from envelope', function () {
+test('returns raw body from message', function () {
     $body = '{"uuid":"test","displayName":"TestJob"}';
-    $envelope = mockAMQPEnvelope(['body' => $body]);
+    $message = mockAMQPMessage(['body' => $body]);
 
     $job = new RabbitMQJob(
         $this->container,
         $this->rabbitmq,
-        $this->mockQueue,
-        $envelope,
+        $this->mockChannel,
+        $message,
         'rabbitmq',
         'test-queue'
     );
@@ -88,13 +88,13 @@ test('returns raw body from envelope', function () {
 });
 
 test('returns 1 for first delivery', function () {
-    $envelope = mockAMQPEnvelope(['headers' => []]);
+    $message = mockAMQPMessage(['headers' => []]);
 
     $job = new RabbitMQJob(
         $this->container,
         $this->rabbitmq,
-        $this->mockQueue,
-        $envelope,
+        $this->mockChannel,
+        $message,
         'rabbitmq',
         'test-queue'
     );
@@ -103,7 +103,7 @@ test('returns 1 for first delivery', function () {
 });
 
 test('calculates attempts from x-death header', function () {
-    $envelope = mockAMQPEnvelope([
+    $message = mockAMQPMessage([
         'headers' => [
             'x-death' => [
                 ['queue' => 'original-queue', 'count' => 2, 'reason' => 'rejected'],
@@ -115,8 +115,8 @@ test('calculates attempts from x-death header', function () {
     $job = new RabbitMQJob(
         $this->container,
         $this->rabbitmq,
-        $this->mockQueue,
-        $envelope,
+        $this->mockChannel,
+        $message,
         'rabbitmq',
         'test-queue'
     );
@@ -133,13 +133,13 @@ test('decodes payload correctly', function () {
         'data' => ['email_id' => 123],
     ];
 
-    $envelope = mockAMQPEnvelope(['body' => json_encode($payload)]);
+    $message = mockAMQPMessage(['body' => json_encode($payload)]);
 
     $job = new RabbitMQJob(
         $this->container,
         $this->rabbitmq,
-        $this->mockQueue,
-        $envelope,
+        $this->mockChannel,
+        $message,
         'rabbitmq',
         'test-queue'
     );
@@ -150,13 +150,13 @@ test('decodes payload correctly', function () {
 test('throws exception on invalid JSON', function () {
     Log::spy();
 
-    $envelope = mockAMQPEnvelope(['body' => 'not-valid-json']);
+    $message = mockAMQPMessage(['body' => 'not-valid-json']);
 
     $job = new RabbitMQJob(
         $this->container,
         $this->rabbitmq,
-        $this->mockQueue,
-        $envelope,
+        $this->mockChannel,
+        $message,
         'rabbitmq',
         'test-queue'
     );
@@ -168,7 +168,7 @@ test('throws exception on invalid JSON', function () {
 });
 
 test('returns job name from payload', function () {
-    $envelope = mockAMQPEnvelope([
+    $message = mockAMQPMessage([
         'body' => json_encode([
             'displayName' => 'SendNotification',
             'job' => 'SendNotification@handle',
@@ -178,8 +178,8 @@ test('returns job name from payload', function () {
     $job = new RabbitMQJob(
         $this->container,
         $this->rabbitmq,
-        $this->mockQueue,
-        $envelope,
+        $this->mockChannel,
+        $message,
         'rabbitmq',
         'test-queue'
     );
@@ -188,7 +188,7 @@ test('returns job name from payload', function () {
 });
 
 test('returns resolved name from payload', function () {
-    $envelope = mockAMQPEnvelope([
+    $message = mockAMQPMessage([
         'body' => json_encode([
             'displayName' => 'ShortName',
             'data' => ['commandName' => 'App\\Jobs\\FullClassName'],
@@ -198,8 +198,8 @@ test('returns resolved name from payload', function () {
     $job = new RabbitMQJob(
         $this->container,
         $this->rabbitmq,
-        $this->mockQueue,
-        $envelope,
+        $this->mockChannel,
+        $message,
         'rabbitmq',
         'test-queue'
     );
@@ -208,7 +208,7 @@ test('returns resolved name from payload', function () {
 });
 
 test('detects message was dead-lettered', function () {
-    $envelope = mockAMQPEnvelope([
+    $message = mockAMQPMessage([
         'headers' => [
             'x-death' => [['queue' => 'original', 'count' => 1]],
         ],
@@ -217,8 +217,8 @@ test('detects message was dead-lettered', function () {
     $job = new RabbitMQJob(
         $this->container,
         $this->rabbitmq,
-        $this->mockQueue,
-        $envelope,
+        $this->mockChannel,
+        $message,
         'rabbitmq',
         'test-queue'
     );
@@ -227,13 +227,13 @@ test('detects message was dead-lettered', function () {
 });
 
 test('detects message was not dead-lettered', function () {
-    $envelope = mockAMQPEnvelope(['headers' => []]);
+    $message = mockAMQPMessage(['headers' => []]);
 
     $job = new RabbitMQJob(
         $this->container,
         $this->rabbitmq,
-        $this->mockQueue,
-        $envelope,
+        $this->mockChannel,
+        $message,
         'rabbitmq',
         'test-queue'
     );
@@ -242,7 +242,7 @@ test('detects message was not dead-lettered', function () {
 });
 
 test('returns original queue from x-death header', function () {
-    $envelope = mockAMQPEnvelope([
+    $message = mockAMQPMessage([
         'headers' => [
             'x-death' => [
                 ['queue' => 'emails:outbound', 'count' => 1],
@@ -253,8 +253,8 @@ test('returns original queue from x-death header', function () {
     $job = new RabbitMQJob(
         $this->container,
         $this->rabbitmq,
-        $this->mockQueue,
-        $envelope,
+        $this->mockChannel,
+        $message,
         'rabbitmq',
         'dlq-queue'
     );
@@ -263,13 +263,13 @@ test('returns original queue from x-death header', function () {
 });
 
 test('returns null when no original queue', function () {
-    $envelope = mockAMQPEnvelope(['headers' => []]);
+    $message = mockAMQPMessage(['headers' => []]);
 
     $job = new RabbitMQJob(
         $this->container,
         $this->rabbitmq,
-        $this->mockQueue,
-        $envelope,
+        $this->mockChannel,
+        $message,
         'rabbitmq',
         'test-queue'
     );
@@ -278,15 +278,15 @@ test('returns null when no original queue', function () {
 });
 
 test('returns max tries from payload', function () {
-    $envelope = mockAMQPEnvelope([
+    $message = mockAMQPMessage([
         'body' => json_encode(['maxTries' => 5]),
     ]);
 
     $job = new RabbitMQJob(
         $this->container,
         $this->rabbitmq,
-        $this->mockQueue,
-        $envelope,
+        $this->mockChannel,
+        $message,
         'rabbitmq',
         'test-queue'
     );
@@ -295,15 +295,15 @@ test('returns max tries from payload', function () {
 });
 
 test('returns null when max tries not set', function () {
-    $envelope = mockAMQPEnvelope([
+    $message = mockAMQPMessage([
         'body' => json_encode([]),
     ]);
 
     $job = new RabbitMQJob(
         $this->container,
         $this->rabbitmq,
-        $this->mockQueue,
-        $envelope,
+        $this->mockChannel,
+        $message,
         'rabbitmq',
         'test-queue'
     );
@@ -312,15 +312,15 @@ test('returns null when max tries not set', function () {
 });
 
 test('returns timeout from payload', function () {
-    $envelope = mockAMQPEnvelope([
+    $message = mockAMQPMessage([
         'body' => json_encode(['timeout' => 120]),
     ]);
 
     $job = new RabbitMQJob(
         $this->container,
         $this->rabbitmq,
-        $this->mockQueue,
-        $envelope,
+        $this->mockChannel,
+        $message,
         'rabbitmq',
         'test-queue'
     );
@@ -329,15 +329,15 @@ test('returns timeout from payload', function () {
 });
 
 test('returns backoff from payload', function () {
-    $envelope = mockAMQPEnvelope([
+    $message = mockAMQPMessage([
         'body' => json_encode(['backoff' => [60, 120, 300]]),
     ]);
 
     $job = new RabbitMQJob(
         $this->container,
         $this->rabbitmq,
-        $this->mockQueue,
-        $envelope,
+        $this->mockChannel,
+        $message,
         'rabbitmq',
         'test-queue'
     );
@@ -345,44 +345,44 @@ test('returns backoff from payload', function () {
     expect($job->backoff())->toBe([60, 120, 300]);
 });
 
-test('returns envelope', function () {
-    $envelope = mockAMQPEnvelope();
+test('returns message', function () {
+    $message = mockAMQPMessage();
 
     $job = new RabbitMQJob(
         $this->container,
         $this->rabbitmq,
-        $this->mockQueue,
-        $envelope,
+        $this->mockChannel,
+        $message,
         'rabbitmq',
         'test-queue'
     );
 
-    expect($job->getEnvelope())->toBe($envelope);
+    expect($job->getMessage())->toBe($message);
 });
 
-test('returns AMQP queue', function () {
-    $envelope = mockAMQPEnvelope();
+test('returns AMQP channel', function () {
+    $message = mockAMQPMessage();
 
     $job = new RabbitMQJob(
         $this->container,
         $this->rabbitmq,
-        $this->mockQueue,
-        $envelope,
+        $this->mockChannel,
+        $message,
         'rabbitmq',
         'test-queue'
     );
 
-    expect($job->getAMQPQueue())->toBe($this->mockQueue);
+    expect($job->getChannel())->toBe($this->mockChannel);
 });
 
-test('returns priority from envelope', function () {
-    $envelope = mockAMQPEnvelope(['priority' => 7]);
+test('returns priority from message', function () {
+    $message = mockAMQPMessage(['priority' => 7]);
 
     $job = new RabbitMQJob(
         $this->container,
         $this->rabbitmq,
-        $this->mockQueue,
-        $envelope,
+        $this->mockChannel,
+        $message,
         'rabbitmq',
         'test-queue'
     );
@@ -390,15 +390,15 @@ test('returns priority from envelope', function () {
     expect($job->getPriority())->toBe(7);
 });
 
-test('returns timestamp from envelope', function () {
+test('returns timestamp from message', function () {
     $timestamp = time();
-    $envelope = mockAMQPEnvelope(['timestamp' => $timestamp]);
+    $message = mockAMQPMessage(['timestamp' => $timestamp]);
 
     $job = new RabbitMQJob(
         $this->container,
         $this->rabbitmq,
-        $this->mockQueue,
-        $envelope,
+        $this->mockChannel,
+        $message,
         'rabbitmq',
         'test-queue'
     );
@@ -406,15 +406,15 @@ test('returns timestamp from envelope', function () {
     expect($job->getTimestamp())->toBe($timestamp);
 });
 
-test('returns headers from envelope', function () {
+test('returns headers from message', function () {
     $headers = ['x-custom' => 'value'];
-    $envelope = mockAMQPEnvelope(['headers' => $headers]);
+    $message = mockAMQPMessage(['headers' => $headers]);
 
     $job = new RabbitMQJob(
         $this->container,
         $this->rabbitmq,
-        $this->mockQueue,
-        $envelope,
+        $this->mockChannel,
+        $message,
         'rabbitmq',
         'test-queue'
     );

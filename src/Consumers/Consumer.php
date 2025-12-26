@@ -4,10 +4,6 @@ declare(strict_types=1);
 
 namespace Lettermint\RabbitMQ\Consumers;
 
-use AMQPChannelException;
-use AMQPConnectionException;
-use AMQPQueue;
-use AMQPQueueException;
 use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Queue\Events\JobExceptionOccurred;
@@ -22,13 +18,24 @@ use Lettermint\RabbitMQ\Discovery\AttributeScanner;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
 use Lettermint\RabbitMQ\Queue\RabbitMQJob;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
+use PhpAmqpLib\Channel\AMQPChannel;
+use PhpAmqpLib\Connection\AbstractConnection;
+use PhpAmqpLib\Connection\Heartbeat\PCNTLHeartbeatSender;
+use PhpAmqpLib\Exception\AMQPChannelClosedException;
+use PhpAmqpLib\Exception\AMQPConnectionClosedException;
+use PhpAmqpLib\Exception\AMQPIOException;
+use PhpAmqpLib\Exception\AMQPRuntimeException;
+use PhpAmqpLib\Exception\AMQPTimeoutException;
+use PhpAmqpLib\Message\AMQPMessage;
 use Throwable;
 
 /**
  * RabbitMQ message consumer.
  *
  * This class handles the consumption of messages from RabbitMQ queues,
- * processing them through Laravel's job system.
+ * processing them through Laravel's job system. Uses basic_consume for
+ * push-based message delivery and PCNTLHeartbeatSender for maintaining
+ * connections during long-running jobs.
  */
 class Consumer
 {
@@ -62,6 +69,30 @@ class Consumer
 
     protected bool $shouldQuit = false;
 
+    protected int $jobsProcessed = 0;
+
+    protected ?Carbon $startTime = null;
+
+    /**
+     * The heartbeat sender for maintaining connections during long-running jobs.
+     */
+    protected ?PCNTLHeartbeatSender $heartbeatSender = null;
+
+    /**
+     * Whether to use the heartbeat sender.
+     */
+    protected bool $useHeartbeatSender = true;
+
+    /**
+     * The active channel for consuming.
+     */
+    protected ?AMQPChannel $channel = null;
+
+    /**
+     * Consumer tag for cancelling consumption.
+     */
+    protected string $consumerTag = '';
+
     public function __construct(
         protected ChannelManager $channelManager,
         protected AttributeScanner $scanner,
@@ -73,17 +104,21 @@ class Consumer
     /**
      * Start consuming messages from the queue.
      *
+     * Uses basic_consume for push-based message delivery. The wait() method
+     * processes heartbeats between jobs, while PCNTLHeartbeatSender handles
+     * heartbeats DURING job execution (via SIGALRM).
+     *
      * @throws ConnectionException When consumer fails to initialize or connection is lost
      */
     public function consume(): void
     {
-        $startTime = Carbon::now();
-        $jobsProcessed = 0;
+        $this->startTime = Carbon::now();
+        $this->jobsProcessed = 0;
 
         try {
-            $channel = $this->channelManager->consumeChannel();
-            $channel->setPrefetchCount($this->prefetch);
-        } catch (AMQPConnectionException|AMQPChannelException $e) {
+            $this->channel = $this->channelManager->consumeChannel();
+            $this->channel->basic_qos(0, $this->prefetch, false);
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPRuntimeException $e) {
             Log::error('RabbitMQ consumer failed to start', [
                 'queue' => $this->queue,
                 'error' => $e->getMessage(),
@@ -95,66 +130,100 @@ class Consumer
             );
         }
 
-        $amqpQueue = new AMQPQueue($channel);
-        $amqpQueue->setName($this->queue);
+        $connection = $this->channelManager->getConnection();
 
-        // Register signal handlers
+        // Register heartbeat sender BEFORE consuming
+        if ($this->shouldUseHeartbeatSender($connection)) {
+            $this->heartbeatSender = new PCNTLHeartbeatSender($connection);
+            $this->heartbeatSender->register();
+
+            Log::debug('RabbitMQ heartbeat sender registered', [
+                'queue' => $this->queue,
+                'heartbeat_interval' => $connection->getHeartbeat(),
+            ]);
+        }
+
+        // Register signal handlers for graceful shutdown
         $this->registerSignalHandlers();
 
-        while (! $this->shouldQuit) {
-            // Check if we should stop
-            if ($this->shouldStop($jobsProcessed, $startTime)) {
-                break;
-            }
+        try {
+            // Register consumer callback (push-based)
+            $this->consumerTag = $this->channel->basic_consume(
+                $this->queue,
+                '',              // consumer tag (auto-generated)
+                false,           // no_local
+                false,           // no_ack (we ack manually)
+                false,           // exclusive
+                false,           // nowait
+                function (AMQPMessage $message): void {
+                    $this->handleMessage($message);
+                }
+            );
 
-            // Fire the looping event
-            $this->events->dispatch(new Looping($this->connection, $this->queue));
+            Log::info('RabbitMQ consumer started', [
+                'queue' => $this->queue,
+                'consumer_tag' => $this->consumerTag,
+                'prefetch' => $this->prefetch,
+            ]);
 
-            // Get a message from the queue
-            try {
-                $envelope = $amqpQueue->get();
-            } catch (AMQPConnectionException|AMQPChannelException|AMQPQueueException $e) {
-                Log::error('RabbitMQ failed to get message from queue', [
-                    'queue' => $this->queue,
-                    'jobs_processed' => $jobsProcessed,
-                    'error' => $e->getMessage(),
-                ]);
-
-                throw new ConnectionException(
-                    "Consumer lost connection to queue '{$this->queue}': {$e->getMessage()}",
-                    previous: $e
-                );
-            }
-
-            if ($envelope === null) {
-                if ($this->stopWhenEmpty) {
+            // Consume loop - wait() handles heartbeats between jobs
+            while ($this->channel->is_consuming() && ! $this->shouldQuit) {
+                // Check if we should stop
+                if ($this->shouldStop($this->jobsProcessed, $this->startTime)) {
                     break;
                 }
 
-                $this->sleep($this->sleep);
+                // Fire the looping event
+                $this->events->dispatch(new Looping($this->connection, $this->queue));
 
-                continue;
+                try {
+                    // wait() processes heartbeats while waiting for messages
+                    // PCNTLHeartbeatSender handles heartbeats DURING job execution
+                    $this->channel->wait(null, false, $this->timeout ?: 30);
+                } catch (AMQPTimeoutException $e) {
+                    // Timeout during wait() - normal when queue is empty
+                    // Check if we should stop when empty
+                    if ($this->stopWhenEmpty) {
+                        break;
+                    }
+                }
             }
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPRuntimeException $e) {
+            Log::error('RabbitMQ consumer connection lost', [
+                'queue' => $this->queue,
+                'jobs_processed' => $this->jobsProcessed,
+                'error' => $e->getMessage(),
+            ]);
 
-            // Create a job instance
-            $job = new RabbitMQJob(
-                container: app(),
-                rabbitmq: $this->rabbitmq,
-                queue: $amqpQueue,
-                envelope: $envelope,
-                connectionName: $this->connection,
-                queueName: $this->queue
+            throw new ConnectionException(
+                "Consumer lost connection to queue '{$this->queue}': {$e->getMessage()}",
+                previous: $e
             );
+        } finally {
+            $this->cleanup();
+        }
+    }
 
-            // Process the job
-            $this->processJob($job);
+    /**
+     * Handle an incoming message.
+     */
+    protected function handleMessage(AMQPMessage $message): void
+    {
+        $job = new RabbitMQJob(
+            container: app(),
+            rabbitmq: $this->rabbitmq,
+            channel: $message->getChannel(),
+            message: $message,
+            connectionName: $this->connection,
+            queueName: $this->queue
+        );
 
-            $jobsProcessed++;
+        $this->processJob($job);
+        $this->jobsProcessed++;
 
-            // Rest between jobs if configured
-            if ($this->rest > 0) {
-                $this->sleep($this->rest);
-            }
+        // Rest between jobs if configured
+        if ($this->rest > 0) {
+            $this->sleep($this->rest);
         }
     }
 
@@ -220,7 +289,7 @@ class Consumer
 
         try {
             // Reject without requeue - will go to DLQ
-            $this->rabbitmq->reject($job->getEnvelope(), $job->getAMQPQueue(), false);
+            $this->rabbitmq->reject($job->getMessage(), $job->getChannel(), false);
         } catch (ConnectionException $rejectException) {
             Log::critical('Failed to reject job after failure - message state undefined', [
                 'queue' => $this->queue,
@@ -233,6 +302,68 @@ class Consumer
             // Re-throw to stop the consumer - we cannot safely continue
             throw $rejectException;
         }
+    }
+
+    /**
+     * Determine if the heartbeat sender should be used.
+     */
+    protected function shouldUseHeartbeatSender(AbstractConnection $connection): bool
+    {
+        // Check if enabled in config
+        if (! $this->useHeartbeatSender) {
+            return false;
+        }
+
+        if (! config('rabbitmq.heartbeat_sender.enabled', true)) {
+            return false;
+        }
+
+        // Check if pcntl extension is available
+        if (! extension_loaded('pcntl')) {
+            Log::warning('RabbitMQ heartbeat sender not available: pcntl extension not loaded', [
+                'queue' => $this->queue,
+            ]);
+
+            return false;
+        }
+
+        // Check if connection has heartbeat enabled
+        if ($connection->getHeartbeat() <= 0) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Clean up resources.
+     */
+    protected function cleanup(): void
+    {
+        // Unregister heartbeat sender
+        if ($this->heartbeatSender !== null) {
+            $this->heartbeatSender->unregister();
+            $this->heartbeatSender = null;
+
+            Log::debug('RabbitMQ heartbeat sender unregistered', [
+                'queue' => $this->queue,
+            ]);
+        }
+
+        // Cancel consumer
+        if ($this->channel !== null && $this->channel->is_open() && $this->consumerTag !== '') {
+            try {
+                $this->channel->basic_cancel($this->consumerTag);
+            } catch (AMQPIOException|AMQPChannelClosedException $e) {
+                // Channel already closed, ignore
+            }
+        }
+
+        Log::info('RabbitMQ consumer stopped', [
+            'queue' => $this->queue,
+            'jobs_processed' => $this->jobsProcessed,
+            'runtime_seconds' => $this->startTime?->diffInSeconds(Carbon::now()),
+        ]);
     }
 
     /**
@@ -284,15 +415,18 @@ class Consumer
         if (extension_loaded('pcntl')) {
             pcntl_async_signals(true);
 
-            pcntl_signal(SIGTERM, function () {
+            // Note: SIGALRM is used by PCNTLHeartbeatSender for heartbeats
+            // We only register SIGTERM, SIGINT, SIGQUIT for graceful shutdown
+
+            pcntl_signal(SIGTERM, function (): void {
                 $this->shouldQuit = true;
             });
 
-            pcntl_signal(SIGINT, function () {
+            pcntl_signal(SIGINT, function (): void {
                 $this->shouldQuit = true;
             });
 
-            pcntl_signal(SIGQUIT, function () {
+            pcntl_signal(SIGQUIT, function (): void {
                 $this->shouldQuit = true;
             });
         }
@@ -373,6 +507,13 @@ class Consumer
     public function setStopWhenEmpty(bool $stopWhenEmpty): self
     {
         $this->stopWhenEmpty = $stopWhenEmpty;
+
+        return $this;
+    }
+
+    public function setUseHeartbeatSender(bool $use): self
+    {
+        $this->useHeartbeatSender = $use;
 
         return $this;
     }

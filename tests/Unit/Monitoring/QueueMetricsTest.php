@@ -49,8 +49,8 @@ test('getAllQueueStats returns empty array for empty input', function () {
     expect($stats)->toBeEmpty();
 });
 
-test('hasStatistics always returns false due to ext-amqp limitations', function () {
+test('hasStatistics returns true with php-amqplib', function () {
     $metrics = new QueueMetrics($this->channelManager);
 
-    expect($metrics->hasStatistics())->toBeFalse();
+    expect($metrics->hasStatistics())->toBeTrue();
 });

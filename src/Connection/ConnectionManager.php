@@ -4,14 +4,18 @@ declare(strict_types=1);
 
 namespace Lettermint\RabbitMQ\Connection;
 
-use AMQPConnection;
-use AMQPConnectionException;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\Log;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
+use PhpAmqpLib\Connection\AbstractConnection;
+use PhpAmqpLib\Connection\AMQPConnectionConfig;
+use PhpAmqpLib\Connection\AMQPConnectionFactory;
+use PhpAmqpLib\Exception\AMQPConnectionClosedException;
+use PhpAmqpLib\Exception\AMQPIOException;
+use PhpAmqpLib\Exception\AMQPRuntimeException;
 
 /**
- * Manages RabbitMQ connections using ext-amqp.
+ * Manages RabbitMQ connections using php-amqplib.
  *
  * This class handles connection creation, pooling, and lifecycle management.
  * It supports multiple hosts for failover and SSL connections.
@@ -21,7 +25,7 @@ class ConnectionManager
     /**
      * Active connections indexed by name.
      *
-     * @var array<string, AMQPConnection>
+     * @var array<string, AbstractConnection>
      */
     protected array $connections = [];
 
@@ -40,7 +44,7 @@ class ConnectionManager
      *
      * @throws ConnectionException When connection or reconnection fails
      */
-    public function connection(?string $name = null): AMQPConnection
+    public function connection(?string $name = null): AbstractConnection
     {
         $name ??= $this->getDefaultConnection();
 
@@ -60,7 +64,7 @@ class ConnectionManager
                 Log::info('RabbitMQ reconnection successful', [
                     'connection' => $name,
                 ]);
-            } catch (AMQPConnectionException $e) {
+            } catch (AMQPIOException|AMQPConnectionClosedException|AMQPRuntimeException $e) {
                 Log::error('RabbitMQ reconnection failed', [
                     'connection' => $name,
                     'error' => $e->getMessage(),
@@ -84,7 +88,7 @@ class ConnectionManager
      *
      * @throws ConnectionException When all hosts fail
      */
-    protected function createConnection(string $name): AMQPConnection
+    protected function createConnection(string $name): AbstractConnection
     {
         $config = $this->getConnectionConfig($name);
 
@@ -120,7 +124,7 @@ class ConnectionManager
                 }
 
                 return $connection;
-            } catch (AMQPConnectionException $e) {
+            } catch (AMQPIOException|AMQPConnectionClosedException|AMQPRuntimeException $e) {
                 $failures[] = [
                     'host' => $hostIdentifier,
                     'error' => $e->getMessage(),
@@ -155,35 +159,46 @@ class ConnectionManager
      * @param  array<string, mixed>  $options
      * @param  array<string, mixed>  $ssl
      *
-     * @throws AMQPConnectionException
+     * @throws AMQPIOException|AMQPConnectionClosedException|AMQPRuntimeException
      */
-    protected function createConnectionToHost(array $host, array $options, array $ssl): AMQPConnection
+    protected function createConnectionToHost(array $host, array $options, array $ssl): AbstractConnection
     {
-        $credentials = [
-            'host' => Arr::get($host, 'host', 'localhost'),
-            'port' => Arr::get($host, 'port', 5672),
-            'login' => Arr::get($host, 'user', 'guest'),
-            'password' => Arr::get($host, 'password', 'guest'),
-            'vhost' => Arr::get($host, 'vhost', '/'),
-            'heartbeat' => Arr::get($options, 'heartbeat', 60),
-            'connect_timeout' => Arr::get($options, 'connection_timeout', 30),
-            'read_timeout' => Arr::get($options, 'read_timeout', 300),
-            'write_timeout' => Arr::get($options, 'write_timeout', 300),
-            'rpc_timeout' => Arr::get($options, 'channel_rpc_timeout', 0),
-        ];
+        $config = new AMQPConnectionConfig;
 
-        // Add SSL configuration if enabled
+        // Connection settings
+        $config->setHost(Arr::get($host, 'host', 'localhost'));
+        $config->setPort((int) Arr::get($host, 'port', 5672));
+        $config->setUser(Arr::get($host, 'user', 'guest'));
+        $config->setPassword(Arr::get($host, 'password', 'guest'));
+        $config->setVhost(Arr::get($host, 'vhost', '/'));
+
+        // Timeouts and heartbeat
+        $config->setHeartbeat((int) Arr::get($options, 'heartbeat', 60));
+        $config->setConnectionTimeout((float) Arr::get($options, 'connection_timeout', 30.0));
+        $config->setReadTimeout((float) Arr::get($options, 'read_timeout', 300.0));
+        $config->setWriteTimeout((float) Arr::get($options, 'read_timeout', 300.0));
+        $config->setChannelRPCTimeout((float) Arr::get($options, 'channel_rpc_timeout', 0.0));
+
+        // SSL configuration
         if (Arr::get($ssl, 'enabled', false)) {
-            $credentials['cacert'] = Arr::get($ssl, 'cafile');
-            $credentials['cert'] = Arr::get($ssl, 'local_cert');
-            $credentials['key'] = Arr::get($ssl, 'local_key');
-            $credentials['verify'] = Arr::get($ssl, 'verify_peer', true);
+            $config->setIsSecure(true);
+
+            if ($caFile = Arr::get($ssl, 'cafile')) {
+                $config->setSslCaCert($caFile);
+            }
+
+            if ($localCert = Arr::get($ssl, 'local_cert')) {
+                $config->setSslCert($localCert);
+            }
+
+            if ($localKey = Arr::get($ssl, 'local_key')) {
+                $config->setSslKey($localKey);
+            }
+
+            $config->setSslVerify(Arr::get($ssl, 'verify_peer', true));
         }
 
-        $connection = new AMQPConnection($credentials);
-        $connection->connect();
-
-        return $connection;
+        return AMQPConnectionFactory::create($config);
     }
 
     /**
@@ -212,7 +227,7 @@ class ConnectionManager
         $name ??= $this->getDefaultConnection();
 
         if (isset($this->connections[$name]) && $this->connections[$name]->isConnected()) {
-            $this->connections[$name]->disconnect();
+            $this->connections[$name]->close();
         }
 
         unset($this->connections[$name]);
@@ -247,7 +262,17 @@ class ConnectionManager
     {
         return array_keys(array_filter(
             $this->connections,
-            fn (AMQPConnection $conn) => $conn->isConnected()
+            fn (AbstractConnection $conn) => $conn->isConnected()
         ));
+    }
+
+    /**
+     * Get the heartbeat interval for a connection.
+     */
+    public function getHeartbeat(?string $name = null): int
+    {
+        $connection = $this->connection($name);
+
+        return $connection->getHeartbeat();
     }
 }

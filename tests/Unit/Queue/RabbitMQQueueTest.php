@@ -13,7 +13,6 @@ use Lettermint\RabbitMQ\Tests\Fixtures\Jobs\SimpleJob;
 
 beforeEach(function () {
     $this->mockChannel = mockAMQPChannel();
-    $this->mockExchange = mockAMQPExchange('test-exchange', $this->mockChannel);
 
     $this->channelManager = Mockery::mock(ChannelManager::class);
     $this->channelManager->shouldReceive('publishChannel')
@@ -81,7 +80,7 @@ test('returns default when null provided', function () {
 });
 
 test('returns job when message available', function () {
-    $envelope = mockAMQPEnvelope([
+    $message = mockAMQPMessage([
         'body' => json_encode([
             'uuid' => 'test-uuid',
             'displayName' => 'TestJob',
@@ -90,43 +89,18 @@ test('returns job when message available', function () {
         ]),
     ]);
 
-    // Create a real AMQPQueue mock for the get() call
-    $mockQueue = mockAMQPQueue('test-queue');
-    $mockQueue->shouldReceive('get')->once()->andReturn($envelope);
+    // Set up channel to return message from basic_get
+    $this->mockChannel->shouldReceive('basic_get')
+        ->once()
+        ->andReturn($message);
 
-    // Create a testable queue that returns our mocked queue
-    $queue = new class($this->channelManager, $this->scanner, $this->config, $mockQueue) extends RabbitMQQueue
-    {
-        public function __construct(
-            ChannelManager $channelManager,
-            AttributeScanner $scanner,
-            array $config,
-            private $mockQueue
-        ) {
-            parent::__construct($channelManager, $scanner, $config);
-        }
-
-        public function pop($queue = null): ?\Illuminate\Contracts\Queue\Job
-        {
-            $queue = $this->getQueue($queue);
-            $envelope = $this->mockQueue->get();
-
-            if ($envelope instanceof \AMQPEnvelope) {
-                return new \Lettermint\RabbitMQ\Queue\RabbitMQJob(
-                    container: $this->container,
-                    rabbitmq: $this,
-                    queue: $this->mockQueue,
-                    envelope: $envelope,
-                    connectionName: $this->connectionName ?? 'rabbitmq',
-                    queueName: $queue
-                );
-            }
-
-            return null;
-        }
-    };
-
+    $queue = new RabbitMQQueue(
+        $this->channelManager,
+        $this->scanner,
+        $this->config
+    );
     $queue->setContainer(new Container);
+    $queue->setConnectionName('rabbitmq');
 
     $job = $queue->pop('test-queue');
 
@@ -219,9 +193,9 @@ test('returns empty array for empty batch', function () {
 });
 
 test('acknowledges message', function () {
-    $envelope = mockAMQPEnvelope(['deliveryTag' => 42]);
-    $mockQueue = mockAMQPQueue();
-    $mockQueue->shouldReceive('ack')->with(42)->once();
+    $message = mockAMQPMessage(['deliveryTag' => 42]);
+    $channel = mockAMQPChannel();
+    $channel->shouldReceive('basic_ack')->with(42)->once();
 
     $queue = new RabbitMQQueue(
         $this->channelManager,
@@ -229,16 +203,16 @@ test('acknowledges message', function () {
         $this->config
     );
 
-    $queue->ack($envelope, $mockQueue);
+    $queue->ack($message, $channel);
 
     // Assertion is in mock expectation
     expect(true)->toBeTrue();
 });
 
 test('rejects message without requeue', function () {
-    $envelope = mockAMQPEnvelope(['deliveryTag' => 42]);
-    $mockQueue = mockAMQPQueue();
-    $mockQueue->shouldReceive('reject')->with(42, AMQP_NOPARAM)->once();
+    $message = mockAMQPMessage(['deliveryTag' => 42]);
+    $channel = mockAMQPChannel();
+    $channel->shouldReceive('basic_reject')->with(42, false)->once();
 
     $queue = new RabbitMQQueue(
         $this->channelManager,
@@ -246,15 +220,15 @@ test('rejects message without requeue', function () {
         $this->config
     );
 
-    $queue->reject($envelope, $mockQueue, false);
+    $queue->reject($message, $channel, false);
 
     expect(true)->toBeTrue();
 });
 
 test('rejects message with requeue', function () {
-    $envelope = mockAMQPEnvelope(['deliveryTag' => 42]);
-    $mockQueue = mockAMQPQueue();
-    $mockQueue->shouldReceive('reject')->with(42, AMQP_REQUEUE)->once();
+    $message = mockAMQPMessage(['deliveryTag' => 42]);
+    $channel = mockAMQPChannel();
+    $channel->shouldReceive('basic_reject')->with(42, true)->once();
 
     $queue = new RabbitMQQueue(
         $this->channelManager,
@@ -262,7 +236,7 @@ test('rejects message with requeue', function () {
         $this->config
     );
 
-    $queue->reject($envelope, $mockQueue, true);
+    $queue->reject($message, $channel, true);
 
     expect(true)->toBeTrue();
 });

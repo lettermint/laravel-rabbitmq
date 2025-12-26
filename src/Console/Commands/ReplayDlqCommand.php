@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace Lettermint\RabbitMQ\Console\Commands;
 
-use AMQPQueue;
 use Illuminate\Console\Command;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Discovery\AttributeScanner;
@@ -54,8 +53,6 @@ class ReplayDlqCommand extends Command
 
         try {
             $channel = $channelManager->consumeChannel();
-            $dlqQueue = new AMQPQueue($channel);
-            $dlqQueue->setName($dlqQueueName);
 
             $replayed = 0;
             $processed = 0;
@@ -65,33 +62,35 @@ class ReplayDlqCommand extends Command
                     break;
                 }
 
-                $envelope = $dlqQueue->get();
+                // Use basic_get to fetch a message from the DLQ
+                $message = $channel->basic_get($dlqQueueName, false);
 
-                if ($envelope === null) {
+                if ($message === null) {
                     break;
                 }
 
                 $processed++;
 
                 if ($dryRun) {
-                    $payload = json_decode($envelope->getBody(), true);
+                    $payload = json_decode($message->getBody(), true);
                     $jobName = $payload['displayName'] ?? 'Unknown';
                     $this->line("  Would replay: {$jobName}");
-                    $dlqQueue->reject($envelope->getDeliveryTag(), AMQP_REQUEUE);
+                    // Reject with requeue to put it back
+                    $channel->basic_reject($message->getDeliveryTag(), true);
 
                     continue;
                 }
 
                 // Republish to original queue
-                $rabbitmq->pushRaw($envelope->getBody(), $queueName);
+                $rabbitmq->pushRaw($message->getBody(), $queueName);
 
                 // Acknowledge the DLQ message
-                $dlqQueue->ack($envelope->getDeliveryTag());
+                $channel->basic_ack($message->getDeliveryTag());
 
                 $replayed++;
 
                 if ($this->getOutput()->isVerbose()) {
-                    $payload = json_decode($envelope->getBody(), true);
+                    $payload = json_decode($message->getBody(), true);
                     $jobName = $payload['displayName'] ?? 'Unknown';
                     $this->line("  <fg=green>✓</> Replayed: {$jobName}");
                 }

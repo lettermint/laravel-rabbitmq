@@ -197,25 +197,17 @@ test('auto-creates DLQ queue', function () {
 });
 
 test('purges queue', function () {
-    $mockQueue = mockAMQPQueue('test-queue');
-    $mockQueue->shouldReceive('purge')->once()->andReturn(42);
+    // Mock channel to return purge count
+    $this->mockChannel->shouldReceive('queue_purge')
+        ->with('test-queue')
+        ->once()
+        ->andReturn(42);
 
-    $manager = new class($this->channelManager, $this->scanner, $this->config, $mockQueue) extends TopologyManager
-    {
-        public function __construct(
-            ChannelManager $channelManager,
-            AttributeScanner $scanner,
-            array $config,
-            private $mockQueue
-        ) {
-            parent::__construct($channelManager, $scanner, $config);
-        }
-
-        public function purgeQueue(string $queueName): int
-        {
-            return $this->mockQueue->purge();
-        }
-    };
+    $manager = new TopologyManager(
+        $this->channelManager,
+        $this->scanner,
+        $this->config
+    );
 
     $count = $manager->purgeQueue('test-queue');
 
@@ -223,25 +215,16 @@ test('purges queue', function () {
 });
 
 test('deletes queue', function () {
-    $mockQueue = mockAMQPQueue('test-queue');
-    $mockQueue->shouldReceive('delete')->once();
+    // Mock channel queue_delete
+    $this->mockChannel->shouldReceive('queue_delete')
+        ->with('test-queue')
+        ->once();
 
-    $manager = new class($this->channelManager, $this->scanner, $this->config, $mockQueue) extends TopologyManager
-    {
-        public function __construct(
-            ChannelManager $channelManager,
-            AttributeScanner $scanner,
-            array $config,
-            private $mockQueue
-        ) {
-            parent::__construct($channelManager, $scanner, $config);
-        }
-
-        public function deleteQueue(string $queueName): void
-        {
-            $this->mockQueue->delete();
-        }
-    };
+    $manager = new TopologyManager(
+        $this->channelManager,
+        $this->scanner,
+        $this->config
+    );
 
     $manager->deleteQueue('test-queue');
 

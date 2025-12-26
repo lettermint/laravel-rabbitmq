@@ -4,13 +4,15 @@ declare(strict_types=1);
 
 namespace Lettermint\RabbitMQ\Connection;
 
-use AMQPChannel;
-use AMQPConnection;
-use AMQPConnectionException;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
+use PhpAmqpLib\Channel\AMQPChannel;
+use PhpAmqpLib\Connection\AbstractConnection;
+use PhpAmqpLib\Exception\AMQPConnectionClosedException;
+use PhpAmqpLib\Exception\AMQPIOException;
+use PhpAmqpLib\Exception\AMQPRuntimeException;
 
 /**
- * Manages RabbitMQ channels for the ext-amqp extension.
+ * Manages RabbitMQ channels for php-amqplib.
  *
  * Channels are lightweight connections that share a single TCP connection.
  * This class manages channel lifecycle and provides channels for different
@@ -41,7 +43,7 @@ class ChannelManager
     {
         $key = $this->getChannelKey($purpose, $connection);
 
-        if (! isset($this->channels[$key]) || ! $this->channels[$key]->isConnected()) {
+        if (! isset($this->channels[$key]) || ! $this->channels[$key]->is_open()) {
             $this->channels[$key] = $this->createChannel($connection);
         }
 
@@ -58,8 +60,8 @@ class ChannelManager
         try {
             $amqpConnection = $this->connectionManager->connection($connection);
 
-            return new AMQPChannel($amqpConnection);
-        } catch (AMQPConnectionException $e) {
+            return $amqpConnection->channel();
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPRuntimeException $e) {
             throw new ConnectionException(
                 'Failed to create RabbitMQ channel: '.$e->getMessage(),
                 previous: $e
@@ -108,7 +110,14 @@ class ChannelManager
         $key = $this->getChannelKey($purpose, $connection);
 
         if (isset($this->channels[$key])) {
-            // ext-amqp doesn't have explicit channel close, just unset
+            try {
+                if ($this->channels[$key]->is_open()) {
+                    $this->channels[$key]->close();
+                }
+            } catch (AMQPIOException|AMQPConnectionClosedException $e) {
+                // Channel already closed, ignore
+            }
+
             unset($this->channels[$key]);
         }
     }
@@ -118,7 +127,10 @@ class ChannelManager
      */
     public function closeAll(): void
     {
-        $this->channels = [];
+        foreach (array_keys($this->channels) as $key) {
+            [$connection, $purpose] = explode(':', $key, 2);
+            $this->closeChannel($purpose, $connection);
+        }
     }
 
     /**
@@ -132,11 +144,11 @@ class ChannelManager
     }
 
     /**
-     * Get the underlying AMQPConnection for a channel.
+     * Get the underlying connection for a channel.
      *
      * @throws ConnectionException
      */
-    public function getConnection(?string $name = null): AMQPConnection
+    public function getConnection(?string $name = null): AbstractConnection
     {
         return $this->connectionManager->connection($name);
     }
