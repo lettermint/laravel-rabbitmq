@@ -198,7 +198,10 @@ class AttributeScanner
     /**
      * Build a complete topology representation.
      *
-     * @return array{exchanges: array<string, Exchange>, queues: array<string, array{attribute: ConsumesQueue, class: class-string}>}
+     * When multiple jobs declare the same queue with different bindings,
+     * this method merges all bindings together so all routing keys are declared.
+     *
+     * @return array{exchanges: array<string, Exchange>, queues: array<string, array{attribute: ConsumesQueue, class: class-string, allBindings: array<string, array<string>>}>}
      */
     public function getTopology(): array
     {
@@ -209,10 +212,31 @@ class AttributeScanner
 
         $queues = [];
         foreach ($this->queues as $item) {
-            $queues[$item['attribute']->queue] = [
-                'attribute' => $item['attribute'],
-                'class' => $item['class'],
-            ];
+            $queueName = $item['attribute']->queue;
+
+            if (! isset($queues[$queueName])) {
+                // First occurrence - use this attribute as the base
+                $queues[$queueName] = [
+                    'attribute' => $item['attribute'],
+                    'class' => $item['class'],
+                    'allBindings' => $item['attribute']->bindings,
+                ];
+            } else {
+                // Additional declaration of same queue - merge bindings
+                foreach ($item['attribute']->bindings as $exchange => $routingKeys) {
+                    $routingKeys = (array) $routingKeys;
+
+                    if (! isset($queues[$queueName]['allBindings'][$exchange])) {
+                        $queues[$queueName]['allBindings'][$exchange] = $routingKeys;
+                    } else {
+                        // Merge routing keys, avoiding duplicates
+                        $existing = (array) $queues[$queueName]['allBindings'][$exchange];
+                        $queues[$queueName]['allBindings'][$exchange] = array_values(array_unique(
+                            array_merge($existing, $routingKeys)
+                        ));
+                    }
+                }
+            }
         }
 
         return [

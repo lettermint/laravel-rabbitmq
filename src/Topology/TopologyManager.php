@@ -109,14 +109,17 @@ class TopologyManager
             /** @var ConsumesQueue $attribute */
             $attribute = $queueData['attribute'];
 
+            // Use allBindings which merges bindings from all jobs declaring this queue
+            $allBindings = $queueData['allBindings'];
+
             $result['queues'][] = $queueName;
 
             if (! $dryRun) {
                 $this->declareQueue($channel, $attribute);
             }
 
-            // Declare bindings
-            foreach ($attribute->bindings as $exchangeName => $routingKeys) {
+            // Declare bindings from ALL jobs that use this queue
+            foreach ($allBindings as $exchangeName => $routingKeys) {
                 $routingKeys = (array) $routingKeys;
 
                 foreach ($routingKeys as $routingKey) {
