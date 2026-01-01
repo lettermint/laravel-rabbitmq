@@ -95,6 +95,9 @@ class ReplayDlqCommand extends Command
 
     /**
      * Replay a specific message by ID.
+     *
+     * Uses "fetch all, then process" pattern to avoid the issue where
+     * basic_reject(requeue=true) puts messages at the front of the queue.
      */
     protected function replayById(
         AMQPChannel $channel,
@@ -105,14 +108,20 @@ class ReplayDlqCommand extends Command
         RabbitMQQueue $rabbitmq,
         bool $dryRun
     ): int {
-        $message = $this->findMessageById($channel, $dlqQueueName, $targetId);
+        $result = $this->findMessageById($channel, $dlqQueueName, $targetId);
 
-        if ($message === null) {
+        // Requeue all non-matching messages first
+        foreach ($result['others'] as $msg) {
+            $channel->basic_reject($msg->getDeliveryTag(), true);
+        }
+
+        if ($result['target'] === null) {
             $this->components->error("Message with ID '{$targetId}' not found in DLQ");
 
             return self::FAILURE;
         }
 
+        $message = $result['target'];
         $payload = json_decode($message->getBody(), true);
         $jobName = $payload['displayName'] ?? 'Unknown';
 
@@ -148,6 +157,13 @@ class ReplayDlqCommand extends Command
                 // Channel may be closed
             }
 
+            // Requeue the message so it's not lost
+            try {
+                $channel->basic_reject($message->getDeliveryTag(), true);
+            } catch (\Exception $rejectException) {
+                // Message will be requeued automatically when channel closes
+            }
+
             Log::error('DLQ replay failed for specific message', [
                 'queue' => $queueName,
                 'message_id' => $targetId,
@@ -162,6 +178,9 @@ class ReplayDlqCommand extends Command
 
     /**
      * Replay messages in bulk with rate limiting and batch support.
+     *
+     * Uses "fetch all, then process" pattern for dry-run mode to avoid
+     * the issue where basic_reject(requeue=true) puts messages at the front.
      */
     protected function replayBulk(
         AMQPChannel $channel,
@@ -177,7 +196,6 @@ class ReplayDlqCommand extends Command
     ): int {
         $replayed = 0;
         $failed = 0;
-        $processed = 0;
         $batchCount = 0;
 
         // Calculate delay between messages for rate limiting (in microseconds)
@@ -186,15 +204,49 @@ class ReplayDlqCommand extends Command
         // Determine effective limit
         $effectiveLimit = $limit > 0 ? min($limit, $totalMessages) : $totalMessages;
 
-        // Create progress bar for non-dry-run operations
+        // For dry-run, use "fetch all, then reject all" pattern
+        if ($dryRun) {
+            $fetchedMessages = [];
+            $maxFetch = $limit > 0 ? $limit : 100000;
+
+            while (count($fetchedMessages) < $maxFetch) {
+                $message = $channel->basic_get($dlqQueueName, false);
+
+                if ($message === null) {
+                    break;
+                }
+
+                $fetchedMessages[] = $message;
+            }
+
+            // Display what would be replayed
+            foreach ($fetchedMessages as $message) {
+                $payload = json_decode($message->getBody(), true);
+                $jobName = $payload['displayName'] ?? 'Unknown';
+                $this->line("  Would replay: {$jobName}");
+            }
+
+            // Requeue all messages at the end
+            foreach ($fetchedMessages as $message) {
+                $channel->basic_reject($message->getDeliveryTag(), true);
+            }
+
+            $this->newLine();
+            $this->components->info('Found '.count($fetchedMessages).' message(s) to replay');
+
+            return self::SUCCESS;
+        }
+
+        // Non-dry-run: process messages one by one with rate limiting
         $progressBar = null;
-        if (! $dryRun && $effectiveLimit > 0 && ! $this->getOutput()->isQuiet()) {
+        if ($effectiveLimit > 0 && ! $this->getOutput()->isQuiet()) {
             $progressBar = $this->output->createProgressBar($effectiveLimit);
             $progressBar->setFormat(' %current%/%max% [%bar%] %percent:3s%% %elapsed:6s%/%estimated:-6s% %message%');
             $progressBar->setMessage('Starting...');
             $progressBar->start();
         }
 
+        $processed = 0;
         while (true) {
             if ($limit > 0 && $processed >= $limit) {
                 break;
@@ -211,83 +263,74 @@ class ReplayDlqCommand extends Command
             $payload = json_decode($message->getBody(), true);
             $jobName = $payload['displayName'] ?? 'Unknown';
 
-            if ($dryRun) {
-                $this->line("  Would replay: {$jobName}");
-                // Reject with requeue to put it back
-                $channel->basic_reject($message->getDeliveryTag(), true);
-            } else {
-                // Use transaction for atomic publish+ack
+            // Use transaction for atomic publish+ack
+            try {
+                $channel->tx_select();
+
+                // Republish to original queue
+                $rabbitmq->pushRaw($message->getBody(), $queueName);
+
+                // Acknowledge the DLQ message
+                $channel->basic_ack($message->getDeliveryTag());
+
+                // Commit both operations atomically
+                $channel->tx_commit();
+
+                $replayed++;
+
+                if ($progressBar !== null) {
+                    $progressBar->setMessage($jobName);
+                    $progressBar->advance();
+                } elseif ($this->getOutput()->isVerbose()) {
+                    $this->line("  <fg=green>✓</> Replayed: {$jobName}");
+                }
+            } catch (\Exception $e) {
+                // Rollback on any failure
                 try {
-                    $channel->tx_select();
-
-                    // Republish to original queue
-                    $rabbitmq->pushRaw($message->getBody(), $queueName);
-
-                    // Acknowledge the DLQ message
-                    $channel->basic_ack($message->getDeliveryTag());
-
-                    // Commit both operations atomically
-                    $channel->tx_commit();
-
-                    $replayed++;
-
-                    if ($progressBar !== null) {
-                        $progressBar->setMessage($jobName);
-                        $progressBar->advance();
-                    } elseif ($this->getOutput()->isVerbose()) {
-                        $this->line("  <fg=green>✓</> Replayed: {$jobName}");
-                    }
-                } catch (\Exception $e) {
-                    // Rollback on any failure
-                    try {
-                        $channel->tx_rollback();
-                    } catch (\Exception $rollbackException) {
-                        // Channel may be closed, need to get a fresh one
-                        $channel = $channelManager->channel('replay');
-                    }
-
-                    $failed++;
-
-                    Log::error('DLQ replay failed for message', [
-                        'queue' => $queueName,
-                        'dlq_queue' => $dlqQueueName,
-                        'job_name' => $jobName,
-                        'error' => $e->getMessage(),
-                    ]);
-
-                    if ($progressBar !== null) {
-                        $progressBar->setMessage("<fg=red>Failed: {$jobName}</>");
-                        $progressBar->advance();
-                    } elseif ($this->getOutput()->isVerbose()) {
-                        $this->line("  <fg=red>✗</> Failed: {$jobName} - {$e->getMessage()}");
-                    }
-
-                    // Reject with requeue so message stays in DLQ for retry
-                    try {
-                        $rejectedMsg = $channel->basic_get($dlqQueueName, false);
-                        if ($rejectedMsg !== null) {
-                            $channel->basic_reject($rejectedMsg->getDeliveryTag(), true);
-                        }
-                    } catch (\Exception $rejectException) {
-                        // Message will be requeued automatically when channel closes
-                    }
+                    $channel->tx_rollback();
+                } catch (\Exception $rollbackException) {
+                    // Channel may be closed, need to get a fresh one
+                    $channel = $channelManager->channel('replay');
                 }
 
-                // Apply rate limiting
-                if ($delayMicroseconds > 0 && $replayed < $effectiveLimit) {
-                    usleep($delayMicroseconds);
+                $failed++;
+
+                Log::error('DLQ replay failed for message', [
+                    'queue' => $queueName,
+                    'dlq_queue' => $dlqQueueName,
+                    'job_name' => $jobName,
+                    'error' => $e->getMessage(),
+                ]);
+
+                if ($progressBar !== null) {
+                    $progressBar->setMessage("<fg=red>Failed: {$jobName}</>");
+                    $progressBar->advance();
+                } elseif ($this->getOutput()->isVerbose()) {
+                    $this->line("  <fg=red>✗</> Failed: {$jobName} - {$e->getMessage()}");
                 }
 
-                // Apply batch pausing
-                if ($batchSize > 0) {
-                    $batchCount++;
-                    if ($batchCount >= $batchSize) {
-                        $batchCount = 0;
-                        if ($progressBar !== null) {
-                            $progressBar->setMessage('Batch pause...');
-                        }
-                        sleep(1);
+                // Requeue the message so it stays in DLQ
+                try {
+                    $channel->basic_reject($message->getDeliveryTag(), true);
+                } catch (\Exception $rejectException) {
+                    // Message will be requeued automatically when channel closes
+                }
+            }
+
+            // Apply rate limiting
+            if ($delayMicroseconds > 0 && $replayed < $effectiveLimit) {
+                usleep($delayMicroseconds);
+            }
+
+            // Apply batch pausing
+            if ($batchSize > 0) {
+                $batchCount++;
+                if ($batchCount >= $batchSize) {
+                    $batchCount = 0;
+                    if ($progressBar !== null) {
+                        $progressBar->setMessage('Batch pause...');
                     }
+                    sleep(1);
                 }
             }
         }
@@ -299,14 +342,10 @@ class ReplayDlqCommand extends Command
             $this->newLine();
         }
 
-        if ($dryRun) {
-            $this->components->info("Found {$processed} message(s) to replay");
-        } else {
-            $this->components->success("Replayed {$replayed} message(s) from DLQ to '{$queueName}'");
+        $this->components->success("Replayed {$replayed} message(s) from DLQ to '{$queueName}'");
 
-            if ($failed > 0) {
-                $this->components->warn("Failed to replay {$failed} message(s) - see logs for details");
-            }
+        if ($failed > 0) {
+            $this->components->warn("Failed to replay {$failed} message(s) - see logs for details");
         }
 
         return $failed > 0 ? self::FAILURE : self::SUCCESS;
@@ -314,35 +353,46 @@ class ReplayDlqCommand extends Command
 
     /**
      * Find a message by its ID in the DLQ.
+     *
+     * Fetches messages without rejecting them, returning both the target
+     * and all other messages so they can be properly requeued by the caller.
+     *
+     * @return array{target: AMQPMessage|null, others: array<AMQPMessage>}
      */
     protected function findMessageById(
         AMQPChannel $channel,
         string $dlqName,
         string $targetId
-    ): ?AMQPMessage {
+    ): array {
         $checked = 0;
         $maxMessages = 10000; // Safety limit
+        $otherMessages = [];
+        $targetMessage = null;
 
         while ($checked < $maxMessages) {
             $message = $channel->basic_get($dlqName, false);
 
             if ($message === null) {
-                return null;
+                break;
             }
 
             $payload = json_decode($message->getBody(), true);
             $messageId = $payload['uuid'] ?? $payload['id'] ?? null;
 
             if ($messageId === $targetId) {
-                return $message;
+                $targetMessage = $message;
+                break;
             }
 
-            // Not the one we want - requeue it
-            $channel->basic_reject($message->getDeliveryTag(), true);
+            // Not the one we want - hold for later requeueing
+            $otherMessages[] = $message;
             $checked++;
         }
 
-        return null;
+        return [
+            'target' => $targetMessage,
+            'others' => $otherMessages,
+        ];
     }
 
     /**

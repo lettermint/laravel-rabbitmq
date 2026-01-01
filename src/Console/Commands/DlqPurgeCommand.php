@@ -109,6 +109,9 @@ class DlqPurgeCommand extends Command
 
     /**
      * Purge a specific message by ID.
+     *
+     * Uses "fetch all, then process" pattern to avoid the issue where
+     * basic_reject(requeue=true) puts messages at the front of the queue.
      */
     protected function purgeById(
         AMQPChannel $channel,
@@ -118,53 +121,70 @@ class DlqPurgeCommand extends Command
     ): int {
         $checked = 0;
         $maxMessages = 10000; // Safety limit
+        $otherMessages = [];
+        $targetMessage = null;
+        $targetPayload = null;
 
+        // Fetch messages until we find the target (hold all unacked)
         while ($checked < $maxMessages) {
             $message = $channel->basic_get($dlqQueueName, false);
 
             if ($message === null) {
-                $this->components->error("Message with ID '{$targetId}' not found in DLQ");
-
-                return self::FAILURE;
+                break;
             }
 
             $payload = json_decode($message->getBody(), true);
             $messageId = $payload['uuid'] ?? $payload['id'] ?? null;
 
             if ($messageId === $targetId) {
-                if ($dryRun) {
-                    $jobName = $payload['displayName'] ?? 'Unknown';
-                    $this->line("  Would purge: {$jobName} (ID: {$targetId})");
-                    $channel->basic_reject($message->getDeliveryTag(), true);
-                    $this->newLine();
-                    $this->components->info('1 message would be purged');
-                } else {
-                    $channel->basic_ack($message->getDeliveryTag());
-
-                    Log::info('DLQ message purged', [
-                        'dlq_queue' => $dlqQueueName,
-                        'message_id' => $targetId,
-                        'job_class' => $payload['displayName'] ?? 'Unknown',
-                    ]);
-
-                    $this->components->success("Message '{$targetId}' purged from DLQ");
-                }
-
-                return self::SUCCESS;
+                $targetMessage = $message;
+                $targetPayload = $payload;
+                break;
             }
 
-            // Not the one we want - requeue it
-            $channel->basic_reject($message->getDeliveryTag(), true);
+            // Not the one we want - hold for later requeueing
+            $otherMessages[] = $message;
             $checked++;
         }
 
-        $this->components->error("Message with ID '{$targetId}' not found after checking {$maxMessages} messages");
+        // Requeue all non-matching messages first
+        foreach ($otherMessages as $msg) {
+            $channel->basic_reject($msg->getDeliveryTag(), true);
+        }
 
-        return self::FAILURE;
+        // Handle target message
+        if ($targetMessage === null) {
+            $this->components->error("Message with ID '{$targetId}' not found in DLQ");
+
+            return self::FAILURE;
+        }
+
+        if ($dryRun) {
+            $jobName = $targetPayload['displayName'] ?? 'Unknown';
+            $this->line("  Would purge: {$jobName} (ID: {$targetId})");
+            $channel->basic_reject($targetMessage->getDeliveryTag(), true);
+            $this->newLine();
+            $this->components->info('1 message would be purged');
+        } else {
+            $channel->basic_ack($targetMessage->getDeliveryTag());
+
+            Log::info('DLQ message purged', [
+                'dlq_queue' => $dlqQueueName,
+                'message_id' => $targetId,
+                'job_class' => $targetPayload['displayName'] ?? 'Unknown',
+            ]);
+
+            $this->components->success("Message '{$targetId}' purged from DLQ");
+        }
+
+        return self::SUCCESS;
     }
 
     /**
      * Purge messages in bulk, optionally filtered by age.
+     *
+     * Uses "fetch all, then process" pattern to avoid the issue where
+     * basic_reject(requeue=true) puts messages at the front of the queue.
      */
     protected function purgeBulk(
         AMQPChannel $channel,
@@ -172,21 +192,26 @@ class DlqPurgeCommand extends Command
         ?Carbon $cutoffTime,
         bool $dryRun
     ): int {
-        $purged = 0;
-        $skipped = 0;
-        $processed = 0;
         $maxMessages = 100000; // Safety limit
 
-        while ($processed < $maxMessages) {
+        // Fetch all messages first (hold all unacked)
+        $fetchedMessages = [];
+        while (count($fetchedMessages) < $maxMessages) {
             $message = $channel->basic_get($dlqQueueName, false);
 
             if ($message === null) {
                 break;
             }
 
-            $processed++;
+            $fetchedMessages[] = $message;
+        }
+
+        // Categorize messages into purge vs skip
+        $toPurge = [];
+        $toSkip = [];
+
+        foreach ($fetchedMessages as $message) {
             $payload = json_decode($message->getBody(), true) ?? [];
-            $jobName = $payload['displayName'] ?? 'Unknown';
 
             // Check age filter if provided
             if ($cutoffTime !== null) {
@@ -194,26 +219,41 @@ class DlqPurgeCommand extends Command
 
                 if ($messageTime !== null && $messageTime->isAfter($cutoffTime)) {
                     // Message is newer than cutoff - skip it
-                    $channel->basic_reject($message->getDeliveryTag(), true);
-                    $skipped++;
+                    $toSkip[] = ['message' => $message, 'payload' => $payload];
 
                     continue;
                 }
             }
 
+            $toPurge[] = ['message' => $message, 'payload' => $payload];
+        }
+
+        // Display what would be purged (dry run) or actually purge
+        foreach ($toPurge as $item) {
+            $jobName = $item['payload']['displayName'] ?? 'Unknown';
+
             if ($dryRun) {
                 $this->line("  Would purge: {$jobName}");
-                $channel->basic_reject($message->getDeliveryTag(), true);
-            } else {
-                $channel->basic_ack($message->getDeliveryTag());
-
-                if ($this->getOutput()->isVerbose()) {
-                    $this->line("  <fg=red>x</> Purged: {$jobName}");
-                }
+            } elseif ($this->getOutput()->isVerbose()) {
+                $this->line("  <fg=red>x</> Purged: {$jobName}");
             }
-
-            $purged++;
         }
+
+        // Process all messages at the end
+        foreach ($toSkip as $item) {
+            $channel->basic_reject($item['message']->getDeliveryTag(), true);
+        }
+
+        foreach ($toPurge as $item) {
+            if ($dryRun) {
+                $channel->basic_reject($item['message']->getDeliveryTag(), true);
+            } else {
+                $channel->basic_ack($item['message']->getDeliveryTag());
+            }
+        }
+
+        $purged = count($toPurge);
+        $skipped = count($toSkip);
 
         $this->newLine();
 

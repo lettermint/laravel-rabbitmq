@@ -52,35 +52,57 @@ class DlqInspectCommand extends Command
         try {
             $channel = $channelManager->channel('dlq-inspect');
             $messages = [];
-            $inspected = 0;
 
-            // If looking for specific ID, search until found
+            // Fetch messages first, then reject all at the end
+            // This prevents the same message being fetched repeatedly
+            // (basic_reject with requeue=true puts message at front of queue)
+            $fetchedMessages = [];
+
             if ($targetId !== null) {
-                $message = $this->findMessageById($channel, $dlqQueueName, $targetId);
+                // Search for specific message by ID
+                $result = $this->findMessageById($channel, $dlqQueueName, $targetId);
 
-                if ($message === null) {
+                if ($result['target'] === null) {
+                    // Requeue all non-matching messages we fetched
+                    foreach ($result['others'] as $msg) {
+                        $channel->basic_reject($msg->getDeliveryTag(), true);
+                    }
+
                     $this->components->error("Message with ID '{$targetId}' not found in DLQ");
 
                     return self::FAILURE;
                 }
 
-                $messages[] = $this->extractMessageData($message);
+                $fetchedMessages = [$result['target']];
+                $otherMessages = $result['others'];
 
-                // Requeue the message after inspection
-                $channel->basic_reject($message->getDeliveryTag(), true);
+                // Extract data from target message
+                $messages[] = $this->extractMessageData($result['target']);
+
+                // Requeue all messages (target + others)
+                foreach ($otherMessages as $msg) {
+                    $channel->basic_reject($msg->getDeliveryTag(), true);
+                }
+                $channel->basic_reject($result['target']->getDeliveryTag(), true);
             } else {
-                // Fetch up to limit messages
-                while ($inspected < $limit) {
+                // Fetch up to limit messages (hold all unacked)
+                while (count($fetchedMessages) < $limit) {
                     $message = $channel->basic_get($dlqQueueName, false);
 
                     if ($message === null) {
                         break;
                     }
 
-                    $messages[] = $this->extractMessageData($message);
-                    $inspected++;
+                    $fetchedMessages[] = $message;
+                }
 
-                    // Requeue the message - we're just peeking
+                // Extract data from all fetched messages
+                foreach ($fetchedMessages as $message) {
+                    $messages[] = $this->extractMessageData($message);
+                }
+
+                // Requeue all messages at the end
+                foreach ($fetchedMessages as $message) {
                     $channel->basic_reject($message->getDeliveryTag(), true);
                 }
             }
@@ -104,36 +126,45 @@ class DlqInspectCommand extends Command
     /**
      * Find a message by its ID in the DLQ.
      *
-     * Iterates through all messages, requeueing non-matches until the target is found.
+     * Fetches messages without rejecting them, returning both the target
+     * and all other messages so they can be properly requeued by the caller.
+     *
+     * @return array{target: AMQPMessage|null, others: array<AMQPMessage>}
      */
     protected function findMessageById(
         \PhpAmqpLib\Channel\AMQPChannel $channel,
         string $dlqName,
         string $targetId
-    ): ?AMQPMessage {
+    ): array {
         $checked = 0;
         $maxMessages = 10000; // Safety limit to prevent infinite loops
+        $otherMessages = [];
+        $targetMessage = null;
 
         while ($checked < $maxMessages) {
             $message = $channel->basic_get($dlqName, false);
 
             if ($message === null) {
-                return null;
+                break;
             }
 
             $payload = json_decode($message->getBody(), true);
             $messageId = $payload['uuid'] ?? $payload['id'] ?? null;
 
             if ($messageId === $targetId) {
-                return $message;
+                $targetMessage = $message;
+                break;
             }
 
-            // Not the one we want - requeue it
-            $channel->basic_reject($message->getDeliveryTag(), true);
+            // Not the one we want - hold it for later requeueing
+            $otherMessages[] = $message;
             $checked++;
         }
 
-        return null;
+        return [
+            'target' => $targetMessage,
+            'others' => $otherMessages,
+        ];
     }
 
     /**
