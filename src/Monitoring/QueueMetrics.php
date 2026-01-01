@@ -53,6 +53,9 @@ class QueueMetrics
             ];
         } catch (AMQPProtocolChannelException $e) {
             // Queue doesn't exist (404) or other protocol error
+            // Channel is now closed by RabbitMQ - invalidate it
+            $this->channelManager->closeChannel('topology');
+
             Log::warning('Failed to get queue stats: queue may not exist', [
                 'queue' => $queueName,
                 'error' => $e->getMessage(),

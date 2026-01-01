@@ -18,7 +18,8 @@ use PhpAmqpLib\Exception\AMQPRuntimeException;
  * Manages RabbitMQ connections using php-amqplib.
  *
  * This class handles connection creation, pooling, and lifecycle management.
- * It supports multiple hosts for failover and SSL connections.
+ * It supports multiple hosts for failover, SSL connections, and circuit breaker
+ * protection to prevent cascading failures during RabbitMQ outages.
  */
 class ConnectionManager
 {
@@ -30,54 +31,82 @@ class ConnectionManager
     protected array $connections = [];
 
     /**
+     * Circuit breaker for connection resilience.
+     */
+    protected CircuitBreaker $circuitBreaker;
+
+    /**
      * @param  array<string, mixed>  $config  Full RabbitMQ configuration array
      */
     public function __construct(
         protected array $config,
-    ) {}
+        ?CircuitBreaker $circuitBreaker = null,
+    ) {
+        $this->circuitBreaker = $circuitBreaker ?? new CircuitBreaker(
+            failureThreshold: (int) Arr::get($config, 'circuit_breaker.failure_threshold', 5),
+            recoveryTimeout: (float) Arr::get($config, 'circuit_breaker.recovery_timeout', 30.0),
+        );
+    }
 
     /**
      * Get or create a connection by name.
      *
      * Automatically handles reconnection if the connection was closed,
      * with appropriate logging for visibility into connection issues.
+     * Uses circuit breaker to prevent cascading failures during outages.
      *
-     * @throws ConnectionException When connection or reconnection fails
+     * @throws ConnectionException When connection fails or circuit breaker is open
      */
     public function connection(?string $name = null): AbstractConnection
     {
         $name ??= $this->getDefaultConnection();
 
-        if (! isset($this->connections[$name])) {
-            $this->connections[$name] = $this->createConnection($name);
+        // Check circuit breaker before attempting connection
+        if (! $this->circuitBreaker->isAvailable()) {
+            throw new ConnectionException(
+                'RabbitMQ circuit breaker is open - connections are temporarily blocked after repeated failures. '.
+                "Retry after {$this->circuitBreaker->getOpenDuration()} seconds.",
+            );
         }
 
-        // Reconnect if connection was closed
-        if (! $this->connections[$name]->isConnected()) {
-            Log::info('RabbitMQ connection lost, attempting reconnect', [
-                'connection' => $name,
-            ]);
+        try {
+            if (! isset($this->connections[$name])) {
+                $this->connections[$name] = $this->createConnection($name);
+            }
 
-            try {
+            // Reconnect if connection was closed
+            if (! $this->connections[$name]->isConnected()) {
+                Log::info('RabbitMQ connection lost, attempting reconnect', [
+                    'connection' => $name,
+                ]);
+
                 $this->connections[$name]->reconnect();
 
                 Log::info('RabbitMQ reconnection successful', [
                     'connection' => $name,
                 ]);
-            } catch (AMQPIOException|AMQPConnectionClosedException|AMQPRuntimeException $e) {
-                Log::error('RabbitMQ reconnection failed', [
-                    'connection' => $name,
-                    'error' => $e->getMessage(),
-                ]);
-
-                throw new ConnectionException(
-                    "Failed to reconnect to RabbitMQ [{$name}]: {$e->getMessage()}",
-                    previous: $e
-                );
             }
-        }
 
-        return $this->connections[$name];
+            // Record success with circuit breaker
+            $this->circuitBreaker->recordSuccess();
+
+            return $this->connections[$name];
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPRuntimeException $e) {
+            // Record failure with circuit breaker
+            $this->circuitBreaker->recordFailure();
+
+            Log::error('RabbitMQ connection failed', [
+                'connection' => $name,
+                'error' => $e->getMessage(),
+                'circuit_breaker_failures' => $this->circuitBreaker->getFailures(),
+                'circuit_breaker_state' => $this->circuitBreaker->getState()->value,
+            ]);
+
+            throw new ConnectionException(
+                "Failed to connect to RabbitMQ [{$name}]: {$e->getMessage()}",
+                previous: $e
+            );
+        }
     }
 
     /**
@@ -221,16 +250,26 @@ class ConnectionManager
 
     /**
      * Disconnect from a specific connection.
+     *
+     * Gracefully handles exceptions during close - the connection is removed
+     * from the pool regardless of whether close() succeeds.
      */
     public function disconnect(?string $name = null): void
     {
         $name ??= $this->getDefaultConnection();
 
-        if (isset($this->connections[$name]) && $this->connections[$name]->isConnected()) {
-            $this->connections[$name]->close();
+        try {
+            if (isset($this->connections[$name]) && $this->connections[$name]->isConnected()) {
+                $this->connections[$name]->close();
+            }
+        } catch (AMQPIOException|AMQPConnectionClosedException $e) {
+            Log::debug('Connection close during disconnect (expected during cleanup)', [
+                'connection' => $name,
+                'error' => $e->getMessage(),
+            ]);
+        } finally {
+            unset($this->connections[$name]);
         }
-
-        unset($this->connections[$name]);
     }
 
     /**
@@ -274,5 +313,13 @@ class ConnectionManager
         $connection = $this->connection($name);
 
         return $connection->getHeartbeat();
+    }
+
+    /**
+     * Get the circuit breaker instance.
+     */
+    public function getCircuitBreaker(): CircuitBreaker
+    {
+        return $this->circuitBreaker;
     }
 }

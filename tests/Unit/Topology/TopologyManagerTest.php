@@ -42,7 +42,7 @@ test('performs dry run without making changes', function () {
     $this->scanner->shouldReceive('getTopology')
         ->andReturn([
             'exchanges' => ['emails' => $exchangeAttr],
-            'queues' => ['emails:outbound' => ['attribute' => $queueAttr, 'class' => 'TestJob']],
+            'queues' => ['emails:outbound' => ['attribute' => $queueAttr, 'class' => 'TestJob', 'allBindings' => $queueAttr->bindings]],
         ]);
 
     $manager = new TopologyManager(
@@ -137,7 +137,7 @@ test('includes queue bindings in result', function () {
     $this->scanner->shouldReceive('getTopology')
         ->andReturn([
             'exchanges' => [],
-            'queues' => ['notifications:push' => ['attribute' => $queueAttr, 'class' => 'TestJob']],
+            'queues' => ['notifications:push' => ['attribute' => $queueAttr, 'class' => 'TestJob', 'allBindings' => $queueAttr->bindings]],
         ]);
 
     $manager = new TopologyManager(
@@ -181,7 +181,7 @@ test('auto-creates DLQ queue', function () {
     $this->scanner->shouldReceive('getTopology')
         ->andReturn([
             'exchanges' => [],
-            'queues' => ['emails:outbound' => ['attribute' => $queueAttr, 'class' => 'TestJob']],
+            'queues' => ['emails:outbound' => ['attribute' => $queueAttr, 'class' => 'TestJob', 'allBindings' => $queueAttr->bindings]],
         ]);
 
     $manager = new TopologyManager(

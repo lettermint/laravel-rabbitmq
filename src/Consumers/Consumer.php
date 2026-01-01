@@ -36,6 +36,34 @@ use Throwable;
  * processing them through Laravel's job system. Uses basic_consume for
  * push-based message delivery and PCNTLHeartbeatSender for maintaining
  * connections during long-running jobs.
+ *
+ * IMPORTANT PRODUCTION NOTES:
+ *
+ * 1. Signal Handler Conflict (SIGALRM):
+ *    PCNTLHeartbeatSender uses SIGALRM for heartbeat signals. If your jobs use
+ *    Laravel's $timeout property, the job timeout mechanism also uses SIGALRM.
+ *    This can cause the heartbeat handler to be overwritten, potentially leading
+ *    to connection drops during long-running jobs. Consider either:
+ *    - Using maxTime on the consumer instead of $timeout on individual jobs
+ *    - Setting heartbeat_sender.enabled = false in config if you use job timeouts
+ *    - Ensuring jobs complete within the heartbeat interval
+ *
+ * 2. No Automatic Reconnection:
+ *    If the RabbitMQ connection drops, the consumer will throw a ConnectionException
+ *    and exit. The consumer does NOT automatically reconnect. Use a process manager
+ *    like Supervisor to restart consumers after failures:
+ *
+ *    [program:rabbitmq-consumer]
+ *    command=php artisan rabbitmq:consume your-queue
+ *    autostart=true
+ *    autorestart=true
+ *    startsecs=0
+ *    numprocs=1
+ *    redirect_stderr=true
+ *
+ * 3. Graceful Shutdown:
+ *    The consumer handles SIGTERM, SIGINT, and SIGQUIT for graceful shutdown.
+ *    It will finish processing the current job before stopping.
  */
 class Consumer
 {
@@ -133,14 +161,29 @@ class Consumer
         $connection = $this->channelManager->getConnection();
 
         // Register heartbeat sender BEFORE consuming
+        // Note: PCNTLHeartbeatSender uses SIGALRM which may conflict with Laravel's
+        // job timeout mechanism. If jobs have $timeout set, the heartbeat sender's
+        // signal handler may be overwritten, potentially causing connection drops
+        // during long-running jobs.
         if ($this->shouldUseHeartbeatSender($connection)) {
-            $this->heartbeatSender = new PCNTLHeartbeatSender($connection);
-            $this->heartbeatSender->register();
+            try {
+                $this->heartbeatSender = new PCNTLHeartbeatSender($connection);
+                $this->heartbeatSender->register();
 
-            Log::debug('RabbitMQ heartbeat sender registered', [
-                'queue' => $this->queue,
-                'heartbeat_interval' => $connection->getHeartbeat(),
-            ]);
+                Log::debug('RabbitMQ heartbeat sender registered', [
+                    'queue' => $this->queue,
+                    'heartbeat_interval' => $connection->getHeartbeat(),
+                ]);
+            } catch (\Throwable $e) {
+                // Registration can fail if signal handlers conflict or pcntl is misconfigured
+                Log::warning('RabbitMQ heartbeat sender registration failed - long-running jobs may cause connection drops', [
+                    'queue' => $this->queue,
+                    'heartbeat_interval' => $connection->getHeartbeat(),
+                    'error' => $e->getMessage(),
+                ]);
+
+                $this->heartbeatSender = null;
+            }
         }
 
         // Register signal handlers for graceful shutdown

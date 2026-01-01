@@ -12,6 +12,10 @@ use Lettermint\RabbitMQ\Discovery\AttributeScanner;
 use Lettermint\RabbitMQ\Enums\TopologyEntityType;
 use Lettermint\RabbitMQ\Exceptions\TopologyException;
 use PhpAmqpLib\Channel\AMQPChannel;
+use PhpAmqpLib\Exception\AMQPChannelClosedException;
+use PhpAmqpLib\Exception\AMQPConnectionClosedException;
+use PhpAmqpLib\Exception\AMQPIOException;
+use PhpAmqpLib\Exception\AMQPProtocolChannelException;
 use PhpAmqpLib\Wire\AMQPTable;
 
 /**
@@ -65,6 +69,11 @@ class TopologyManager
         $channel = $dryRun ? null : $this->channelManager->topologyChannel();
 
         // First: Declare delayed exchange if enabled
+        // NOTE: The delayed exchange is declared but not automatically bound to queues.
+        // For delayed messages to be delivered, you must create bindings from the delayed
+        // exchange to your target queues using the same routing keys as your regular bindings.
+        // Example: If queue 'notifications' is bound to 'events' with key 'user.*',
+        // also bind it to 'delayed' with key 'user.*' to receive delayed messages.
         if (Arr::get($this->config, 'delayed.enabled', true)) {
             $delayedExchange = Arr::get($this->config, 'delayed.exchange', 'delayed');
             $result['exchanges'][] = "{$delayedExchange} (x-delayed-message)";
@@ -176,7 +185,7 @@ class TopologyManager
             );
 
             $this->declaredExchanges[$exchange->name] = true;
-        } catch (\Exception $e) {
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPChannelClosedException|AMQPProtocolChannelException $e) {
             throw new TopologyException(
                 "Failed to declare exchange [{$exchange->name}]: ".$e->getMessage(),
                 entityType: TopologyEntityType::Exchange,
@@ -209,7 +218,7 @@ class TopologyManager
             );
 
             $this->declaredExchanges[$name] = true;
-        } catch (\Exception $e) {
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPChannelClosedException|AMQPProtocolChannelException $e) {
             throw new TopologyException(
                 "Failed to declare DLQ exchange [{$name}]: ".$e->getMessage(),
                 entityType: TopologyEntityType::Exchange,
@@ -249,7 +258,7 @@ class TopologyManager
             );
 
             $this->declaredExchanges[$name] = true;
-        } catch (\Exception $e) {
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPChannelClosedException|AMQPProtocolChannelException $e) {
             throw new TopologyException(
                 "Failed to declare delayed exchange [{$name}]: ".$e->getMessage().
                 ' (Is the rabbitmq_delayed_message_exchange plugin installed?)',
@@ -314,7 +323,7 @@ class TopologyManager
             );
 
             $this->declaredQueues[$attribute->queue] = true;
-        } catch (\Exception $e) {
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPChannelClosedException|AMQPProtocolChannelException $e) {
             throw new TopologyException(
                 "Failed to declare queue [{$attribute->queue}]: ".$e->getMessage(),
                 entityType: TopologyEntityType::Queue,
@@ -363,7 +372,7 @@ class TopologyManager
             );
 
             $this->declaredQueues[$dlqQueueName] = true;
-        } catch (\Exception $e) {
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPChannelClosedException|AMQPProtocolChannelException $e) {
             throw new TopologyException(
                 "Failed to declare DLQ queue [{$dlqQueueName}]: ".$e->getMessage(),
                 entityType: TopologyEntityType::Queue,
@@ -408,7 +417,7 @@ class TopologyManager
             $channel->queue_delete($queueName);
 
             unset($this->declaredQueues[$queueName]);
-        } catch (\Exception $e) {
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPChannelClosedException|AMQPProtocolChannelException $e) {
             throw new TopologyException(
                 "Failed to delete queue [{$queueName}]: ".$e->getMessage(),
                 entityType: TopologyEntityType::Queue,
@@ -430,7 +439,7 @@ class TopologyManager
 
             // queue_purge returns the number of messages purged
             return (int) $channel->queue_purge($queueName);
-        } catch (\Exception $e) {
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPChannelClosedException|AMQPProtocolChannelException $e) {
             throw new TopologyException(
                 "Failed to purge queue [{$queueName}]: ".$e->getMessage(),
                 entityType: TopologyEntityType::Queue,
@@ -469,7 +478,7 @@ class TopologyManager
                 'messages' => $messageCount,
                 'consumers' => $consumerCount,
             ];
-        } catch (\Exception $e) {
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPChannelClosedException|AMQPProtocolChannelException $e) {
             throw new TopologyException(
                 "Failed to get queue info for [{$queueName}]: ".$e->getMessage(),
                 entityType: TopologyEntityType::Queue,

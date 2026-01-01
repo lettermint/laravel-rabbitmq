@@ -22,6 +22,7 @@ use PhpAmqpLib\Exception\AMQPConnectionClosedException;
 use PhpAmqpLib\Exception\AMQPIOException;
 use PhpAmqpLib\Exception\AMQPProtocolChannelException;
 use PhpAmqpLib\Exception\AMQPRuntimeException;
+use PhpAmqpLib\Exception\AMQPTimeoutException;
 use PhpAmqpLib\Message\AMQPMessage;
 use PhpAmqpLib\Wire\AMQPTable;
 
@@ -101,7 +102,10 @@ class RabbitMQQueue extends Queue implements QueueContract
 
             return $messageCount;
         } catch (AMQPProtocolChannelException $e) {
-            // Queue doesn't exist
+            // Queue doesn't exist - channel is now closed by RabbitMQ
+            // Invalidate the topology channel so next call creates a fresh one
+            $this->channelManager->closeChannel('topology');
+
             Log::debug('RabbitMQ queue does not exist', [
                 'queue' => $queue,
                 'error' => $e->getMessage(),
@@ -256,6 +260,10 @@ class RabbitMQQueue extends Queue implements QueueContract
      * Uses RabbitMQ transactions to ensure all-or-nothing semantics.
      * Critical for operations where batch consistency is required.
      *
+     * Note: Uses a separate 'batch' channel to avoid conflicts with publisher
+     * confirms on the regular publish channel. Mixing tx_select and confirm_select
+     * on the same channel is not supported by RabbitMQ.
+     *
      * @param  array<object|string>  $jobs  Array of job instances or class names
      * @return array<array{status: string, job: string, id?: string}>
      *
@@ -271,7 +279,8 @@ class RabbitMQQueue extends Queue implements QueueContract
         $queue = $this->getQueue($queue);
 
         try {
-            $channel = $this->channelManager->publishChannel();
+            // Use dedicated batch channel to avoid tx/confirm mode conflict
+            $channel = $this->channelManager->channel('batch');
             $channel->tx_select();
 
             foreach ($jobs as $index => $job) {
@@ -365,7 +374,21 @@ class RabbitMQQueue extends Queue implements QueueContract
             $channel->basic_publish($message, $exchange, $routingKey);
 
             if ($this->useConfirms) {
-                $channel->wait_for_pending_acks_returns($this->confirmTimeout);
+                try {
+                    $channel->wait_for_pending_acks_returns($this->confirmTimeout);
+                } catch (AMQPTimeoutException $e) {
+                    // Timeout waiting for confirm - message was already published via basic_publish
+                    // but we don't know for sure if RabbitMQ received it. Log as warning since
+                    // the message may have been delivered, and let the caller decide whether to retry.
+                    Log::warning('RabbitMQ publisher confirm timed out - message may have been delivered', [
+                        'exchange' => $exchange,
+                        'routing_key' => $routingKey,
+                        'confirm_timeout' => $this->confirmTimeout,
+                    ]);
+
+                    // Don't throw - the message was published, we just couldn't confirm
+                    // Throwing here would cause duplicates if caller retries
+                }
             }
         } catch (PublishException $e) {
             Log::error('RabbitMQ message publish failed', [
