@@ -38,6 +38,13 @@ class ConsumeCommand extends Command
 
     protected $description = 'Consume messages from a RabbitMQ queue';
 
+    /**
+     * Job start times keyed by job ID for accurate timing.
+     *
+     * @var array<string, float>
+     */
+    protected array $jobStartTimes = [];
+
     public function handle(Consumer $consumer, ExceptionHandler $handler): int
     {
         $queue = $this->argument('queue');
@@ -82,24 +89,47 @@ class ConsumeCommand extends Command
     protected function listenForEvents(): void
     {
         Event::listen(JobProcessing::class, function (JobProcessing $event) {
-            $this->components->task(
-                "Processing: {$event->job->resolveName()}",
-                fn () => true
-            );
+            $this->jobStartTimes[$event->job->getJobId()] = microtime(true);
+            $this->line("Processing: {$event->job->resolveName()}");
         });
 
         Event::listen(JobProcessed::class, function (JobProcessed $event) {
-            if ($this->getOutput()->isVerbose()) {
-                $this->line("  <fg=green>✓</> Processed: {$event->job->resolveName()}");
-            }
+            $jobId = $event->job->getJobId();
+            $duration = $this->formatDuration($jobId);
+            unset($this->jobStartTimes[$jobId]);
+
+            $this->line("  <fg=green>✓</> Done in {$duration}");
         });
 
         Event::listen(JobFailed::class, function (JobFailed $event) {
-            $this->components->error("Failed: {$event->job->resolveName()}");
+            $jobId = $event->job->getJobId();
+            $duration = $this->formatDuration($jobId);
+            unset($this->jobStartTimes[$jobId]);
+
+            $this->line("  <fg=red>✗</> Failed in {$duration}");
 
             if ($this->getOutput()->isVerbose()) {
-                $this->line("  <fg=red>Error:</> {$event->exception->getMessage()}");
+                $this->line("    <fg=red>Error:</> {$event->exception->getMessage()}");
             }
         });
+    }
+
+    /**
+     * Format the duration for a job based on its start time.
+     */
+    protected function formatDuration(string $jobId): string
+    {
+        $startTime = $this->jobStartTimes[$jobId] ?? null;
+
+        if ($startTime === null) {
+            return '?ms';
+        }
+
+        $seconds = microtime(true) - $startTime;
+        $ms = $seconds * 1000;
+
+        return $ms >= 1000
+            ? sprintf('%.2fs', $seconds)
+            : sprintf('%.2fms', $ms);
     }
 }
