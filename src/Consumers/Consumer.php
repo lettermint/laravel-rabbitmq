@@ -316,8 +316,8 @@ class Consumer
         if ($this->tries > 0 && $job->attempts() >= $this->tries) {
             $this->failJob($job, $e);
         } else {
-            // Release the job back (will go to DLQ due to rejection)
-            $job->release();
+            // Release the job with exception info for DLQ inspection
+            $job->releaseWithException(0, $e);
         }
     }
 

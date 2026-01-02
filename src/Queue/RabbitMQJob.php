@@ -99,6 +99,86 @@ class RabbitMQJob extends Job implements JobContract
     }
 
     /**
+     * Release the job with exception information stored in the payload.
+     *
+     * This method stores exception details in the message payload before
+     * releasing, making them visible in DLQ inspection tools. Uses a
+     * transactional ack+republish pattern since we can't modify the
+     * original message body during rejection.
+     *
+     * @param  int  $delay  Delay hint (not directly used, see DLQ configuration)
+     *
+     * @throws ConnectionException When release fails
+     */
+    public function releaseWithException(int $delay, \Throwable $exception): void
+    {
+        parent::release($delay);
+
+        try {
+            // Build modified payload with exception info
+            $payload = $this->decoded();
+            $payload['exception'] = [
+                'class' => get_class($exception),
+                'message' => $exception->getMessage(),
+                'code' => $exception->getCode(),
+                'file' => $exception->getFile(),
+                'line' => $exception->getLine(),
+                'trace' => array_slice($exception->getTrace(), 0, 5),
+            ];
+
+            // Use transaction for atomic ack+republish
+            $this->channel->tx_select();
+
+            try {
+                // Republish with exception info to the same queue
+                // This will go through normal retry/DLQ flow
+                $this->rabbitmq->pushRaw(
+                    json_encode($payload, JSON_THROW_ON_ERROR),
+                    $this->queueName
+                );
+
+                // Acknowledge original message
+                $this->rabbitmq->ack($this->message, $this->channel);
+
+                $this->channel->tx_commit();
+
+                Log::debug('Job released with exception info', [
+                    'queue' => $this->queueName,
+                    'job_id' => $this->getJobId(),
+                    'job_name' => $this->getName(),
+                    'exception' => $exception->getMessage(),
+                ]);
+            } catch (\Throwable $txException) {
+                // Rollback transaction
+                try {
+                    $this->channel->tx_rollback();
+                } catch (\Throwable $rollbackException) {
+                    // Channel may be in bad state
+                }
+
+                // Fall back to normal rejection (without exception info)
+                Log::warning('Failed to release with exception info, falling back to reject', [
+                    'queue' => $this->queueName,
+                    'job_id' => $this->getJobId(),
+                    'error' => $txException->getMessage(),
+                ]);
+
+                $this->rabbitmq->reject($this->message, $this->channel, false);
+            }
+        } catch (ConnectionException $e) {
+            Log::error('Failed to release RabbitMQ message with exception', [
+                'queue' => $this->queueName,
+                'job_id' => $this->getJobId(),
+                'job_name' => $this->getName(),
+                'delivery_tag' => $this->message->getDeliveryTag(),
+                'error' => $e->getMessage(),
+            ]);
+
+            throw $e;
+        }
+    }
+
+    /**
      * Delete the job from the queue (acknowledge successful processing).
      *
      * CRITICAL: If acknowledgment fails after job completion, the message
@@ -129,12 +209,23 @@ class RabbitMQJob extends Job implements JobContract
 
     /**
      * Get the number of times the job has been attempted.
+     *
+     * Checks payload first (for replayed DLQ messages), then falls back
+     * to x-death headers. This is necessary because x-death headers are
+     * lost when messages are replayed via pushRaw().
      */
     public function attempts(): int
     {
+        $payload = $this->decoded();
+
+        // Check payload first - this is set when replaying from DLQ
+        if (isset($payload['attempts']) && is_int($payload['attempts'])) {
+            return $payload['attempts'];
+        }
+
+        // Fall back to x-death header (native RabbitMQ retry tracking)
         $headers = $this->getHeaders();
 
-        // x-death header tracks routing through DLQs
         if (isset($headers['x-death']) && is_array($headers['x-death'])) {
             $totalCount = 0;
             foreach ($headers['x-death'] as $death) {

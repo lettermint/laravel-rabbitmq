@@ -11,6 +11,7 @@ use Lettermint\RabbitMQ\Discovery\AttributeScanner;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Message\AMQPMessage;
+use PhpAmqpLib\Wire\AMQPTable;
 
 /**
  * Artisan command to replay messages from a dead letter queue.
@@ -136,18 +137,21 @@ class ReplayDlqCommand extends Command
 
         try {
             $channel->tx_select();
-            $rabbitmq->pushRaw($message->getBody(), $queueName);
+            $preparedPayload = $this->preparePayloadForReplay($message);
+            $rabbitmq->pushRaw($preparedPayload, $queueName);
             $channel->basic_ack($message->getDeliveryTag());
             $channel->tx_commit();
 
+            $newAttempts = json_decode($preparedPayload, true)['attempts'] ?? 'unknown';
             Log::info('DLQ message replayed', [
                 'queue' => $queueName,
                 'dlq_queue' => $dlqQueueName,
                 'message_id' => $targetId,
                 'job_class' => $jobName,
+                'attempts' => $newAttempts,
             ]);
 
-            $this->components->success("Message '{$targetId}' replayed to '{$queueName}'");
+            $this->components->success("Message '{$targetId}' replayed to '{$queueName}' (attempt #{$newAttempts})");
 
             return self::SUCCESS;
         } catch (\Exception $e) {
@@ -267,8 +271,11 @@ class ReplayDlqCommand extends Command
             try {
                 $channel->tx_select();
 
+                // Prepare payload with updated attempts count
+                $preparedPayload = $this->preparePayloadForReplay($message);
+
                 // Republish to original queue
-                $rabbitmq->pushRaw($message->getBody(), $queueName);
+                $rabbitmq->pushRaw($preparedPayload, $queueName);
 
                 // Acknowledge the DLQ message
                 $channel->basic_ack($message->getDeliveryTag());
@@ -277,12 +284,13 @@ class ReplayDlqCommand extends Command
                 $channel->tx_commit();
 
                 $replayed++;
+                $newAttempts = json_decode($preparedPayload, true)['attempts'] ?? '?';
 
                 if ($progressBar !== null) {
-                    $progressBar->setMessage($jobName);
+                    $progressBar->setMessage("{$jobName} (#{$newAttempts})");
                     $progressBar->advance();
                 } elseif ($this->getOutput()->isVerbose()) {
-                    $this->line("  <fg=green>✓</> Replayed: {$jobName}");
+                    $this->line("  <fg=green>✓</> Replayed: {$jobName} (attempt #{$newAttempts})");
                 }
             } catch (\Exception $e) {
                 // Rollback on any failure
@@ -435,5 +443,60 @@ class ReplayDlqCommand extends Command
         } else {
             $this->components->warn('No queues discovered. Run attribute scanning first.');
         }
+    }
+
+    /**
+     * Prepare message payload for replay by injecting the attempts count.
+     *
+     * When replaying from DLQ, we need to preserve the attempt count because
+     * x-death headers are lost when using pushRaw(). This injects the attempts
+     * directly into the payload so RabbitMQJob::attempts() can read it.
+     */
+    protected function preparePayloadForReplay(AMQPMessage $message): string
+    {
+        $payload = json_decode($message->getBody(), true) ?? [];
+        $currentAttempts = $this->getAttemptsFromMessage($message);
+
+        // Increment attempts for the upcoming retry
+        $payload['attempts'] = $currentAttempts + 1;
+
+        return json_encode($payload, JSON_THROW_ON_ERROR);
+    }
+
+    /**
+     * Get the current attempts count from a DLQ message.
+     *
+     * Checks both the payload (for previously replayed messages) and
+     * x-death headers (for fresh DLQ arrivals).
+     */
+    protected function getAttemptsFromMessage(AMQPMessage $message): int
+    {
+        $payload = json_decode($message->getBody(), true) ?? [];
+
+        // Check payload first (for previously replayed messages)
+        if (isset($payload['attempts']) && is_int($payload['attempts'])) {
+            return $payload['attempts'];
+        }
+
+        // Fall back to x-death headers
+        $headers = $message->has('application_headers')
+            ? $message->get('application_headers')
+            : null;
+
+        if ($headers instanceof AMQPTable) {
+            $nativeHeaders = $headers->getNativeData();
+
+            if (isset($nativeHeaders['x-death']) && is_array($nativeHeaders['x-death'])) {
+                $totalCount = 0;
+                foreach ($nativeHeaders['x-death'] as $death) {
+                    $deathData = $death instanceof AMQPTable ? $death->getNativeData() : $death;
+                    $totalCount += (int) ($deathData['count'] ?? 0);
+                }
+
+                return $totalCount + 1;
+            }
+        }
+
+        return 1;
     }
 }
