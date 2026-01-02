@@ -47,6 +47,14 @@ abstract class TestCase extends OrchestraTestCase
      */
     protected function defineEnvironment($app): void
     {
+        // Configure logging to handle deprecations properly
+        // This prevents errors when older dependencies trigger PHP 8.4 deprecation warnings
+        $app['config']->set('logging.deprecations', 'null');
+        $app['config']->set('logging.channels.null', [
+            'driver' => 'monolog',
+            'handler' => \Monolog\Handler\NullHandler::class,
+        ]);
+
         $app['config']->set('rabbitmq', [
             'default' => 'default',
             'connections' => [

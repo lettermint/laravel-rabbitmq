@@ -139,8 +139,10 @@ class AMQPMocks
         $options = array_merge($defaults, $options);
         $hasHeaders = ! empty($options['headers']);
 
-        // Use real AMQPTable - Mockery has issues with this class
-        $headersTable = new AMQPTable($options['headers']);
+        // Create AMQPTable with deprecation warnings suppressed
+        // This is necessary because older dependencies may trigger PHP 8.4
+        // deprecation warnings during autoload
+        $headersTable = self::createHeadersTableSafely($options['headers']);
 
         $mock = Mockery::mock(AMQPMessage::class);
 
@@ -221,5 +223,33 @@ class AMQPMocks
     public static function headersTable(array $headers = []): AMQPTable
     {
         return new AMQPTable($headers);
+    }
+
+    /**
+     * Create an AMQPTable safely, suppressing deprecation warnings.
+     *
+     * This is necessary because older dependencies (Guzzle, Symfony, PsySH)
+     * may trigger PHP 8.4 deprecation warnings during autoload. When this
+     * happens, Laravel's HandleExceptions tries to log the deprecation but
+     * the logger may not be configured, causing "Call to a member function
+     * warning() on null" errors.
+     *
+     * @param  array<string, mixed>  $headers
+     */
+    public static function createHeadersTableSafely(array $headers = []): AMQPTable
+    {
+        // Temporarily suppress deprecation warnings during AMQPTable creation
+        // This prevents Laravel's HandleExceptions from trying to log deprecations
+        // before the logger is properly configured
+        set_error_handler(function ($level) {
+            // Suppress deprecation warnings, let other errors through
+            return in_array($level, [E_DEPRECATED, E_USER_DEPRECATED]);
+        });
+
+        try {
+            return new AMQPTable($headers);
+        } finally {
+            restore_error_handler();
+        }
     }
 }
