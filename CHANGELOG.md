@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.0.0 - 2026-01-02
+
+### What's Changed
+
+* Bump actions/checkout from 3 to 6 by @dependabot[bot] in https://github.com/lettermint/laravel-rabbitmq/pull/2
+* Bump stefanzweifel/git-auto-commit-action from 6 to 7 by @dependabot[bot] in https://github.com/lettermint/laravel-rabbitmq/pull/1
+* feat: migrate to phpamqplib for better heartbeat and reliability by @bjarn in https://github.com/lettermint/laravel-rabbitmq/pull/4
+
+### New Contributors
+
+* @bjarn made their first contribution in https://github.com/lettermint/laravel-rabbitmq/pull/4
+
+**Full Changelog**: https://github.com/lettermint/laravel-rabbitmq/compare/0.2.0...1.0.0
+
 ## [Unreleased]
 
 ## [1.0.0] - 2024-12-19
@@ -28,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `rabbitmq:purge` - Purge messages from a queue
   - `rabbitmq:replay-dlq` - Replay dead-lettered messages
   - `rabbitmq:health` - Health check command
+  
 - Fallback routing for jobs without attributes (third-party packages)
 - Graceful shutdown handling with SIGTERM/SIGINT
 - Publisher confirms for reliable message delivery
