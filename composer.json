@@ -17,10 +17,14 @@
     ],
     "require": {
         "php": "^8.2",
-        "ext-amqp": "*",
+        "ext-sockets": "*",
         "illuminate/contracts": "^11.0 | ^12.0",
         "illuminate/queue": "^11.0 | ^12.0",
-        "illuminate/support": "^11.0 | ^12.0"
+        "illuminate/support": "^11.0 | ^12.0",
+        "php-amqplib/php-amqplib": "^3.6"
+    },
+    "suggest": {
+        "ext-pcntl": "Required for heartbeat sender support during long-running jobs"
     },
     "require-dev": {
         "laravel/pint": "^1.14",

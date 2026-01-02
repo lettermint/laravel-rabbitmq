@@ -169,6 +169,25 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Heartbeat Sender
+    |--------------------------------------------------------------------------
+    |
+    | The PCNTLHeartbeatSender uses SIGALRM signals to send heartbeats during
+    | blocking PHP operations. This prevents RabbitMQ from closing connections
+    | when jobs run longer than heartbeat * 2 seconds.
+    |
+    | Note: Jobs with Laravel's $timeout property set will have heartbeats
+    | disabled during execution (both use SIGALRM). For long-running jobs
+    | that need heartbeat support, set $timeout = 0 on the job class.
+    |
+    */
+
+    'heartbeat_sender' => [
+        'enabled' => env('RABBITMQ_HEARTBEAT_SENDER', true),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Publisher Settings
     |--------------------------------------------------------------------------
     |

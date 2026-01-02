@@ -37,11 +37,11 @@ expect()->extend('toBeValidExchangeName', function () {
 */
 
 /**
- * Create a mock AMQPConnection.
+ * Create a mock AMQPStreamConnection.
  */
-function mockAMQPConnection(bool $connected = true): Mockery\MockInterface
+function mockAMQPConnection(bool $connected = true, int $heartbeat = 60): Mockery\MockInterface
 {
-    return Lettermint\RabbitMQ\Tests\Mocks\AMQPMocks::connection($connected);
+    return Lettermint\RabbitMQ\Tests\Mocks\AMQPMocks::connection($connected, $heartbeat);
 }
 
 /**
@@ -53,27 +53,27 @@ function mockAMQPChannel(?Mockery\MockInterface $connection = null): Mockery\Moc
 }
 
 /**
- * Create a mock AMQPQueue.
+ * Create a mock AMQPMessage.
  */
-function mockAMQPQueue(string $name = 'test-queue'): Mockery\MockInterface
+function mockAMQPMessage(array $options = []): Mockery\MockInterface
 {
-    return Lettermint\RabbitMQ\Tests\Mocks\AMQPMocks::queue($name);
+    return Lettermint\RabbitMQ\Tests\Mocks\AMQPMocks::message($options);
 }
 
 /**
- * Create a mock AMQPExchange.
+ * Create a mock AMQPMessage with a specific job payload.
  */
-function mockAMQPExchange(string $name = 'test-exchange'): Mockery\MockInterface
+function mockAMQPMessageWithJob(string $jobClass, array $jobData = [], array $options = []): Mockery\MockInterface
 {
-    return Lettermint\RabbitMQ\Tests\Mocks\AMQPMocks::exchange($name);
+    return Lettermint\RabbitMQ\Tests\Mocks\AMQPMocks::messageWithJob($jobClass, $jobData, $options);
 }
 
 /**
- * Create a mock AMQPEnvelope.
+ * Create a mock AMQPTable for headers.
  */
-function mockAMQPEnvelope(array $options = []): Mockery\MockInterface
+function mockAMQPTable(array $headers = []): Mockery\MockInterface
 {
-    return Lettermint\RabbitMQ\Tests\Mocks\AMQPMocks::envelope($options);
+    return Lettermint\RabbitMQ\Tests\Mocks\AMQPMocks::headersTable($headers);
 }
 
 /**

@@ -5,6 +5,8 @@ declare(strict_types=1);
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Connection\ConnectionManager;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
+use PhpAmqpLib\Channel\AMQPChannel;
+use PhpAmqpLib\Exception\AMQPIOException;
 
 beforeEach(function () {
     $this->mockConnection = mockAMQPConnection(true);
@@ -28,7 +30,7 @@ test('creates channel for given purpose', function () {
             parent::__construct($connectionManager);
         }
 
-        protected function createChannel(?string $connection = null): \AMQPChannel
+        protected function createChannel(?string $connection = null): AMQPChannel
         {
             return $this->mockChannel;
         }
@@ -47,7 +49,7 @@ test('reuses channel for same purpose', function () {
             parent::__construct($connectionManager);
         }
 
-        protected function createChannel(?string $connection = null): \AMQPChannel
+        protected function createChannel(?string $connection = null): AMQPChannel
         {
             return $this->mockChannel;
         }
@@ -75,7 +77,7 @@ test('creates separate channels for different purposes', function () {
             parent::__construct($connectionManager);
         }
 
-        protected function createChannel(?string $connection = null): \AMQPChannel
+        protected function createChannel(?string $connection = null): AMQPChannel
         {
             $this->callCount++;
 
@@ -91,10 +93,10 @@ test('creates separate channels for different purposes', function () {
 
 test('recreates channel when disconnected', function () {
     $disconnectedChannel = mockAMQPChannel();
-    $disconnectedChannel->shouldReceive('isConnected')->andReturn(false);
+    $disconnectedChannel->shouldReceive('is_open')->andReturn(false);
 
     $newChannel = mockAMQPChannel();
-    $newChannel->shouldReceive('isConnected')->andReturn(true);
+    $newChannel->shouldReceive('is_open')->andReturn(true);
 
     $callCount = 0;
     $channelManager = new class($this->connectionManager, $disconnectedChannel, $newChannel, $callCount) extends ChannelManager
@@ -108,7 +110,7 @@ test('recreates channel when disconnected', function () {
             parent::__construct($connectionManager);
         }
 
-        protected function createChannel(?string $connection = null): \AMQPChannel
+        protected function createChannel(?string $connection = null): AMQPChannel
         {
             $this->callCount++;
 
@@ -131,7 +133,7 @@ test('provides publish channel', function () {
             parent::__construct($connectionManager);
         }
 
-        protected function createChannel(?string $connection = null): \AMQPChannel
+        protected function createChannel(?string $connection = null): AMQPChannel
         {
             return $this->mockChannel;
         }
@@ -150,7 +152,7 @@ test('provides consume channel', function () {
             parent::__construct($connectionManager);
         }
 
-        protected function createChannel(?string $connection = null): \AMQPChannel
+        protected function createChannel(?string $connection = null): AMQPChannel
         {
             return $this->mockChannel;
         }
@@ -169,7 +171,7 @@ test('provides topology channel', function () {
             parent::__construct($connectionManager);
         }
 
-        protected function createChannel(?string $connection = null): \AMQPChannel
+        protected function createChannel(?string $connection = null): AMQPChannel
         {
             return $this->mockChannel;
         }
@@ -188,7 +190,7 @@ test('closes specific channel', function () {
             parent::__construct($connectionManager);
         }
 
-        protected function createChannel(?string $connection = null): \AMQPChannel
+        protected function createChannel(?string $connection = null): AMQPChannel
         {
             return $this->mockChannel;
         }
@@ -210,7 +212,7 @@ test('closes all channels', function () {
             parent::__construct($connectionManager);
         }
 
-        protected function createChannel(?string $connection = null): \AMQPChannel
+        protected function createChannel(?string $connection = null): AMQPChannel
         {
             return $this->mockChannel;
         }
@@ -248,7 +250,7 @@ test('gets connection by name', function () {
 
 test('wraps connection exception when channel creation fails', function () {
     $this->connectionManager->shouldReceive('connection')
-        ->andThrow(new \AMQPConnectionException('Connection failed'));
+        ->andThrow(new AMQPIOException('Connection failed'));
 
     $channelManager = new ChannelManager($this->connectionManager);
 

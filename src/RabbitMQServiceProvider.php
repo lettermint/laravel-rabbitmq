@@ -12,6 +12,8 @@ use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Connection\ConnectionManager;
 use Lettermint\RabbitMQ\Console\Commands\ConsumeCommand;
 use Lettermint\RabbitMQ\Console\Commands\DeclareCommand;
+use Lettermint\RabbitMQ\Console\Commands\DlqInspectCommand;
+use Lettermint\RabbitMQ\Console\Commands\DlqPurgeCommand;
 use Lettermint\RabbitMQ\Console\Commands\HealthCommand;
 use Lettermint\RabbitMQ\Console\Commands\PurgeCommand;
 use Lettermint\RabbitMQ\Console\Commands\QueuesCommand;
@@ -171,6 +173,8 @@ class RabbitMQServiceProvider extends ServiceProvider
             $this->commands([
                 ConsumeCommand::class,
                 DeclareCommand::class,
+                DlqInspectCommand::class,
+                DlqPurgeCommand::class,
                 HealthCommand::class,
                 PurgeCommand::class,
                 QueuesCommand::class,

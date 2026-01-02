@@ -4,18 +4,15 @@ declare(strict_types=1);
 
 namespace Lettermint\RabbitMQ\Monitoring;
 
-use AMQPQueue;
 use Illuminate\Support\Facades\Log;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
+use PhpAmqpLib\Exception\AMQPProtocolChannelException;
 
 /**
  * Queue metrics service.
  *
- * Provides statistics about RabbitMQ queues.
- *
- * **Important**: The ext-amqp PHP extension does not expose detailed queue
- * statistics like message counts. For accurate metrics, use the RabbitMQ
- * Management API (HTTP) or implement a custom metrics collector.
+ * Provides statistics about RabbitMQ queues using php-amqplib's passive
+ * queue declaration feature, which returns message and consumer counts.
  */
 class QueueMetrics
 {
@@ -26,9 +23,9 @@ class QueueMetrics
     /**
      * Get statistics for a specific queue.
      *
-     * Note: ext-amqp doesn't expose message counts from declareQueue().
-     * Values are null to indicate data is unavailable (not zero).
-     * Use RabbitMQ Management API for accurate statistics.
+     * Uses passive queue declaration to retrieve queue statistics from RabbitMQ.
+     * php-amqplib exposes the full response from queue.declare including
+     * message and consumer counts.
      *
      * @return array{messages: int|null, consumers: int|null, rate: float|null, connected: bool, notice: string|null, error: string|null}
      */
@@ -36,18 +33,41 @@ class QueueMetrics
     {
         try {
             $channel = $this->channelManager->topologyChannel();
-            $queue = new AMQPQueue($channel);
-            $queue->setName($queueName);
 
-            // ext-amqp doesn't expose count info from declareQueue()
-            // Return null to clearly indicate data is unavailable (not zero)
+            // Passive declare returns [queue_name, message_count, consumer_count]
+            [$name, $messageCount, $consumerCount] = $channel->queue_declare(
+                $queueName,
+                true,   // passive - don't create, just check
+                false,  // durable (ignored for passive)
+                false,  // exclusive (ignored for passive)
+                false   // auto_delete (ignored for passive)
+            );
+
+            return [
+                'messages' => $messageCount,
+                'consumers' => $consumerCount,
+                'rate' => null, // Rate requires time-series sampling
+                'connected' => true,
+                'notice' => null,
+                'error' => null,
+            ];
+        } catch (AMQPProtocolChannelException $e) {
+            // Queue doesn't exist (404) or other protocol error
+            // Channel is now closed by RabbitMQ - invalidate it
+            $this->channelManager->closeChannel('topology');
+
+            Log::warning('Failed to get queue stats: queue may not exist', [
+                'queue' => $queueName,
+                'error' => $e->getMessage(),
+            ]);
+
             return [
                 'messages' => null,
                 'consumers' => null,
                 'rate' => null,
-                'connected' => true,
-                'notice' => 'Queue statistics unavailable via ext-amqp. Use RabbitMQ Management API for accurate counts.',
-                'error' => null,
+                'connected' => false,
+                'notice' => null,
+                'error' => $e->getMessage(),
             ];
         } catch (\Exception $e) {
             Log::warning('Failed to get queue stats', [
@@ -86,11 +106,11 @@ class QueueMetrics
     /**
      * Check if queue statistics are available.
      *
-     * ext-amqp does not provide queue statistics. This method always returns
-     * false. Use RabbitMQ Management API for statistics availability.
+     * php-amqplib provides queue statistics via passive queue declaration.
+     * This returns true as the library supports retrieving message/consumer counts.
      */
     public function hasStatistics(): bool
     {
-        return false;
+        return true;
     }
 }

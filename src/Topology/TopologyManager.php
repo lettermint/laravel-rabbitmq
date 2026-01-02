@@ -4,12 +4,6 @@ declare(strict_types=1);
 
 namespace Lettermint\RabbitMQ\Topology;
 
-use AMQPChannel;
-use AMQPChannelException;
-use AMQPExchange;
-use AMQPExchangeException;
-use AMQPQueue;
-use AMQPQueueException;
 use Illuminate\Support\Arr;
 use Lettermint\RabbitMQ\Attributes\ConsumesQueue;
 use Lettermint\RabbitMQ\Attributes\Exchange;
@@ -17,6 +11,12 @@ use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Discovery\AttributeScanner;
 use Lettermint\RabbitMQ\Enums\TopologyEntityType;
 use Lettermint\RabbitMQ\Exceptions\TopologyException;
+use PhpAmqpLib\Channel\AMQPChannel;
+use PhpAmqpLib\Exception\AMQPChannelClosedException;
+use PhpAmqpLib\Exception\AMQPConnectionClosedException;
+use PhpAmqpLib\Exception\AMQPIOException;
+use PhpAmqpLib\Exception\AMQPProtocolChannelException;
+use PhpAmqpLib\Wire\AMQPTable;
 
 /**
  * Manages RabbitMQ topology (exchanges, queues, bindings).
@@ -69,6 +69,11 @@ class TopologyManager
         $channel = $dryRun ? null : $this->channelManager->topologyChannel();
 
         // First: Declare delayed exchange if enabled
+        // NOTE: The delayed exchange is declared but not automatically bound to queues.
+        // For delayed messages to be delivered, you must create bindings from the delayed
+        // exchange to your target queues using the same routing keys as your regular bindings.
+        // Example: If queue 'notifications' is bound to 'events' with key 'user.*',
+        // also bind it to 'delayed' with key 'user.*' to receive delayed messages.
         if (Arr::get($this->config, 'delayed.enabled', true)) {
             $delayedExchange = Arr::get($this->config, 'delayed.exchange', 'delayed');
             $result['exchanges'][] = "{$delayedExchange} (x-delayed-message)";
@@ -113,14 +118,17 @@ class TopologyManager
             /** @var ConsumesQueue $attribute */
             $attribute = $queueData['attribute'];
 
+            // Use allBindings which merges bindings from all jobs declaring this queue
+            $allBindings = $queueData['allBindings'];
+
             $result['queues'][] = $queueName;
 
             if (! $dryRun) {
                 $this->declareQueue($channel, $attribute);
             }
 
-            // Declare bindings
-            foreach ($attribute->bindings as $exchangeName => $routingKeys) {
+            // Declare bindings from ALL jobs that use this queue
+            foreach ($allBindings as $exchangeName => $routingKeys) {
                 $routingKeys = (array) $routingKeys;
 
                 foreach ($routingKeys as $routingKey) {
@@ -161,19 +169,23 @@ class TopologyManager
         }
 
         try {
-            $amqpExchange = new AMQPExchange($channel);
-            $amqpExchange->setName($exchange->name);
-            $amqpExchange->setType($this->mapExchangeType($exchange->getTypeValue()));
-            $amqpExchange->setFlags($this->getExchangeFlags($exchange));
+            $arguments = ! empty($exchange->arguments)
+                ? new AMQPTable($exchange->arguments)
+                : [];
 
-            if (! empty($exchange->arguments)) {
-                $amqpExchange->setArguments($exchange->arguments);
-            }
-
-            $amqpExchange->declareExchange();
+            $channel->exchange_declare(
+                $exchange->name,
+                $exchange->getTypeValue(),
+                false,             // passive
+                $exchange->durable,
+                $exchange->autoDelete,
+                $exchange->internal,
+                false,             // nowait
+                $arguments
+            );
 
             $this->declaredExchanges[$exchange->name] = true;
-        } catch (AMQPExchangeException $e) {
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPChannelClosedException|AMQPProtocolChannelException $e) {
             throw new TopologyException(
                 "Failed to declare exchange [{$exchange->name}]: ".$e->getMessage(),
                 entityType: TopologyEntityType::Exchange,
@@ -195,14 +207,18 @@ class TopologyManager
         }
 
         try {
-            $exchange = new AMQPExchange($channel);
-            $exchange->setName($name);
-            $exchange->setType(AMQP_EX_TYPE_DIRECT);
-            $exchange->setFlags(AMQP_DURABLE);
-            $exchange->declareExchange();
+            $channel->exchange_declare(
+                $name,
+                'direct',
+                false,  // passive
+                true,   // durable
+                false,  // auto_delete
+                false,  // internal
+                false   // nowait
+            );
 
             $this->declaredExchanges[$name] = true;
-        } catch (AMQPExchangeException $e) {
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPChannelClosedException|AMQPProtocolChannelException $e) {
             throw new TopologyException(
                 "Failed to declare DLQ exchange [{$name}]: ".$e->getMessage(),
                 entityType: TopologyEntityType::Exchange,
@@ -226,17 +242,23 @@ class TopologyManager
         }
 
         try {
-            $exchange = new AMQPExchange($channel);
-            $exchange->setName($name);
-            $exchange->setType('x-delayed-message');
-            $exchange->setFlags(AMQP_DURABLE);
-            $exchange->setArguments([
+            $arguments = new AMQPTable([
                 'x-delayed-type' => 'topic', // Underlying exchange type for routing
             ]);
-            $exchange->declareExchange();
+
+            $channel->exchange_declare(
+                $name,
+                'x-delayed-message',
+                false,  // passive
+                true,   // durable
+                false,  // auto_delete
+                false,  // internal
+                false,  // nowait
+                $arguments
+            );
 
             $this->declaredExchanges[$name] = true;
-        } catch (AMQPExchangeException $e) {
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPChannelClosedException|AMQPProtocolChannelException $e) {
             throw new TopologyException(
                 "Failed to declare delayed exchange [{$name}]: ".$e->getMessage().
                 ' (Is the rabbitmq_delayed_message_exchange plugin installed?)',
@@ -259,15 +281,14 @@ class TopologyManager
         }
 
         try {
-            $amqpExchange = new AMQPExchange($channel);
-            $amqpExchange->setName($exchange->name);
-
-            // Bind this exchange to the parent exchange
-            // Note: In ext-amqp, we bind the source exchange TO the destination
-            $sourceExchange = new AMQPExchange($channel);
-            $sourceExchange->setName($exchange->bindTo);
-            $sourceExchange->bind($exchange->name, $exchange->bindRoutingKey);
-        } catch (AMQPExchangeException $e) {
+            // Bind the source exchange to this exchange as destination
+            // exchange_bind(destination, source, routing_key)
+            $channel->exchange_bind(
+                $exchange->name,           // destination
+                $exchange->bindTo,         // source
+                $exchange->bindRoutingKey  // routing_key
+            );
+        } catch (\Exception $e) {
             throw new TopologyException(
                 "Failed to bind exchange [{$exchange->name}] to [{$exchange->bindTo}]: ".$e->getMessage(),
                 entityType: TopologyEntityType::Binding,
@@ -289,14 +310,20 @@ class TopologyManager
         }
 
         try {
-            $queue = new AMQPQueue($channel);
-            $queue->setName($attribute->queue);
-            $queue->setFlags(AMQP_DURABLE);
-            $queue->setArguments($attribute->getQueueArguments());
-            $queue->declareQueue();
+            $arguments = new AMQPTable($attribute->getQueueArguments());
+
+            $channel->queue_declare(
+                $attribute->queue,
+                false,     // passive
+                true,      // durable
+                false,     // exclusive
+                false,     // auto_delete
+                false,     // nowait
+                $arguments
+            );
 
             $this->declaredQueues[$attribute->queue] = true;
-        } catch (AMQPQueueException $e) {
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPChannelClosedException|AMQPProtocolChannelException $e) {
             throw new TopologyException(
                 "Failed to declare queue [{$attribute->queue}]: ".$e->getMessage(),
                 entityType: TopologyEntityType::Queue,
@@ -321,21 +348,31 @@ class TopologyManager
         }
 
         try {
-            // Declare DLQ queue
-            $queue = new AMQPQueue($channel);
-            $queue->setName($dlqQueueName);
-            $queue->setFlags(AMQP_DURABLE);
-            $queue->setArguments([
+            $arguments = new AMQPTable([
                 'x-queue-type' => 'quorum',
                 'x-message-ttl' => Arr::get($this->config, 'dead_letter.default_ttl', 604800000), // 7 days
             ]);
-            $queue->declareQueue();
+
+            // Declare DLQ queue
+            $channel->queue_declare(
+                $dlqQueueName,
+                false,     // passive
+                true,      // durable
+                false,     // exclusive
+                false,     // auto_delete
+                false,     // nowait
+                $arguments
+            );
 
             // Bind DLQ queue to DLQ exchange
-            $queue->bind($dlqExchange, $attribute->getDlqRoutingKey());
+            $channel->queue_bind(
+                $dlqQueueName,
+                $dlqExchange,
+                $attribute->getDlqRoutingKey()
+            );
 
             $this->declaredQueues[$dlqQueueName] = true;
-        } catch (AMQPQueueException $e) {
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPChannelClosedException|AMQPProtocolChannelException $e) {
             throw new TopologyException(
                 "Failed to declare DLQ queue [{$dlqQueueName}]: ".$e->getMessage(),
                 entityType: TopologyEntityType::Queue,
@@ -357,10 +394,8 @@ class TopologyManager
         string $routingKey
     ): void {
         try {
-            $queue = new AMQPQueue($channel);
-            $queue->setName($queueName);
-            $queue->bind($exchangeName, $routingKey);
-        } catch (AMQPQueueException $e) {
+            $channel->queue_bind($queueName, $exchangeName, $routingKey);
+        } catch (\Exception $e) {
             throw new TopologyException(
                 "Failed to bind queue [{$queueName}] to [{$exchangeName}]: ".$e->getMessage(),
                 entityType: TopologyEntityType::Binding,
@@ -368,42 +403,6 @@ class TopologyManager
                 previous: $e
             );
         }
-    }
-
-    /**
-     * Map string exchange type to AMQP constant.
-     */
-    protected function mapExchangeType(string $type): string
-    {
-        return match ($type) {
-            'direct' => AMQP_EX_TYPE_DIRECT,
-            'topic' => AMQP_EX_TYPE_TOPIC,
-            'fanout' => AMQP_EX_TYPE_FANOUT,
-            'headers' => AMQP_EX_TYPE_HEADERS,
-            default => $type, // For custom types like 'x-delayed-message'
-        };
-    }
-
-    /**
-     * Get exchange flags from Exchange attribute.
-     */
-    protected function getExchangeFlags(Exchange $exchange): int
-    {
-        $flags = 0;
-
-        if ($exchange->durable) {
-            $flags |= AMQP_DURABLE;
-        }
-
-        if ($exchange->autoDelete) {
-            $flags |= AMQP_AUTODELETE;
-        }
-
-        if ($exchange->internal) {
-            $flags |= AMQP_INTERNAL;
-        }
-
-        return $flags;
     }
 
     /**
@@ -415,12 +414,10 @@ class TopologyManager
     {
         try {
             $channel = $this->channelManager->topologyChannel();
-            $queue = new AMQPQueue($channel);
-            $queue->setName($queueName);
-            $queue->delete();
+            $channel->queue_delete($queueName);
 
             unset($this->declaredQueues[$queueName]);
-        } catch (AMQPQueueException|AMQPChannelException $e) {
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPChannelClosedException|AMQPProtocolChannelException $e) {
             throw new TopologyException(
                 "Failed to delete queue [{$queueName}]: ".$e->getMessage(),
                 entityType: TopologyEntityType::Queue,
@@ -439,11 +436,10 @@ class TopologyManager
     {
         try {
             $channel = $this->channelManager->topologyChannel();
-            $queue = new AMQPQueue($channel);
-            $queue->setName($queueName);
 
-            return $queue->purge();
-        } catch (AMQPQueueException|AMQPChannelException $e) {
+            // queue_purge returns the number of messages purged
+            return (int) $channel->queue_purge($queueName);
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPChannelClosedException|AMQPProtocolChannelException $e) {
             throw new TopologyException(
                 "Failed to purge queue [{$queueName}]: ".$e->getMessage(),
                 entityType: TopologyEntityType::Queue,
@@ -456,11 +452,10 @@ class TopologyManager
     /**
      * Get queue information.
      *
-     * Note: Due to ext-amqp limitations, message and consumer counts
-     * are not available via declareQueue(). Use RabbitMQ Management API
-     * for accurate statistics.
+     * Uses passive queue_declare to get message and consumer counts
+     * without modifying the queue.
      *
-     * @return array{messages: int|null, consumers: int|null, name: string}
+     * @return array{messages: int, consumers: int, name: string}
      *
      * @throws TopologyException When queue access fails
      */
@@ -468,16 +463,22 @@ class TopologyManager
     {
         try {
             $channel = $this->channelManager->topologyChannel();
-            $queue = new AMQPQueue($channel);
-            $queue->setName($queueName);
-            $queue->declareQueue();
+
+            // Passive declare returns [queue_name, message_count, consumer_count]
+            [$name, $messageCount, $consumerCount] = $channel->queue_declare(
+                $queueName,
+                true,   // passive - only check, don't create
+                false,  // durable
+                false,  // exclusive
+                false   // auto_delete
+            );
 
             return [
-                'name' => $queueName,
-                'messages' => null,
-                'consumers' => null,
+                'name' => $name,
+                'messages' => $messageCount,
+                'consumers' => $consumerCount,
             ];
-        } catch (AMQPQueueException|AMQPChannelException $e) {
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPChannelClosedException|AMQPProtocolChannelException $e) {
             throw new TopologyException(
                 "Failed to get queue info for [{$queueName}]: ".$e->getMessage(),
                 entityType: TopologyEntityType::Queue,

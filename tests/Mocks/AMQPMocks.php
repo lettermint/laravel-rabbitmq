@@ -4,51 +4,33 @@ declare(strict_types=1);
 
 namespace Lettermint\RabbitMQ\Tests\Mocks;
 
-use AMQPChannel;
-use AMQPConnection;
-use AMQPEnvelope;
-use AMQPExchange;
-use AMQPQueue;
 use Mockery;
 use Mockery\MockInterface;
+use PhpAmqpLib\Channel\AMQPChannel;
+use PhpAmqpLib\Connection\AMQPStreamConnection;
+use PhpAmqpLib\Message\AMQPMessage;
+use PhpAmqpLib\Wire\AMQPTable;
 
 /**
- * Factory for creating mock AMQP extension classes.
+ * Factory for creating mock php-amqplib classes.
  *
  * Use these mocks to test RabbitMQ functionality without a real connection.
  */
 class AMQPMocks
 {
     /**
-     * Create a mock AMQPConnection.
+     * Create a mock AMQPStreamConnection.
      */
-    public static function connection(bool $connected = true): MockInterface
+    public static function connection(bool $connected = true, int $heartbeat = 60): MockInterface
     {
-        $mock = Mockery::mock(AMQPConnection::class);
+        $mock = Mockery::mock(AMQPStreamConnection::class);
 
         $mock->shouldReceive('isConnected')->andReturn($connected)->byDefault();
-        $mock->shouldReceive('connect')->andReturn(true)->byDefault();
-        $mock->shouldReceive('pconnect')->andReturn(true)->byDefault();
         $mock->shouldReceive('reconnect')->andReturn(true)->byDefault();
-        $mock->shouldReceive('preconnect')->andReturn(true)->byDefault();
-        $mock->shouldReceive('disconnect')->andReturn(true)->byDefault();
-        $mock->shouldReceive('pdisconnect')->andReturn(true)->byDefault();
+        $mock->shouldReceive('close')->andReturn(null)->byDefault();
 
-        $mock->shouldReceive('getHost')->andReturn('localhost')->byDefault();
-        $mock->shouldReceive('getPort')->andReturn(5672)->byDefault();
-        $mock->shouldReceive('getLogin')->andReturn('guest')->byDefault();
-        $mock->shouldReceive('getVhost')->andReturn('/')->byDefault();
-
-        $mock->shouldReceive('setHost')->andReturnSelf()->byDefault();
-        $mock->shouldReceive('setPort')->andReturnSelf()->byDefault();
-        $mock->shouldReceive('setLogin')->andReturnSelf()->byDefault();
-        $mock->shouldReceive('setPassword')->andReturnSelf()->byDefault();
-        $mock->shouldReceive('setVhost')->andReturnSelf()->byDefault();
-        $mock->shouldReceive('setReadTimeout')->andReturnSelf()->byDefault();
-        $mock->shouldReceive('setWriteTimeout')->andReturnSelf()->byDefault();
-        $mock->shouldReceive('setConnectionTimeout')->andReturnSelf()->byDefault();
-        $mock->shouldReceive('setHeartbeat')->andReturnSelf()->byDefault();
-        $mock->shouldReceive('setRpcTimeout')->andReturnSelf()->byDefault();
+        $mock->shouldReceive('getHeartbeat')->andReturn($heartbeat)->byDefault();
+        $mock->shouldReceive('channel')->andReturn(self::channel($mock))->byDefault();
 
         return $mock;
     }
@@ -60,112 +42,57 @@ class AMQPMocks
     {
         $mock = Mockery::mock(AMQPChannel::class);
 
-        $mock->shouldReceive('isConnected')->andReturn(true)->byDefault();
+        $mock->shouldReceive('is_open')->andReturn(true)->byDefault();
+        $mock->shouldReceive('is_consuming')->andReturn(true)->byDefault();
+        $mock->shouldReceive('close')->andReturn(null)->byDefault();
         $mock->shouldReceive('getConnection')->andReturn($connection ?? self::connection())->byDefault();
 
-        // Prefetch / QoS
-        $mock->shouldReceive('setPrefetchCount')->andReturn(true)->byDefault();
-        $mock->shouldReceive('setPrefetchSize')->andReturn(true)->byDefault();
-        $mock->shouldReceive('qos')->andReturn(true)->byDefault();
-        $mock->shouldReceive('getPrefetchCount')->andReturn(10)->byDefault();
-        $mock->shouldReceive('getPrefetchSize')->andReturn(0)->byDefault();
+        // QoS
+        $mock->shouldReceive('basic_qos')->andReturn(null)->byDefault();
 
         // Publisher confirms
-        $mock->shouldReceive('confirmSelect')->andReturn(true)->byDefault();
-        $mock->shouldReceive('setConfirmCallback')->andReturn(true)->byDefault();
-        $mock->shouldReceive('waitForConfirm')->andReturn(true)->byDefault();
-        $mock->shouldReceive('setReturnCallback')->andReturn(true)->byDefault();
+        $mock->shouldReceive('confirm_select')->andReturn(null)->byDefault();
+        $mock->shouldReceive('set_ack_handler')->andReturn(null)->byDefault();
+        $mock->shouldReceive('set_nack_handler')->andReturn(null)->byDefault();
+        $mock->shouldReceive('wait_for_pending_acks_returns')->andReturn(null)->byDefault();
 
         // Transactions
-        $mock->shouldReceive('startTransaction')->andReturn(true)->byDefault();
-        $mock->shouldReceive('commitTransaction')->andReturn(true)->byDefault();
-        $mock->shouldReceive('rollbackTransaction')->andReturn(true)->byDefault();
-
-        // Basic operations
-        $mock->shouldReceive('basicRecover')->andReturn(true)->byDefault();
-        $mock->shouldReceive('close')->andReturn(true)->byDefault();
-
-        return $mock;
-    }
-
-    /**
-     * Create a mock AMQPQueue.
-     */
-    public static function queue(string $name = 'test-queue', ?MockInterface $channel = null): MockInterface
-    {
-        $mock = Mockery::mock(AMQPQueue::class);
-
-        $mock->shouldReceive('getName')->andReturn($name)->byDefault();
-        $mock->shouldReceive('setName')->andReturn(true)->byDefault();
-        $mock->shouldReceive('getChannel')->andReturn($channel ?? self::channel())->byDefault();
-
-        // Flags and arguments
-        $mock->shouldReceive('getFlags')->andReturn(\AMQP_DURABLE)->byDefault();
-        $mock->shouldReceive('setFlags')->andReturn(true)->byDefault();
-        $mock->shouldReceive('getArguments')->andReturn([])->byDefault();
-        $mock->shouldReceive('setArguments')->andReturn(true)->byDefault();
-        $mock->shouldReceive('setArgument')->andReturn(true)->byDefault();
-
-        // Declaration
-        $mock->shouldReceive('declareQueue')->andReturn(0)->byDefault();
-        $mock->shouldReceive('delete')->andReturn(0)->byDefault();
-        $mock->shouldReceive('purge')->andReturn(0)->byDefault();
-
-        // Binding
-        $mock->shouldReceive('bind')->andReturn(true)->byDefault();
-        $mock->shouldReceive('unbind')->andReturn(true)->byDefault();
-
-        // Consuming
-        $mock->shouldReceive('get')->andReturn(null)->byDefault();
-        $mock->shouldReceive('consume')->andReturn(true)->byDefault();
-        $mock->shouldReceive('cancel')->andReturn(true)->byDefault();
-
-        // Acknowledgement
-        $mock->shouldReceive('ack')->andReturn(true)->byDefault();
-        $mock->shouldReceive('nack')->andReturn(true)->byDefault();
-        $mock->shouldReceive('reject')->andReturn(true)->byDefault();
-
-        return $mock;
-    }
-
-    /**
-     * Create a mock AMQPExchange.
-     */
-    public static function exchange(string $name = 'test-exchange', ?MockInterface $channel = null): MockInterface
-    {
-        $mock = Mockery::mock(AMQPExchange::class);
-
-        $mock->shouldReceive('getName')->andReturn($name)->byDefault();
-        $mock->shouldReceive('setName')->andReturn(true)->byDefault();
-        $mock->shouldReceive('getChannel')->andReturn($channel ?? self::channel())->byDefault();
-
-        // Type
-        $mock->shouldReceive('getType')->andReturn('topic')->byDefault();
-        $mock->shouldReceive('setType')->andReturn(true)->byDefault();
-
-        // Flags and arguments
-        $mock->shouldReceive('getFlags')->andReturn(\AMQP_DURABLE)->byDefault();
-        $mock->shouldReceive('setFlags')->andReturn(true)->byDefault();
-        $mock->shouldReceive('getArguments')->andReturn([])->byDefault();
-        $mock->shouldReceive('setArguments')->andReturn(true)->byDefault();
-        $mock->shouldReceive('setArgument')->andReturn(true)->byDefault();
-
-        // Declaration
-        $mock->shouldReceive('declareExchange')->andReturn(true)->byDefault();
-        $mock->shouldReceive('delete')->andReturn(true)->byDefault();
-
-        // Binding (exchange-to-exchange)
-        $mock->shouldReceive('bind')->andReturn(true)->byDefault();
-        $mock->shouldReceive('unbind')->andReturn(true)->byDefault();
+        $mock->shouldReceive('tx_select')->andReturn(null)->byDefault();
+        $mock->shouldReceive('tx_commit')->andReturn(null)->byDefault();
+        $mock->shouldReceive('tx_rollback')->andReturn(null)->byDefault();
 
         // Publishing
-        $mock->shouldReceive('publish')->andReturn(true)->byDefault();
+        $mock->shouldReceive('basic_publish')->andReturn(null)->byDefault();
+
+        // Consuming
+        $mock->shouldReceive('basic_get')->andReturn(null)->byDefault();
+        $mock->shouldReceive('basic_consume')->andReturn('consumer-tag')->byDefault();
+        $mock->shouldReceive('basic_cancel')->andReturn(null)->byDefault();
+        $mock->shouldReceive('wait')->andReturn(null)->byDefault();
+
+        // Acknowledgement
+        $mock->shouldReceive('basic_ack')->andReturn(null)->byDefault();
+        $mock->shouldReceive('basic_nack')->andReturn(null)->byDefault();
+        $mock->shouldReceive('basic_reject')->andReturn(null)->byDefault();
+
+        // Exchange operations
+        $mock->shouldReceive('exchange_declare')->andReturn(null)->byDefault();
+        $mock->shouldReceive('exchange_delete')->andReturn(null)->byDefault();
+        $mock->shouldReceive('exchange_bind')->andReturn(null)->byDefault();
+        $mock->shouldReceive('exchange_unbind')->andReturn(null)->byDefault();
+
+        // Queue operations
+        $mock->shouldReceive('queue_declare')->andReturn(['test-queue', 0, 0])->byDefault();
+        $mock->shouldReceive('queue_delete')->andReturn(0)->byDefault();
+        $mock->shouldReceive('queue_bind')->andReturn(null)->byDefault();
+        $mock->shouldReceive('queue_unbind')->andReturn(null)->byDefault();
+        $mock->shouldReceive('queue_purge')->andReturn(0)->byDefault();
 
         return $mock;
     }
 
     /**
-     * Create a mock AMQPEnvelope.
+     * Create a mock AMQPMessage.
      *
      * @param  array{
      *     body?: string,
@@ -187,7 +114,7 @@ class AMQPMocks
      *     redelivered?: bool,
      * }  $options
      */
-    public static function envelope(array $options = []): MockInterface
+    public static function message(array $options = []): MockInterface
     {
         $defaults = [
             'body' => '{"uuid":"test-uuid","displayName":"TestJob","job":"Illuminate\\\\Queue\\\\CallQueuedHandler@call","data":{}}',
@@ -210,37 +137,57 @@ class AMQPMocks
         ];
 
         $options = array_merge($defaults, $options);
+        $hasHeaders = ! empty($options['headers']);
 
-        $mock = Mockery::mock(AMQPEnvelope::class);
+        // Use real AMQPTable - Mockery has issues with this class
+        $headersTable = new AMQPTable($options['headers']);
+
+        $mock = Mockery::mock(AMQPMessage::class);
 
         $mock->shouldReceive('getBody')->andReturn($options['body']);
         $mock->shouldReceive('getDeliveryTag')->andReturn($options['deliveryTag']);
-        $mock->shouldReceive('getMessageId')->andReturn($options['messageId']);
-        $mock->shouldReceive('getTimestamp')->andReturn($options['timestamp']);
-        $mock->shouldReceive('getPriority')->andReturn($options['priority']);
-        $mock->shouldReceive('getHeaders')->andReturn($options['headers']);
-        $mock->shouldReceive('getHeader')->andReturnUsing(function ($key) use ($options) {
-            return $options['headers'][$key] ?? null;
-        });
-        $mock->shouldReceive('getContentType')->andReturn($options['contentType']);
-        $mock->shouldReceive('getContentEncoding')->andReturn($options['contentEncoding']);
-        $mock->shouldReceive('getCorrelationId')->andReturn($options['correlationId']);
-        $mock->shouldReceive('getReplyTo')->andReturn($options['replyTo']);
-        $mock->shouldReceive('getExpiration')->andReturn($options['expiration']);
-        $mock->shouldReceive('getType')->andReturn($options['type']);
-        $mock->shouldReceive('getUserId')->andReturn($options['userId']);
-        $mock->shouldReceive('getAppId')->andReturn($options['appId']);
+        $mock->shouldReceive('getChannel')->andReturn(self::channel());
+        $mock->shouldReceive('isRedelivered')->andReturn($options['redelivered']);
         $mock->shouldReceive('getRoutingKey')->andReturn($options['routingKey']);
-        $mock->shouldReceive('getExchangeName')->andReturn($options['exchange']);
-        $mock->shouldReceive('isRedelivery')->andReturn($options['redelivered']);
+        $mock->shouldReceive('getExchange')->andReturn($options['exchange']);
+
+        // Properties are accessed via has() and get() in php-amqplib
+        // Using explicit setup to avoid closure capture issues
+        $mock->shouldReceive('has')->with('message_id')->andReturn(! empty($options['messageId']));
+        $mock->shouldReceive('has')->with('timestamp')->andReturn(! empty($options['timestamp']));
+        $mock->shouldReceive('has')->with('priority')->andReturn(isset($options['priority']));
+        $mock->shouldReceive('has')->with('application_headers')->andReturn($hasHeaders);
+        $mock->shouldReceive('has')->with('content_type')->andReturn(! empty($options['contentType']));
+        $mock->shouldReceive('has')->with('content_encoding')->andReturn(! empty($options['contentEncoding']));
+        $mock->shouldReceive('has')->with('correlation_id')->andReturn(! empty($options['correlationId']));
+        $mock->shouldReceive('has')->with('reply_to')->andReturn(! empty($options['replyTo']));
+        $mock->shouldReceive('has')->with('expiration')->andReturn(! empty($options['expiration']));
+        $mock->shouldReceive('has')->with('type')->andReturn(! empty($options['type']));
+        $mock->shouldReceive('has')->with('user_id')->andReturn(! empty($options['userId']));
+        $mock->shouldReceive('has')->with('app_id')->andReturn(! empty($options['appId']));
+        $mock->shouldReceive('has')->andReturn(false)->byDefault();
+
+        $mock->shouldReceive('get')->with('message_id')->andReturn($options['messageId']);
+        $mock->shouldReceive('get')->with('timestamp')->andReturn($options['timestamp']);
+        $mock->shouldReceive('get')->with('priority')->andReturn($options['priority']);
+        $mock->shouldReceive('get')->with('application_headers')->andReturn($headersTable);
+        $mock->shouldReceive('get')->with('content_type')->andReturn($options['contentType']);
+        $mock->shouldReceive('get')->with('content_encoding')->andReturn($options['contentEncoding']);
+        $mock->shouldReceive('get')->with('correlation_id')->andReturn($options['correlationId']);
+        $mock->shouldReceive('get')->with('reply_to')->andReturn($options['replyTo']);
+        $mock->shouldReceive('get')->with('expiration')->andReturn($options['expiration']);
+        $mock->shouldReceive('get')->with('type')->andReturn($options['type']);
+        $mock->shouldReceive('get')->with('user_id')->andReturn($options['userId']);
+        $mock->shouldReceive('get')->with('app_id')->andReturn($options['appId']);
+        $mock->shouldReceive('get')->andReturn(null)->byDefault();
 
         return $mock;
     }
 
     /**
-     * Create an envelope with a specific job payload.
+     * Create a message with a specific job payload.
      */
-    public static function envelopeWithJob(string $jobClass, array $jobData = [], array $options = []): MockInterface
+    public static function messageWithJob(string $jobClass, array $jobData = [], array $options = []): MockInterface
     {
         $payload = [
             'uuid' => $options['uuid'] ?? 'test-uuid-'.uniqid(),
@@ -261,8 +208,18 @@ class AMQPMocks
             $payload['data'] = array_merge($payload['data'], $jobData);
         }
 
-        return self::envelope(array_merge($options, [
+        return self::message(array_merge($options, [
             'body' => json_encode($payload),
         ]));
+    }
+
+    /**
+     * Create an AMQPTable for headers.
+     *
+     * @param  array<string, mixed>  $headers
+     */
+    public static function headersTable(array $headers = []): AMQPTable
+    {
+        return new AMQPTable($headers);
     }
 }

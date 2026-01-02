@@ -5,7 +5,7 @@
 [![GitHub Code Style Action Status](https://img.shields.io/github/actions/workflow/status/lettermint/laravel-rabbitmq/fix-php-code-style-issues.yml?branch=main&label=code%20style&style=flat-square)](https://github.com/lettermint/laravel-rabbitmq/actions?query=workflow%3A"Fix+PHP+code+style+issues"+branch%3Amain)
 [![Total Downloads](https://img.shields.io/packagist/dt/lettermint/laravel-rabbitmq.svg?style=flat-square)](https://packagist.org/packages/lettermint/laravel-rabbitmq)
 
-A modern RabbitMQ queue driver for Laravel using `ext-amqp` with attribute-based topology declaration, dead letter queues, and advanced retry strategies.
+A modern RabbitMQ queue driver for Laravel using `php-amqplib` with attribute-based topology declaration, dead letter queues, and advanced retry strategies.
 
 ## Features
 
@@ -22,7 +22,7 @@ A modern RabbitMQ queue driver for Laravel using `ext-amqp` with attribute-based
 - PHP 8.2+
 - Laravel 11.0+
 - RabbitMQ 3.12+
-- ext-amqp (PECL AMQP extension)
+- php-amqplib/php-amqplib ^3.6
 
 ### Optional
 

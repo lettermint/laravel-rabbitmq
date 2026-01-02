@@ -4,14 +4,6 @@ declare(strict_types=1);
 
 namespace Lettermint\RabbitMQ\Queue;
 
-use AMQPChannelException;
-use AMQPConnectionException;
-use AMQPEnvelope;
-use AMQPException;
-use AMQPExchange;
-use AMQPExchangeException;
-use AMQPQueue;
-use AMQPQueueException;
 use DateInterval;
 use DateTimeInterface;
 use Illuminate\Contracts\Queue\Job;
@@ -24,6 +16,15 @@ use Lettermint\RabbitMQ\Contracts\HasPriority;
 use Lettermint\RabbitMQ\Discovery\AttributeScanner;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
 use Lettermint\RabbitMQ\Exceptions\PublishException;
+use PhpAmqpLib\Channel\AMQPChannel;
+use PhpAmqpLib\Exception\AMQPChannelClosedException;
+use PhpAmqpLib\Exception\AMQPConnectionClosedException;
+use PhpAmqpLib\Exception\AMQPIOException;
+use PhpAmqpLib\Exception\AMQPProtocolChannelException;
+use PhpAmqpLib\Exception\AMQPRuntimeException;
+use PhpAmqpLib\Exception\AMQPTimeoutException;
+use PhpAmqpLib\Message\AMQPMessage;
+use PhpAmqpLib\Wire\AMQPTable;
 
 /**
  * RabbitMQ Queue implementation for Laravel.
@@ -78,9 +79,7 @@ class RabbitMQQueue extends Queue implements QueueContract
     /**
      * Get the size of the queue.
      *
-     * Note: ext-amqp doesn't expose message count from declareQueue().
-     * This method returns 0 when successful. Use RabbitMQ Management API
-     * for accurate queue sizes.
+     * php-amqplib's queue_declare returns [queue_name, message_count, consumer_count].
      *
      * @throws ConnectionException When unable to connect or access queue
      */
@@ -91,13 +90,29 @@ class RabbitMQQueue extends Queue implements QueueContract
         try {
             $channel = $this->channelManager->topologyChannel();
 
-            $amqpQueue = new AMQPQueue($channel);
-            $amqpQueue->setName($queue);
-            $amqpQueue->declareQueue();
+            // queue_declare returns [queue_name, message_count, consumer_count]
+            // passive=true just checks if queue exists without modifying it
+            [$queueName, $messageCount, $consumerCount] = $channel->queue_declare(
+                $queue,
+                true,   // passive - just check, don't create
+                false,  // durable
+                false,  // exclusive
+                false   // auto_delete
+            );
 
-            // ext-amqp doesn't expose count from declareQueue
+            return $messageCount;
+        } catch (AMQPProtocolChannelException $e) {
+            // Queue doesn't exist - channel is now closed by RabbitMQ
+            // Invalidate the topology channel so next call creates a fresh one
+            $this->channelManager->closeChannel('topology');
+
+            Log::debug('RabbitMQ queue does not exist', [
+                'queue' => $queue,
+                'error' => $e->getMessage(),
+            ]);
+
             return 0;
-        } catch (AMQPConnectionException $e) {
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPRuntimeException $e) {
             Log::error('RabbitMQ connection failed while getting queue size', [
                 'queue' => $queue,
                 'error' => $e->getMessage(),
@@ -105,26 +120,6 @@ class RabbitMQQueue extends Queue implements QueueContract
 
             throw new ConnectionException(
                 "Failed to connect to RabbitMQ while getting size of queue '{$queue}': {$e->getMessage()}",
-                previous: $e
-            );
-        } catch (AMQPChannelException $e) {
-            Log::error('RabbitMQ channel error while getting queue size', [
-                'queue' => $queue,
-                'error' => $e->getMessage(),
-            ]);
-
-            throw new ConnectionException(
-                "Channel error while getting size of queue '{$queue}': {$e->getMessage()}",
-                previous: $e
-            );
-        } catch (AMQPQueueException $e) {
-            Log::error('RabbitMQ queue error while getting queue size', [
-                'queue' => $queue,
-                'error' => $e->getMessage(),
-            ]);
-
-            throw new ConnectionException(
-                "Queue error while getting size of queue '{$queue}': {$e->getMessage()}",
                 previous: $e
             );
         }
@@ -229,51 +224,31 @@ class RabbitMQQueue extends Queue implements QueueContract
 
         try {
             $channel = $this->channelManager->consumeChannel();
-            $amqpQueue = new AMQPQueue($channel);
-            $amqpQueue->setName($queue);
 
-            $envelope = $amqpQueue->get();
+            // basic_get returns AMQPMessage or null
+            $message = $channel->basic_get($queue, false);
 
-            if ($envelope instanceof AMQPEnvelope) {
+            if ($message instanceof AMQPMessage) {
                 return new RabbitMQJob(
                     container: $this->container,
                     rabbitmq: $this,
-                    queue: $amqpQueue,
-                    envelope: $envelope,
+                    channel: $channel,
+                    message: $message,
                     connectionName: $this->connectionName,
                     queueName: $queue
                 );
             }
 
             return null;
-        } catch (AMQPConnectionException $e) {
-            Log::error('RabbitMQ connection failed while popping job', [
+        } catch (\Exception $e) {
+            Log::error('RabbitMQ error while popping job', [
                 'queue' => $queue,
                 'error' => $e->getMessage(),
+                'exception' => get_class($e),
             ]);
 
             throw new ConnectionException(
-                "Failed to connect to RabbitMQ while popping from queue '{$queue}': {$e->getMessage()}",
-                previous: $e
-            );
-        } catch (AMQPChannelException $e) {
-            Log::error('RabbitMQ channel error while popping job', [
-                'queue' => $queue,
-                'error' => $e->getMessage(),
-            ]);
-
-            throw new ConnectionException(
-                "Channel error while popping from queue '{$queue}': {$e->getMessage()}",
-                previous: $e
-            );
-        } catch (AMQPQueueException $e) {
-            Log::error('RabbitMQ queue error while popping job', [
-                'queue' => $queue,
-                'error' => $e->getMessage(),
-            ]);
-
-            throw new ConnectionException(
-                "Queue error while popping from queue '{$queue}': {$e->getMessage()}",
+                "Failed to pop from queue '{$queue}': {$e->getMessage()}",
                 previous: $e
             );
         }
@@ -284,6 +259,10 @@ class RabbitMQQueue extends Queue implements QueueContract
      *
      * Uses RabbitMQ transactions to ensure all-or-nothing semantics.
      * Critical for operations where batch consistency is required.
+     *
+     * Note: Uses a separate 'batch' channel to avoid conflicts with publisher
+     * confirms on the regular publish channel. Mixing tx_select and confirm_select
+     * on the same channel is not supported by RabbitMQ.
      *
      * @param  array<object|string>  $jobs  Array of job instances or class names
      * @return array<array{status: string, job: string, id?: string}>
@@ -300,8 +279,9 @@ class RabbitMQQueue extends Queue implements QueueContract
         $queue = $this->getQueue($queue);
 
         try {
-            $channel = $this->channelManager->publishChannel();
-            $channel->startTransaction();
+            // Use dedicated batch channel to avoid tx/confirm mode conflict
+            $channel = $this->channelManager->channel('batch');
+            $channel->tx_select();
 
             foreach ($jobs as $index => $job) {
                 try {
@@ -321,8 +301,8 @@ class RabbitMQQueue extends Queue implements QueueContract
                         'job' => is_object($job) ? get_class($job) : $job,
                         'id' => $this->getPayloadId($payload),
                     ];
-                } catch (AMQPConnectionException|AMQPChannelException|AMQPExchangeException $e) {
-                    $channel->rollbackTransaction();
+                } catch (AMQPIOException|AMQPConnectionClosedException|AMQPChannelClosedException|AMQPProtocolChannelException $e) {
+                    $channel->tx_rollback();
 
                     Log::error('Batch publish failed', [
                         'queue' => $queue,
@@ -340,7 +320,7 @@ class RabbitMQQueue extends Queue implements QueueContract
                 }
             }
 
-            $channel->commitTransaction();
+            $channel->tx_commit();
 
             Log::info('Batch published successfully', [
                 'queue' => $queue,
@@ -350,7 +330,7 @@ class RabbitMQQueue extends Queue implements QueueContract
             return $results;
         } catch (PublishException $e) {
             throw $e;
-        } catch (AMQPConnectionException|AMQPChannelException $e) {
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPChannelClosedException $e) {
             Log::error('Batch publish transaction failed', [
                 'queue' => $queue,
                 'error' => $e->getMessage(),
@@ -385,39 +365,30 @@ class RabbitMQQueue extends Queue implements QueueContract
             // Track by channel ID to detect when channel is replaced (reconnection).
             $channelId = spl_object_id($channel);
             if ($this->useConfirms && $this->confirmModeChannelId !== $channelId) {
-                $channel->confirmSelect();
-                // IMPORTANT: Return FALSE to stop waiting, TRUE to continue waiting
-                // (counterintuitive but per ext-amqp docs)
-                // Note: basic.nack from broker only happens on internal Erlang errors (rare)
-                $channel->setConfirmCallback(
-                    fn (int $deliveryTag, bool $multiple): bool => false,  // ack - success, stop waiting
-                    function (int $deliveryTag, bool $multiple, bool $requeue): bool {
-                        // NACK means broker couldn't handle the message (internal error)
-                        // This is rare but we should fail explicitly
-                        throw new \AMQPException(
-                            "Message nack'd by broker (delivery_tag: {$deliveryTag}, multiple: ".($multiple ? 'true' : 'false').')'
-                        );
-                    }
-                );
+                $channel->confirm_select();
                 $this->confirmModeChannelId = $channelId;
             }
 
-            $amqpExchange = new AMQPExchange($channel);
-            $amqpExchange->setName($exchange);
+            $message = $this->buildMessage($payload, $priority, $delay);
 
-            $attributes = $this->buildMessageAttributes($priority, $delay);
-
-            // AMQPExchange::publish() returns void and throws on failure
-            // Publisher confirms handle broker-level acknowledgment
-            $amqpExchange->publish(
-                $payload,
-                $routingKey,
-                AMQP_NOPARAM,
-                $attributes
-            );
+            $channel->basic_publish($message, $exchange, $routingKey);
 
             if ($this->useConfirms) {
-                $channel->waitForConfirm($this->confirmTimeout);
+                try {
+                    $channel->wait_for_pending_acks_returns($this->confirmTimeout);
+                } catch (AMQPTimeoutException $e) {
+                    // Timeout waiting for confirm - message was already published via basic_publish
+                    // but we don't know for sure if RabbitMQ received it. Log as warning since
+                    // the message may have been delivered, and let the caller decide whether to retry.
+                    Log::warning('RabbitMQ publisher confirm timed out - message may have been delivered', [
+                        'exchange' => $exchange,
+                        'routing_key' => $routingKey,
+                        'confirm_timeout' => $this->confirmTimeout,
+                    ]);
+
+                    // Don't throw - the message was published, we just couldn't confirm
+                    // Throwing here would cause duplicates if caller retries
+                }
             }
         } catch (PublishException $e) {
             Log::error('RabbitMQ message publish failed', [
@@ -427,7 +398,7 @@ class RabbitMQQueue extends Queue implements QueueContract
             ]);
 
             throw $e;
-        } catch (AMQPException|AMQPConnectionException|AMQPChannelException|AMQPExchangeException $e) {
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPChannelClosedException|AMQPProtocolChannelException|AMQPRuntimeException $e) {
             Log::error('RabbitMQ publish error', [
                 'exchange' => $exchange,
                 'routing_key' => $routingKey,
@@ -448,51 +419,41 @@ class RabbitMQQueue extends Queue implements QueueContract
      * Publish a message without confirms (for batch transactions).
      */
     protected function publishMessageWithoutConfirm(
-        \AMQPChannel $channel,
+        AMQPChannel $channel,
         string $exchange,
         string $routingKey,
         string $payload,
         ?int $priority = null,
     ): void {
-        $amqpExchange = new AMQPExchange($channel);
-        $amqpExchange->setName($exchange);
+        $message = $this->buildMessage($payload, $priority, null);
 
-        $attributes = $this->buildMessageAttributes($priority, null);
-
-        $amqpExchange->publish(
-            $payload,
-            $routingKey,
-            AMQP_NOPARAM,
-            $attributes
-        );
+        $channel->basic_publish($message, $exchange, $routingKey);
     }
 
     /**
-     * Build message attributes for publishing.
-     *
-     * @return array<string, mixed>
+     * Build an AMQPMessage with properties.
      */
-    protected function buildMessageAttributes(?int $priority = null, ?int $delay = null): array
+    protected function buildMessage(string $payload, ?int $priority = null, ?int $delay = null): AMQPMessage
     {
-        $attributes = [
-            'delivery_mode' => 2, // Persistent messages for durability
+        $properties = [
+            'delivery_mode' => AMQPMessage::DELIVERY_MODE_PERSISTENT,
             'content_type' => 'application/json',
             'message_id' => Str::uuid()->toString(),
             'timestamp' => time(),
         ];
 
         if ($priority !== null) {
-            $attributes['priority'] = $priority;
+            $properties['priority'] = $priority;
         }
 
         // Add delay header for delayed exchange plugin
         if ($delay !== null && $delay > 0) {
-            $attributes['headers'] = [
+            $properties['application_headers'] = new AMQPTable([
                 'x-delay' => $delay,
-            ];
+            ]);
         }
 
-        return $attributes;
+        return new AMQPMessage($payload, $properties);
     }
 
     /**
@@ -610,14 +571,14 @@ class RabbitMQQueue extends Queue implements QueueContract
      *
      * @throws ConnectionException When acknowledgment fails
      */
-    public function ack(AMQPEnvelope $envelope, AMQPQueue $queue): void
+    public function ack(AMQPMessage $message, AMQPChannel $channel): void
     {
         try {
-            $queue->ack($envelope->getDeliveryTag());
-        } catch (AMQPQueueException|AMQPChannelException $e) {
+            $channel->basic_ack($message->getDeliveryTag());
+        } catch (AMQPIOException|AMQPChannelClosedException $e) {
             Log::error('Failed to acknowledge RabbitMQ message', [
-                'delivery_tag' => $envelope->getDeliveryTag(),
-                'message_id' => $envelope->getMessageId(),
+                'delivery_tag' => $message->getDeliveryTag(),
+                'message_id' => $message->get('message_id'),
                 'error' => $e->getMessage(),
             ]);
 
@@ -635,14 +596,14 @@ class RabbitMQQueue extends Queue implements QueueContract
      *
      * @throws ConnectionException When rejection fails
      */
-    public function reject(AMQPEnvelope $envelope, AMQPQueue $queue, bool $requeue = false): void
+    public function reject(AMQPMessage $message, AMQPChannel $channel, bool $requeue = false): void
     {
         try {
-            $queue->reject($envelope->getDeliveryTag(), $requeue ? AMQP_REQUEUE : AMQP_NOPARAM);
-        } catch (AMQPQueueException|AMQPChannelException $e) {
+            $channel->basic_reject($message->getDeliveryTag(), $requeue);
+        } catch (AMQPIOException|AMQPChannelClosedException $e) {
             Log::error('Failed to reject RabbitMQ message', [
-                'delivery_tag' => $envelope->getDeliveryTag(),
-                'message_id' => $envelope->getMessageId(),
+                'delivery_tag' => $message->getDeliveryTag(),
+                'message_id' => $message->get('message_id'),
                 'requeue' => $requeue,
                 'error' => $e->getMessage(),
             ]);
