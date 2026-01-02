@@ -182,7 +182,9 @@ class DlqInspectCommand extends Command
             : [];
 
         $xDeath = $headers['x-death'][0] ?? null;
-        $attempts = $xDeath['count'] ?? 1;
+
+        // Check payload first (set when replaying from DLQ), then fall back to x-death headers
+        $attempts = $payload['attempts'] ?? $xDeath['count'] ?? 1;
         $failedAt = null;
         $reason = $xDeath['reason'] ?? 'unknown';
 
