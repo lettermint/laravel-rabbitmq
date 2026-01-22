@@ -21,23 +21,23 @@ class TestEventCommand extends Command
     protected $signature = 'rabbitmq:test-event
         {queue=test-events : The queue to publish the test event to}
         {--message= : Custom message content}
-        {--consume : Also consume and verify the message}
+        {--roundtrip : Publish and consume to verify round-trip}
         {--json : Output as JSON}';
 
-    protected $description = 'Send a test event to RabbitMQ and optionally consume it';
+    protected $description = 'Send a test event to RabbitMQ and optionally verify round-trip';
 
     public function handle(ChannelManager $channelManager): int
     {
         $queue = $this->argument('queue');
         $customMessage = $this->option('message');
-        $shouldConsume = $this->option('consume');
+        $roundtrip = $this->option('roundtrip');
         $jsonOutput = $this->option('json');
 
         $messageId = Str::uuid()->toString();
         $timestamp = now()->toIso8601String();
 
-        // When consuming, use a temporary exclusive queue to avoid conflicts with workers
-        $useTemporaryQueue = $shouldConsume;
+        // When doing round-trip, use a temporary exclusive queue to avoid conflicts with workers
+        $useTemporaryQueue = $roundtrip;
         $temporaryQueue = null;
 
         $payload = [
@@ -109,7 +109,7 @@ class TestEventCommand extends Command
             }
 
             // Consume and verify from the temporary queue
-            if ($shouldConsume) {
+            if ($roundtrip) {
                 $consumeResult = $this->consumeAndVerify($channelManager, $publishQueue, $messageId, $jsonOutput);
 
                 if (! $consumeResult['success']) {
