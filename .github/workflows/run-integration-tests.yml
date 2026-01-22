@@ -1,0 +1,90 @@
+name: run-integration-tests
+
+on:
+  push:
+    paths:
+      - '**.php'
+      - '.github/workflows/run-integration-tests.yml'
+      - 'phpunit.xml.dist'
+      - 'composer.json'
+      - 'composer.lock'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    services:
+      rabbitmq:
+        image: rabbitmq:3-management
+        ports:
+          - 5672:5672
+          - 15672:15672
+        env:
+          RABBITMQ_DEFAULT_USER: guest
+          RABBITMQ_DEFAULT_PASS: guest
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    strategy:
+      fail-fast: true
+      matrix:
+        php: [8.4]
+        laravel: [12.*]
+        stability: [prefer-stable]
+        include:
+          - laravel: 12.*
+            testbench: 10.*
+
+    name: Integration Tests - P${{ matrix.php }} - L${{ matrix.laravel }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: dom, curl, libxml, mbstring, zip, pcntl, pdo, sqlite, pdo_sqlite, bcmath, soap, intl, gd, exif, iconv, imagick, fileinfo, amqp, sockets
+          coverage: none
+
+      - name: Setup problem matchers
+        run: |
+          echo "::add-matcher::${{ runner.tool_cache }}/php.json"
+          echo "::add-matcher::${{ runner.tool_cache }}/phpunit.json"
+
+      - name: Require Laravel Framework and Testbench versions
+        run: |
+          composer require "laravel/framework:${{ matrix.laravel }}" "orchestra/testbench:${{ matrix.testbench }}" --no-interaction --no-update
+
+      - name: Require Pest 3.x and plugins for Laravel 11+
+        run: |
+          composer require "pestphp/pest:^3.0" "pestphp/pest-plugin-laravel:^3.0" "pestphp/pest-plugin-arch:^3.0" --dev --no-interaction --no-update
+
+      - name: Install all dependencies
+        run: |
+          composer update --${{ matrix.stability }} --prefer-dist --no-interaction
+
+      - name: Wait for RabbitMQ to be ready
+        run: |
+          timeout 60 bash -c 'until nc -z localhost 5672; do sleep 1; done'
+
+      - name: List Installed Dependencies
+        run: composer show -D
+
+      - name: Execute integration tests
+        env:
+          RABBITMQ_HOST: localhost
+          RABBITMQ_PORT: 5672
+          RABBITMQ_USER: guest
+          RABBITMQ_PASSWORD: guest
+          RABBITMQ_VHOST: /
+        run: vendor/bin/pest --ci --group=integration
