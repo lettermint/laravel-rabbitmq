@@ -36,6 +36,10 @@ class TestEventCommand extends Command
         $messageId = Str::uuid()->toString();
         $timestamp = now()->toIso8601String();
 
+        // When consuming, use a temporary exclusive queue to avoid conflicts with workers
+        $useTemporaryQueue = $shouldConsume;
+        $temporaryQueue = null;
+
         $payload = [
             'uuid' => $messageId,
             'type' => 'test_event',
@@ -48,32 +52,50 @@ class TestEventCommand extends Command
         ];
 
         try {
-            // Declare the queue if it doesn't exist
             $topologyChannel = $channelManager->topologyChannel();
-            $topologyChannel->queue_declare(
-                $queue,
-                false,  // passive
-                true,   // durable
-                false,  // exclusive
-                false   // auto_delete
-            );
+
+            if ($useTemporaryQueue) {
+                // Create a temporary exclusive queue for round-trip testing
+                // This avoids conflicts with workers consuming from the target queue
+                $temporaryQueue = 'test-event-'.Str::random(8);
+                $topologyChannel->queue_declare(
+                    $temporaryQueue,
+                    false,  // passive
+                    false,  // durable (temporary queue)
+                    true,   // exclusive (only this connection)
+                    true    // auto_delete (deleted when connection closes)
+                );
+                $publishQueue = $temporaryQueue;
+            } else {
+                // Declare the target queue if it doesn't exist
+                $topologyChannel->queue_declare(
+                    $queue,
+                    false,  // passive
+                    true,   // durable
+                    false,  // exclusive
+                    false   // auto_delete
+                );
+                $publishQueue = $queue;
+            }
 
             // Publish the message
             $publishChannel = $channelManager->publishChannel();
 
             $message = new AMQPMessage(json_encode($payload), [
-                'delivery_mode' => AMQPMessage::DELIVERY_MODE_PERSISTENT,
+                'delivery_mode' => $useTemporaryQueue
+                    ? AMQPMessage::DELIVERY_MODE_NON_PERSISTENT
+                    : AMQPMessage::DELIVERY_MODE_PERSISTENT,
                 'content_type' => 'application/json',
                 'message_id' => $messageId,
                 'timestamp' => time(),
             ]);
 
-            $publishChannel->basic_publish($message, '', $queue);
+            $publishChannel->basic_publish($message, '', $publishQueue);
 
             $result = [
                 'success' => true,
                 'action' => 'published',
-                'queue' => $queue,
+                'queue' => $useTemporaryQueue ? $temporaryQueue : $queue,
                 'message_id' => $messageId,
                 'timestamp' => $timestamp,
             ];
@@ -81,14 +103,14 @@ class TestEventCommand extends Command
             if (! $jsonOutput) {
                 $this->components->info('Test event published to RabbitMQ');
                 $this->newLine();
-                $this->line("  <fg=gray>Queue:</> {$queue}");
+                $this->line("  <fg=gray>Queue:</> {$publishQueue}".($useTemporaryQueue ? ' (temporary)' : ''));
                 $this->line("  <fg=gray>Message ID:</> {$messageId}");
                 $this->line("  <fg=gray>Timestamp:</> {$timestamp}");
             }
 
-            // Optionally consume and verify
+            // Consume and verify from the temporary queue
             if ($shouldConsume) {
-                $consumeResult = $this->consumeAndVerify($channelManager, $queue, $messageId, $jsonOutput);
+                $consumeResult = $this->consumeAndVerify($channelManager, $publishQueue, $messageId, $jsonOutput);
 
                 if (! $consumeResult['success']) {
                     $result['success'] = false;
