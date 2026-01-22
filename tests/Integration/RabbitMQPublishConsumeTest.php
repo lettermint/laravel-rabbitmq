@@ -187,8 +187,9 @@ describe('RabbitMQ Publish/Consume Integration', function () {
             false
         );
 
-        // Act: Publish 5 messages
+        // Act: Publish 5 messages with publisher confirms to ensure delivery
         $publishChannel = $channelManager->publishChannel();
+        $publishChannel->confirm_select();
 
         for ($i = 1; $i <= 5; $i++) {
             $message = new AMQPMessage(json_encode(['id' => $i]), [
@@ -196,6 +197,9 @@ describe('RabbitMQ Publish/Consume Integration', function () {
             ]);
             $publishChannel->basic_publish($message, '', 'integration-test-queue');
         }
+
+        // Wait for all messages to be confirmed
+        $publishChannel->wait_for_pending_acks(5.0);
 
         // Use RabbitMQQueue to check size
         $rabbitmqQueue = app(RabbitMQQueue::class);
