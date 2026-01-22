@@ -13,7 +13,7 @@ use Mockery\MockInterface;
 |--------------------------------------------------------------------------
 */
 
-uses(TestCase::class)->in('Feature', 'Unit');
+uses(TestCase::class)->in('Feature', 'Unit', 'Integration');
 
 /*
 |--------------------------------------------------------------------------
