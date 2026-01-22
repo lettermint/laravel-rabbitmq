@@ -18,6 +18,7 @@ use Lettermint\RabbitMQ\Console\Commands\HealthCommand;
 use Lettermint\RabbitMQ\Console\Commands\PurgeCommand;
 use Lettermint\RabbitMQ\Console\Commands\QueuesCommand;
 use Lettermint\RabbitMQ\Console\Commands\ReplayDlqCommand;
+use Lettermint\RabbitMQ\Console\Commands\TestEventCommand;
 use Lettermint\RabbitMQ\Console\Commands\TopologyCommand;
 use Lettermint\RabbitMQ\Consumers\Consumer;
 use Lettermint\RabbitMQ\Discovery\AttributeScanner;
@@ -179,6 +180,7 @@ class RabbitMQServiceProvider extends ServiceProvider
                 PurgeCommand::class,
                 QueuesCommand::class,
                 ReplayDlqCommand::class,
+                TestEventCommand::class,
                 TopologyCommand::class,
             ]);
         }
