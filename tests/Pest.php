@@ -10,7 +10,7 @@ use Lettermint\RabbitMQ\Tests\TestCase;
 |--------------------------------------------------------------------------
 */
 
-uses(TestCase::class)->in('Feature', 'Unit');
+uses(TestCase::class)->in('Feature', 'Unit', 'Integration');
 
 /*
 |--------------------------------------------------------------------------
