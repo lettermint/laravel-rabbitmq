@@ -192,18 +192,17 @@ return [
     | Heartbeat Sender
     |--------------------------------------------------------------------------
     |
-    | The PCNTLHeartbeatSender uses SIGALRM signals to send heartbeats during
-    | blocking PHP operations. This prevents RabbitMQ from closing connections
-    | when jobs run longer than heartbeat * 2 seconds.
-    |
-    | Note: Jobs with Laravel's $timeout property set will have heartbeats
-    | disabled during execution (both use SIGALRM). For long-running jobs
-    | that need heartbeat support, set $timeout = 0 on the job class.
+    | php-amqplib can send heartbeat frames from signal handlers while a job is
+    | executing. The default "pcntl" driver uses SIGALRM and is lightweight.
+    | Use the "signal" driver to fork a helper process that sends SIGUSR1 when
+    | your application also uses SIGALRM for hard job timeouts.
     |
     */
 
     'heartbeat_sender' => [
         'enabled' => env('RABBITMQ_HEARTBEAT_SENDER', true),
+        'driver' => env('RABBITMQ_HEARTBEAT_SENDER_DRIVER', 'pcntl'), // pcntl, signal
+        'signal' => env('RABBITMQ_HEARTBEAT_SENDER_SIGNAL', 'SIGUSR1'),
     ],
 
     /*

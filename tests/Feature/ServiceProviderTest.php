@@ -153,6 +153,13 @@ describe('RabbitMQServiceProvider', function () {
             expect(config('rabbitmq.octane'))->toBeArray();
             expect(config('rabbitmq.octane.flush_connections'))->toBeTrue();
         });
+
+        it('has heartbeat sender config', function () {
+            expect(config('rabbitmq.heartbeat_sender'))->toBeArray();
+            expect(config('rabbitmq.heartbeat_sender.enabled'))->toBeTrue();
+            expect(config('rabbitmq.heartbeat_sender.driver'))->toBe('pcntl');
+            expect(config('rabbitmq.heartbeat_sender.signal'))->toBe('SIGUSR1');
+        });
     });
 
     describe('attribute scanning', function () {

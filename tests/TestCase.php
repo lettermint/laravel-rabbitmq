@@ -129,6 +129,11 @@ abstract class TestCase extends OrchestraTestCase
             'octane' => [
                 'flush_connections' => true,
             ],
+            'heartbeat_sender' => [
+                'enabled' => true,
+                'driver' => 'pcntl',
+                'signal' => 'SIGUSR1',
+            ],
             'publisher' => [
                 'confirm' => true,
                 'mandatory' => true,

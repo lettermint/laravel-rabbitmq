@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added optional `rabbitmq-dlq` Laravel failed-job provider so `queue:failed`, `queue:retry`, `queue:forget`, and `queue:flush` can operate on RabbitMQ DLQs.
 - Added optional `rabbitmq:install-filament` command that publishes a Filament page for inspecting and redriving RabbitMQ DLQ jobs.
 - Added Laravel 13 composer and CI matrix compatibility.
+- Added configurable heartbeat sender drivers, including `signal` mode for long-running jobs that need to avoid `SIGALRM` conflicts.
 
 ## [1.0.0] - 2024-12-19
 

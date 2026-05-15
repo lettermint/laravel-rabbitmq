@@ -847,12 +847,41 @@ application level.
 
 ### Heartbeats & Long-Running Jobs
 
-The package sends heartbeats automatically during job execution to prevent connection timeouts.
+The `rabbitmq:consume` worker registers a php-amqplib signal-based heartbeat
+sender before it starts consuming. That keeps the AMQP connection alive while
+PHP is busy inside a long-running job, not just while the worker is waiting for
+the next message.
 
-**For jobs longer than 2× heartbeat interval:**
-- Heartbeats work automatically with `ext-pcntl`
-- If job has `$timeout` property, heartbeats are disabled during execution (both use `SIGALRM`)
-- For long jobs needing heartbeat: set `public $timeout = 0;` on the job class
+```env
+RABBITMQ_HEARTBEAT=60
+RABBITMQ_HEARTBEAT_SENDER=true
+RABBITMQ_HEARTBEAT_SENDER_DRIVER=pcntl
+```
+
+Heartbeat sender drivers:
+
+- `pcntl` uses php-amqplib's `PCNTLHeartbeatSender`. It is lightweight and uses
+  `SIGALRM`.
+- `signal` uses php-amqplib's `SIGHeartbeatSender`. It forks a tiny helper
+  process and uses `SIGUSR1` by default, avoiding `SIGALRM` conflicts.
+
+Use `signal` when your application also relies on `SIGALRM` for hard job
+timeouts:
+
+```env
+RABBITMQ_HEARTBEAT_SENDER_DRIVER=signal
+RABBITMQ_HEARTBEAT_SENDER_SIGNAL=SIGUSR1
+```
+
+Operational guidance:
+
+- Keep `ext-pcntl` installed in queue-worker containers.
+- For `rabbitmq:consume`, prefer `--max-time`, `--max-jobs`, Kubernetes
+  termination grace, and idempotent jobs as the primary safety controls.
+- Do not rely on Laravel's `$timeout` as the primary hard timeout for this
+  custom consumer; it is not Laravel's standard `queue:work` process.
+- If you build custom timeout handling with `SIGALRM`, switch the heartbeat
+  sender driver to `signal`.
 
 ## 🐛 Troubleshooting
 

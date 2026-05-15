@@ -139,7 +139,7 @@ class TopologyCommand extends Command
                 'maxPriority' => $attribute->maxPriority,
                 'messageTtl' => $attribute->messageTtl,
                 'retryAttempts' => $attribute->retryAttempts,
-                'retryStrategy' => $attribute->retryStrategy,
+                'retryStrategy' => $attribute->retryStrategyEnum->value,
                 'dlqQueue' => $attribute->getDlqQueueName(),
                 'dlqExchange' => $attribute->getDlqExchangeName(),
             ];

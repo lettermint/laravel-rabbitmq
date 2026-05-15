@@ -126,6 +126,50 @@ class RabbitMQQueue extends Queue implements QueueContract
     }
 
     /**
+     * Get the number of pending jobs.
+     *
+     * RabbitMQ's passive queue declaration exposes the number of ready messages
+     * for a queue. This maps to Laravel's pending size inspection.
+     */
+    public function pendingSize($queue = null): int
+    {
+        return $this->size($queue);
+    }
+
+    /**
+     * Get the number of delayed jobs.
+     *
+     * The delayed message exchange plugin does not expose delayed counts through
+     * passive queue declarations, so this driver reports zero.
+     */
+    public function delayedSize($queue = null): int
+    {
+        return 0;
+    }
+
+    /**
+     * Get the number of reserved jobs.
+     *
+     * RabbitMQ tracks unacknowledged deliveries per channel, but this driver
+     * does not currently expose a queue-level reserved count.
+     */
+    public function reservedSize($queue = null): int
+    {
+        return 0;
+    }
+
+    /**
+     * Get the creation timestamp of the oldest pending job.
+     *
+     * RabbitMQ does not expose the oldest ready message timestamp through AMQP
+     * passive queue declarations.
+     */
+    public function creationTimeOfOldestPendingJob($queue = null): ?int
+    {
+        return null;
+    }
+
+    /**
      * Push a new job onto the queue.
      *
      * @param  object|string  $job
@@ -501,8 +545,10 @@ class RabbitMQQueue extends Queue implements QueueContract
                 ];
             }
 
-            // Attribute not found - log for debugging
-            Log::warning('RabbitMQ: ConsumesQueue attribute not found for job', [
+            // Attribute not found. This is expected for framework, mail,
+            // notification, Scout, and other vendor jobs that are routed by
+            // their target queue name via the fallback exchange.
+            Log::debug('RabbitMQ: using fallback routing for job without ConsumesQueue attribute', [
                 'job_class' => $jobClass,
                 'queue' => $queue,
                 'scanner_queue_count' => $this->scanner->getQueues()->count(),

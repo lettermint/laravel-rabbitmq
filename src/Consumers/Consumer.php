@@ -20,7 +20,9 @@ use Lettermint\RabbitMQ\Queue\RabbitMQJob;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Connection\AbstractConnection;
+use PhpAmqpLib\Connection\Heartbeat\AbstractSignalHeartbeatSender;
 use PhpAmqpLib\Connection\Heartbeat\PCNTLHeartbeatSender;
+use PhpAmqpLib\Connection\Heartbeat\SIGHeartbeatSender;
 use PhpAmqpLib\Exception\AMQPChannelClosedException;
 use PhpAmqpLib\Exception\AMQPConnectionClosedException;
 use PhpAmqpLib\Exception\AMQPIOException;
@@ -34,19 +36,15 @@ use Throwable;
  *
  * This class handles the consumption of messages from RabbitMQ queues,
  * processing them through Laravel's job system. Uses basic_consume for
- * push-based message delivery and PCNTLHeartbeatSender for maintaining
+ * push-based message delivery and signal-based heartbeat senders for maintaining
  * connections during long-running jobs.
  *
  * IMPORTANT PRODUCTION NOTES:
  *
- * 1. Signal Handler Conflict (SIGALRM):
- *    PCNTLHeartbeatSender uses SIGALRM for heartbeat signals. If your jobs use
- *    Laravel's $timeout property, the job timeout mechanism also uses SIGALRM.
- *    This can cause the heartbeat handler to be overwritten, potentially leading
- *    to connection drops during long-running jobs. Consider either:
- *    - Using maxTime on the consumer instead of $timeout on individual jobs
- *    - Setting heartbeat_sender.enabled = false in config if you use job timeouts
- *    - Ensuring jobs complete within the heartbeat interval
+ * 1. Signal Handler Choice:
+ *    The default PCNTLHeartbeatSender uses SIGALRM. If your application also
+ *    uses SIGALRM for hard job timeouts, configure heartbeat_sender.driver to
+ *    "signal" so php-amqplib uses a child process and SIGUSR1 instead.
  *
  * 2. No Automatic Reconnection:
  *    If the RabbitMQ connection drops, the consumer will throw a ConnectionException
@@ -104,7 +102,7 @@ class Consumer
     /**
      * The heartbeat sender for maintaining connections during long-running jobs.
      */
-    protected ?PCNTLHeartbeatSender $heartbeatSender = null;
+    protected ?AbstractSignalHeartbeatSender $heartbeatSender = null;
 
     /**
      * Whether to use the heartbeat sender.
@@ -133,8 +131,8 @@ class Consumer
      * Start consuming messages from the queue.
      *
      * Uses basic_consume for push-based message delivery. The wait() method
-     * processes heartbeats between jobs, while PCNTLHeartbeatSender handles
-     * heartbeats DURING job execution (via SIGALRM).
+     * processes heartbeats between jobs, while the signal-based heartbeat sender
+     * handles heartbeats DURING job execution.
      *
      * @throws ConnectionException When consumer fails to initialize or connection is lost
      */
@@ -160,24 +158,21 @@ class Consumer
 
         $connection = $this->channelManager->getConnection();
 
-        // Register heartbeat sender BEFORE consuming
-        // Note: PCNTLHeartbeatSender uses SIGALRM which may conflict with Laravel's
-        // job timeout mechanism. If jobs have $timeout set, the heartbeat sender's
-        // signal handler may be overwritten, potentially causing connection drops
-        // during long-running jobs.
         if ($this->shouldUseHeartbeatSender($connection)) {
             try {
-                $this->heartbeatSender = new PCNTLHeartbeatSender($connection);
+                $this->heartbeatSender = $this->createHeartbeatSender($connection);
                 $this->heartbeatSender->register();
 
                 Log::debug('RabbitMQ heartbeat sender registered', [
                     'queue' => $this->queue,
+                    'driver' => config('rabbitmq.heartbeat_sender.driver', 'pcntl'),
                     'heartbeat_interval' => $connection->getHeartbeat(),
                 ]);
             } catch (Throwable $e) {
                 // Registration can fail if signal handlers conflict or pcntl is misconfigured
                 Log::warning('RabbitMQ heartbeat sender registration failed - long-running jobs may cause connection drops', [
                     'queue' => $this->queue,
+                    'driver' => config('rabbitmq.heartbeat_sender.driver', 'pcntl'),
                     'heartbeat_interval' => $connection->getHeartbeat(),
                     'error' => $e->getMessage(),
                 ]);
@@ -379,6 +374,40 @@ class Consumer
     }
 
     /**
+     * Create the configured signal-based heartbeat sender.
+     */
+    protected function createHeartbeatSender(AbstractConnection $connection): AbstractSignalHeartbeatSender
+    {
+        $driver = strtolower((string) config('rabbitmq.heartbeat_sender.driver', 'pcntl'));
+
+        return match ($driver) {
+            'pcntl', 'alarm', 'sigalrm' => new PCNTLHeartbeatSender($connection),
+            'signal', 'sig', 'fork', 'sigusr1' => new SIGHeartbeatSender($connection, $this->heartbeatSignal()),
+            default => throw new \InvalidArgumentException("Unsupported RabbitMQ heartbeat sender driver [{$driver}]."),
+        };
+    }
+
+    /**
+     * Resolve the signal used by SIGHeartbeatSender.
+     */
+    protected function heartbeatSignal(): int
+    {
+        $signal = config('rabbitmq.heartbeat_sender.signal', 'SIGUSR1');
+
+        if (is_int($signal)) {
+            return $signal;
+        }
+
+        $signal = strtoupper((string) $signal);
+
+        return match ($signal) {
+            'SIGUSR1' => SIGUSR1,
+            'SIGUSR2' => SIGUSR2,
+            default => throw new \InvalidArgumentException("Unsupported RabbitMQ heartbeat signal [{$signal}]."),
+        };
+    }
+
+    /**
      * Clean up resources.
      */
     protected function cleanup(): void
@@ -461,9 +490,6 @@ class Consumer
     {
         if (extension_loaded('pcntl')) {
             pcntl_async_signals(true);
-
-            // Note: SIGALRM is used by PCNTLHeartbeatSender for heartbeats
-            // We only register SIGTERM, SIGINT, SIGQUIT for graceful shutdown
 
             pcntl_signal(SIGTERM, function (): void {
                 $this->shouldQuit = true;
