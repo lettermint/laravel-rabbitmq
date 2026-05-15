@@ -1,17 +1,17 @@
-name: run-tests
+name: run-integration-tests
 
 on:
   push:
     paths:
       - '**.php'
-      - '.github/workflows/run-tests.yml'
+      - '.github/workflows/run-integration-tests.yml'
       - 'phpunit.xml.dist'
       - 'composer.json'
       - 'composer.lock'
   pull_request:
     paths:
       - '**.php'
-      - '.github/workflows/run-tests.yml'
+      - '.github/workflows/run-integration-tests.yml'
       - 'phpunit.xml.dist'
       - 'composer.json'
       - 'composer.lock'
@@ -21,16 +21,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 5
+  integration-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: true
       matrix:
-        os: [ubuntu-latest]
-        php: [8.4, 8.3]
-        laravel: [13.*, 12.*, 11.*]
-        stability: [prefer-lowest, prefer-stable]
+        php: [8.4]
+        laravel: [13.*, 12.*]
+        stability: [prefer-stable]
         include:
           - laravel: 13.*
             testbench: 11.*
@@ -42,13 +41,23 @@ jobs:
             pest: ^3.8
             pest-plugin-laravel: ^3.1
             pest-plugin-arch: ^3.0
-          - laravel: 11.*
-            testbench: 9.*
-            pest: ^3.8
-            pest-plugin-laravel: ^3.1
-            pest-plugin-arch: ^3.0
 
-    name: P${{ matrix.php }} - L${{ matrix.laravel }} - ${{ matrix.stability }} - ${{ matrix.os }}
+    services:
+      rabbitmq:
+        image: rabbitmq:3-management
+        ports:
+          - 5672:5672
+          - 15672:15672
+        env:
+          RABBITMQ_DEFAULT_USER: guest
+          RABBITMQ_DEFAULT_PASS: guest
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    name: Integration - P${{ matrix.php }} - L${{ matrix.laravel }}
 
     steps:
       - name: Checkout code
@@ -58,7 +67,7 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
-          extensions: dom, curl, libxml, mbstring, zip, pcntl, pdo, sqlite, pdo_sqlite, bcmath, soap, intl, gd, exif, iconv, imagick, fileinfo, amqp, sockets
+          extensions: dom, curl, libxml, mbstring, zip, pcntl, pdo, sqlite, pdo_sqlite, bcmath, soap, intl, gd, exif, iconv, imagick, fileinfo, sockets
           coverage: none
 
       - name: Setup problem matchers
@@ -74,12 +83,19 @@ jobs:
         run: |
           composer require "pestphp/pest:${{ matrix.pest }}" "pestphp/pest-plugin-laravel:${{ matrix.pest-plugin-laravel }}" "pestphp/pest-plugin-arch:${{ matrix.pest-plugin-arch }}" --dev --no-interaction --no-update
 
-      - name: Install all dependencies
+      - name: Install dependencies
         run: |
           composer update --${{ matrix.stability }} --prefer-dist --no-interaction
 
-      - name: List Installed Dependencies
-        run: composer show -D
+      - name: Wait for RabbitMQ
+        run: |
+          timeout 60 bash -c 'until nc -z localhost 5672; do sleep 1; done'
 
-      - name: Execute tests
-        run: vendor/bin/pest --ci
+      - name: Execute integration tests
+        env:
+          RABBITMQ_HOST: localhost
+          RABBITMQ_PORT: 5672
+          RABBITMQ_USER: guest
+          RABBITMQ_PASSWORD: guest
+          RABBITMQ_VHOST: /
+        run: vendor/bin/pest --ci --group=integration

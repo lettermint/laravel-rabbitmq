@@ -136,6 +136,26 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Laravel Failed Job Provider Integration
+    |--------------------------------------------------------------------------
+    |
+    | To expose RabbitMQ DLQs through Laravel's built-in queue:failed,
+    | queue:retry, queue:forget, and queue:flush commands, set:
+    |
+    |   'failed' => ['driver' => 'rabbitmq-dlq']
+    |
+    | in config/queue.php. Listing and finding failed jobs temporarily reads
+    | messages from each DLQ and immediately requeues them.
+    |
+    */
+
+    'failed_jobs' => [
+        'connection' => env('RABBITMQ_FAILED_JOBS_CONNECTION', 'rabbitmq'),
+        'scan_limit' => env('RABBITMQ_FAILED_JOBS_SCAN_LIMIT', 100),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Delayed Messages
     |--------------------------------------------------------------------------
     |
@@ -184,6 +204,23 @@ return [
 
     'heartbeat_sender' => [
         'enabled' => env('RABBITMQ_HEARTBEAT_SENDER', true),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Long-Lived Worker Lifecycle
+    |--------------------------------------------------------------------------
+    |
+    | Octane keeps the Laravel application in memory across requests. Closing
+    | cached AMQP channels and TCP connections after each Octane request avoids
+    | leaking channel state between requests and prevents stale channels after
+    | RabbitMQ or network restarts. php-fpm and CLI processes are also cleaned
+    | up through Laravel's normal application termination callback.
+    |
+    */
+
+    'octane' => [
+        'flush_connections' => env('RABBITMQ_OCTANE_FLUSH_CONNECTIONS', true),
     ],
 
     /*

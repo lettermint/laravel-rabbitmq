@@ -7,6 +7,7 @@ namespace Lettermint\RabbitMQ;
 use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Queue\QueueManager;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\ServiceProvider;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Connection\ConnectionManager;
@@ -15,14 +16,17 @@ use Lettermint\RabbitMQ\Console\Commands\DeclareCommand;
 use Lettermint\RabbitMQ\Console\Commands\DlqInspectCommand;
 use Lettermint\RabbitMQ\Console\Commands\DlqPurgeCommand;
 use Lettermint\RabbitMQ\Console\Commands\HealthCommand;
+use Lettermint\RabbitMQ\Console\Commands\InstallFilamentCommand;
 use Lettermint\RabbitMQ\Console\Commands\PurgeCommand;
 use Lettermint\RabbitMQ\Console\Commands\QueuesCommand;
 use Lettermint\RabbitMQ\Console\Commands\ReplayDlqCommand;
+use Lettermint\RabbitMQ\Console\Commands\TestEventCommand;
 use Lettermint\RabbitMQ\Console\Commands\TopologyCommand;
 use Lettermint\RabbitMQ\Consumers\Consumer;
 use Lettermint\RabbitMQ\Discovery\AttributeScanner;
 use Lettermint\RabbitMQ\Monitoring\HealthCheck;
 use Lettermint\RabbitMQ\Monitoring\QueueMetrics;
+use Lettermint\RabbitMQ\Queue\Failed\RabbitMQDlqFailedJobProvider;
 use Lettermint\RabbitMQ\Queue\RabbitMQConnector;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
 use Lettermint\RabbitMQ\Topology\TopologyManager;
@@ -43,6 +47,7 @@ class RabbitMQServiceProvider extends ServiceProvider
         $this->registerQueueComponents();
         $this->registerConsumer();
         $this->registerMonitoring();
+        $this->registerFailedJobProvider();
     }
 
     /**
@@ -53,6 +58,7 @@ class RabbitMQServiceProvider extends ServiceProvider
         $this->publishConfig();
         $this->registerCommands();
         $this->registerQueueConnector();
+        $this->registerLifecycleHooks();
         $this->scanTopology();
     }
 
@@ -123,7 +129,7 @@ class RabbitMQServiceProvider extends ServiceProvider
      */
     protected function registerConsumer(): void
     {
-        $this->app->singleton(Consumer::class, function ($app) {
+        $this->app->bind(Consumer::class, function ($app) {
             return new Consumer(
                 channelManager: $app[ChannelManager::class],
                 scanner: $app[AttributeScanner::class],
@@ -153,6 +159,27 @@ class RabbitMQServiceProvider extends ServiceProvider
     }
 
     /**
+     * Register RabbitMQ DLQs as Laravel's failed-job provider when explicitly configured.
+     */
+    protected function registerFailedJobProvider(): void
+    {
+        $driver = $this->app['config']->get('queue.failed.driver');
+
+        if (! in_array($driver, ['rabbitmq-dlq', 'rabbitmq_dlq'], true)) {
+            return;
+        }
+
+        $this->app->singleton('queue.failer', function ($app) {
+            return new RabbitMQDlqFailedJobProvider(
+                channelManager: $app[ChannelManager::class],
+                scanner: $app[AttributeScanner::class],
+                connectionName: (string) $app['config']->get('rabbitmq.failed_jobs.connection', 'rabbitmq'),
+                scanLimit: (int) $app['config']->get('rabbitmq.failed_jobs.scan_limit', 100),
+            );
+        });
+    }
+
+    /**
      * Publish configuration file.
      */
     protected function publishConfig(): void
@@ -176,9 +203,11 @@ class RabbitMQServiceProvider extends ServiceProvider
                 DlqInspectCommand::class,
                 DlqPurgeCommand::class,
                 HealthCommand::class,
+                InstallFilamentCommand::class,
                 PurgeCommand::class,
                 QueuesCommand::class,
                 ReplayDlqCommand::class,
+                TestEventCommand::class,
                 TopologyCommand::class,
             ]);
         }
@@ -197,6 +226,52 @@ class RabbitMQServiceProvider extends ServiceProvider
                 );
             });
         });
+    }
+
+    /**
+     * Register process/request lifecycle cleanup for long-lived runtimes.
+     */
+    protected function registerLifecycleHooks(): void
+    {
+        $this->app->terminating(fn () => $this->flushRabbitMQResources());
+
+        $events = $this->app['events'];
+        $flushConnections = (bool) $this->app['config']->get('rabbitmq.octane.flush_connections', true);
+
+        foreach ([
+            'Laravel\\Octane\\Events\\RequestTerminated',
+            'Laravel\\Octane\\Events\\TaskTerminated',
+        ] as $event) {
+            if ($flushConnections && class_exists($event)) {
+                $events->listen($event, fn () => $this->flushRabbitMQResources());
+            }
+        }
+
+        $workerStopping = 'Laravel\\Octane\\Events\\WorkerStopping';
+        if (class_exists($workerStopping)) {
+            $events->listen($workerStopping, fn () => $this->flushRabbitMQResources());
+        }
+    }
+
+    /**
+     * Close resolved RabbitMQ channels and connections without creating them.
+     */
+    protected function flushRabbitMQResources(): void
+    {
+        try {
+            if ($this->app->resolved(ChannelManager::class)) {
+                $this->app[ChannelManager::class]->closeAll();
+            }
+
+            if ($this->app->resolved(ConnectionManager::class)) {
+                $this->app[ConnectionManager::class]->disconnectAll();
+            }
+        } catch (\Throwable $e) {
+            Log::debug('RabbitMQ resource cleanup failed during application lifecycle hook', [
+                'error' => $e->getMessage(),
+                'exception' => get_class($e),
+            ]);
+        }
     }
 
     /**

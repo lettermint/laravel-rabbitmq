@@ -1,0 +1,81 @@
+<x-filament-panels::page>
+    @if (config('queue.failed.driver') !== 'rabbitmq-dlq')
+        <x-filament::section>
+            <x-slot name="heading">
+                RabbitMQ DLQ provider is not enabled
+            </x-slot>
+
+            <p class="text-sm text-gray-600 dark:text-gray-400">
+                Set <code>queue.failed.driver</code> to <code>rabbitmq-dlq</code> so this page can read RabbitMQ DLQ messages.
+            </p>
+        </x-filament::section>
+    @else
+        <div class="flex justify-end">
+            <x-filament::button wire:click="refresh" icon="heroicon-o-arrow-path">
+                Refresh
+            </x-filament::button>
+        </div>
+
+        <x-filament::section>
+            <x-slot name="heading">
+                Failed Jobs / DLQ
+            </x-slot>
+
+            <x-slot name="description">
+                Inspect payloads and redrive jobs from RabbitMQ dead letter queues.
+            </x-slot>
+
+            <div class="overflow-x-auto">
+                <table class="w-full divide-y divide-gray-200 text-sm dark:divide-white/10">
+                    <thead>
+                        <tr class="text-left font-semibold">
+                            <th class="px-3 py-2">ID</th>
+                            <th class="px-3 py-2">Queue</th>
+                            <th class="px-3 py-2">Failed At</th>
+                            <th class="px-3 py-2">Exception</th>
+                            <th class="px-3 py-2">Payload</th>
+                            <th class="px-3 py-2"></th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-gray-100 dark:divide-white/5">
+                        @forelse ($failedJobs as $job)
+                            <tr>
+                                <td class="whitespace-nowrap px-3 py-2 font-mono">{{ $job->id }}</td>
+                                <td class="whitespace-nowrap px-3 py-2">{{ $job->queue }}</td>
+                                <td class="whitespace-nowrap px-3 py-2">{{ $job->failed_at }}</td>
+                                <td class="max-w-md px-3 py-2">
+                                    <code class="whitespace-pre-wrap text-xs">{{ $job->exception }}</code>
+                                </td>
+                                <td class="max-w-xl px-3 py-2">
+                                    <details>
+                                        <summary class="cursor-pointer text-primary-600">View payload</summary>
+                                        <pre class="mt-2 max-h-80 overflow-auto rounded bg-gray-950 p-3 text-xs text-gray-100">{{ json_encode(json_decode($job->payload, true), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) }}</pre>
+                                    </details>
+                                </td>
+                                <td class="whitespace-nowrap px-3 py-2 text-right">
+                                    <x-filament::button size="sm" wire:click="retry('{{ $job->id }}')">
+                                        Retry
+                                    </x-filament::button>
+
+                                    <x-filament::button color="gray" size="sm" wire:click="forget('{{ $job->id }}')">
+                                        Forget
+                                    </x-filament::button>
+                                </td>
+                            </tr>
+                        @empty
+                            <tr>
+                                <td colspan="6" class="px-3 py-6 text-center text-gray-500">
+                                    No failed jobs found.
+                                </td>
+                            </tr>
+                        @endforelse
+                    </tbody>
+                </table>
+            </div>
+
+            <p class="mt-4 text-xs text-gray-500">
+                CLI equivalent: <code>php artisan rabbitmq:dlq-inspect your-queue --format=json</code>
+            </p>
+        </x-filament::section>
+    @endif
+</x-filament-panels::page>

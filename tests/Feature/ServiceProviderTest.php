@@ -8,6 +8,7 @@ use Lettermint\RabbitMQ\Consumers\Consumer;
 use Lettermint\RabbitMQ\Discovery\AttributeScanner;
 use Lettermint\RabbitMQ\Monitoring\HealthCheck;
 use Lettermint\RabbitMQ\Monitoring\QueueMetrics;
+use Lettermint\RabbitMQ\Queue\Failed\RabbitMQDlqFailedJobProvider;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
 use Lettermint\RabbitMQ\Topology\TopologyManager;
 
@@ -53,12 +54,12 @@ describe('RabbitMQServiceProvider', function () {
             expect($instance1)->toBe($instance2);
         });
 
-        it('registers Consumer as singleton', function () {
+        it('registers Consumer as a fresh stateful service', function () {
             $instance1 = app(Consumer::class);
             $instance2 = app(Consumer::class);
 
             expect($instance1)->toBeInstanceOf(Consumer::class);
-            expect($instance1)->toBe($instance2);
+            expect($instance1)->not->toBe($instance2);
         });
 
         it('registers HealthCheck as singleton', function () {
@@ -75,6 +76,47 @@ describe('RabbitMQServiceProvider', function () {
 
             expect($instance1)->toBeInstanceOf(QueueMetrics::class);
             expect($instance1)->toBe($instance2);
+        });
+
+        it('registers RabbitMQ DLQ as Laravel failed job provider when configured', function () {
+            config()->set('queue.failed.driver', 'rabbitmq-dlq');
+            app()->forgetInstance('queue.failer');
+            app()->register(\Lettermint\RabbitMQ\RabbitMQServiceProvider::class, true);
+
+            expect(app('queue.failer'))->toBeInstanceOf(RabbitMQDlqFailedJobProvider::class);
+        });
+
+        it('closes resolved RabbitMQ resources when the application terminates', function () {
+            $channelManager = Mockery::mock(ChannelManager::class);
+            $connectionManager = Mockery::mock(ConnectionManager::class);
+
+            $channelManager->shouldReceive('closeAll')->once();
+            $connectionManager->shouldReceive('disconnectAll')->once();
+
+            app()->instance(ChannelManager::class, $channelManager);
+            app()->instance(ConnectionManager::class, $connectionManager);
+
+            app()->terminate();
+        });
+
+        it('closes resolved RabbitMQ resources for Octane lifecycle events when Octane is present', function () {
+            declareFakeOctaneEvents();
+
+            config()->set('rabbitmq.octane.flush_connections', true);
+            app()->register(\Lettermint\RabbitMQ\RabbitMQServiceProvider::class, true);
+
+            $channelManager = Mockery::mock(ChannelManager::class);
+            $connectionManager = Mockery::mock(ConnectionManager::class);
+
+            $channelManager->shouldReceive('closeAll')->times(3);
+            $connectionManager->shouldReceive('disconnectAll')->times(3);
+
+            app()->instance(ChannelManager::class, $channelManager);
+            app()->instance(ConnectionManager::class, $connectionManager);
+
+            event(new \Laravel\Octane\Events\RequestTerminated);
+            event(new \Laravel\Octane\Events\TaskTerminated);
+            event(new \Laravel\Octane\Events\WorkerStopping);
         });
     });
 
@@ -102,6 +144,11 @@ describe('RabbitMQServiceProvider', function () {
             expect(config('rabbitmq.delayed'))->toBeArray();
             expect(config('rabbitmq.delayed.enabled'))->toBeTrue();
         });
+
+        it('has Octane lifecycle config', function () {
+            expect(config('rabbitmq.octane'))->toBeArray();
+            expect(config('rabbitmq.octane.flush_connections'))->toBeTrue();
+        });
     });
 
     describe('attribute scanning', function () {
@@ -117,3 +164,18 @@ describe('RabbitMQServiceProvider', function () {
         });
     });
 });
+
+function declareFakeOctaneEvents(): void
+{
+    if (class_exists('Laravel\\Octane\\Events\\RequestTerminated')) {
+        return;
+    }
+
+    eval('
+        namespace Laravel\Octane\Events;
+
+        class RequestTerminated {}
+        class TaskTerminated {}
+        class WorkerStopping {}
+    ');
+}

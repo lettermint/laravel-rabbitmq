@@ -123,6 +123,9 @@ abstract class TestCase extends OrchestraTestCase
                 'timeout' => 30,
                 'auto_ack' => false,
             ],
+            'octane' => [
+                'flush_connections' => true,
+            ],
             'publisher' => [
                 'confirm' => true,
                 'mandatory' => true,

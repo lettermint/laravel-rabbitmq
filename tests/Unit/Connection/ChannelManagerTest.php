@@ -125,6 +125,44 @@ test('recreates channel when disconnected', function () {
     expect($channel2)->toBe($newChannel);
 });
 
+test('recreates channel when connection manager returns a new connection instance', function () {
+    $oldConnection = mockAMQPConnection(true);
+    $newConnection = mockAMQPConnection(true);
+    $oldChannel = mockAMQPChannel($oldConnection);
+    $newChannel = mockAMQPChannel($newConnection);
+
+    $this->connectionManager->shouldReceive('connection')
+        ->andReturn($oldConnection, $newConnection, $newConnection)
+        ->byDefault();
+
+    $callCount = 0;
+    $channelManager = new class($this->connectionManager, $oldChannel, $newChannel, $callCount) extends ChannelManager
+    {
+        public function __construct(
+            ConnectionManager $connectionManager,
+            private $oldChannel,
+            private $newChannel,
+            private &$callCount
+        ) {
+            parent::__construct($connectionManager);
+        }
+
+        protected function createChannel(?string $connection = null): AMQPChannel
+        {
+            $this->connectionManager->connection($connection);
+            $this->callCount++;
+
+            return $this->callCount === 1 ? $this->oldChannel : $this->newChannel;
+        }
+    };
+
+    $channel1 = $channelManager->channel('publish');
+    $channel2 = $channelManager->channel('publish');
+
+    expect($channel1)->toBe($oldChannel);
+    expect($channel2)->toBe($newChannel);
+});
+
 test('provides publish channel', function () {
     $channelManager = new class($this->connectionManager, $this->mockChannel) extends ChannelManager
     {

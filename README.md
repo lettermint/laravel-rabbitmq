@@ -33,7 +33,7 @@ This package is ideal for applications that need:
 ## 📋 Requirements
 
 - PHP 8.2+
-- Laravel 11.0+ or 12.0+
+- Laravel 11.0, 12.0, or 13.0
 - RabbitMQ 3.12+
 - php-amqplib/php-amqplib ^3.6
 
@@ -471,6 +471,22 @@ php artisan rabbitmq:queues --watch
 php artisan rabbitmq:purge my-queue
 ```
 
+### Diagnostics
+
+```bash
+# Publish a diagnostic event to a queue
+php artisan rabbitmq:test-event diagnostics
+
+# Publish custom JSON-friendly content
+php artisan rabbitmq:test-event diagnostics --message="hello"
+
+# Publish to a temporary queue and consume it back to verify round-trip flow
+php artisan rabbitmq:test-event --roundtrip
+
+# Machine-readable output for CI or deployment checks
+php artisan rabbitmq:test-event --roundtrip --json
+```
+
 ### Consumer
 
 ```bash
@@ -535,6 +551,66 @@ php artisan rabbitmq:dlq-purge my-queue --dry-run
 # Skip confirmation
 php artisan rabbitmq:dlq-purge my-queue --force
 ```
+
+### Laravel Failed Job Commands
+
+If you want Laravel's built-in failed-job commands to read from RabbitMQ DLQs,
+configure `config/queue.php` to use the RabbitMQ DLQ failed-job provider:
+
+```php
+'failed' => [
+    'driver' => 'rabbitmq-dlq',
+],
+```
+
+After that, these standard commands operate on RabbitMQ DLQ messages:
+
+```bash
+php artisan queue:failed
+php artisan queue:retry message-uuid
+php artisan queue:retry all --queue=my-queue
+php artisan queue:forget message-uuid
+php artisan queue:flush
+```
+
+Listing and finding failed jobs temporarily reads messages from DLQs and
+immediately requeues them. `queue:retry` republishes the payload to the original
+queue, then removes the matching DLQ message via `queue:forget`.
+
+### Optional Filament Page
+
+If your application uses Filament, this package can publish an app-owned page
+for inspecting DLQ payloads and retrying or forgetting failed jobs:
+
+```bash
+php artisan rabbitmq:install-filament
+```
+
+Then register the generated page in your Filament panel provider:
+
+```php
+use App\Filament\Pages\RabbitMQFailedJobs;
+
+public function panel(Panel $panel): Panel
+{
+    return $panel
+        // ...
+        ->pages([
+            RabbitMQFailedJobs::class,
+        ]);
+}
+```
+
+The generated page requires the Laravel failed-job provider integration above:
+
+```php
+'failed' => [
+    'driver' => 'rabbitmq-dlq',
+],
+```
+
+The installer detects Filament before writing files. Use `--dry-run` to preview
+paths and `--force` to overwrite existing generated files.
 
 ### Monitoring
 
@@ -659,33 +735,41 @@ spec:
               cpu: "500m"
 ```
 
-### Horizontal Pod Autoscaler (HPA)
+### KEDA Scaling
 
-Scale based on queue depth using KEDA or RabbitMQ metrics:
+Scale worker Deployments directly from RabbitMQ queue depth with KEDA:
 
 ```yaml
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
 metadata:
-  name: queue-worker-emails-hpa
+  name: rabbitmq-trigger-auth
+spec:
+  secretTargetRef:
+    - parameter: host
+      name: rabbitmq-credentials
+      key: amqp-uri
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: queue-worker-emails
 spec:
   scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
     name: queue-worker-emails
-  minReplicas: 2
-  maxReplicas: 20
-  metrics:
-    - type: External
-      external:
-        metric:
-          name: rabbitmq_queue_messages_ready
-          selector:
-            matchLabels:
-              queue: emails
-        target:
-          type: AverageValue
-          averageValue: "100"  # Target: 100 messages per pod
+  pollingInterval: 10
+  cooldownPeriod: 60
+  minReplicaCount: 0
+  maxReplicaCount: 20
+  triggers:
+    - type: rabbitmq
+      metadata:
+        protocol: amqp
+        queueName: emails
+        mode: QueueLength
+        value: "100"
+      authenticationRef:
+        name: rabbitmq-trigger-auth
 ```
 
 ### Best Practices
@@ -695,6 +779,8 @@ spec:
 - Use `livenessProbe` and `readinessProbe` for health checks
 - Run `rabbitmq:declare` in init container or CI/CD pipeline
 - Use `PodDisruptionBudget` to maintain availability during updates
+- Use `--stop-when-empty` for scale-to-zero worker Jobs, or leave it off for
+  long-running Deployments managed by KEDA
 
 ## 🔧 Advanced Topics
 
@@ -739,6 +825,25 @@ Publisher confirms ensure messages reach RabbitMQ successfully. Enabled by defau
 ```
 
 If confirm fails, Laravel throws an exception and the job can be retried by your queue worker.
+
+### php-fpm and Octane Lifecycle
+
+The package caches AMQP channels and connections for normal request performance,
+then closes resolved RabbitMQ resources during Laravel application termination.
+That covers php-fpm request shutdown and CLI command shutdown.
+
+When Laravel Octane is installed, the service provider also listens for Octane
+request/task termination and worker-stopping events. By default it flushes AMQP
+connections after each Octane request to avoid leaking channel state across
+long-lived FrankenPHP, RoadRunner, or Swoole workers:
+
+```env
+RABBITMQ_OCTANE_FLUSH_CONNECTIONS=true
+```
+
+Set this to `false` only if you intentionally want to keep AMQP connections open
+across Octane requests and are prepared to handle broker/network restarts at the
+application level.
 
 ### Heartbeats & Long-Running Jobs
 
@@ -790,7 +895,8 @@ The package sends heartbeats automatically during job execution to prevent conne
 
 **Solutions:**
 - Check your job's `handle()` method for unhandled exceptions
-- Enable failed job logging: check `failed_jobs` table
+- Enable Laravel failed job integration with `queue.failed.driver = rabbitmq-dlq`,
+  then run `php artisan queue:failed`
 - Review RabbitMQ DLQ: `php artisan rabbitmq:dlq-inspect your-queue`
 - Add logging to job: `Log::info('Job started', ['id' => $this->id]);`
 

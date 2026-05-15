@@ -44,11 +44,34 @@ class ChannelManager
     {
         $key = $this->getChannelKey($purpose, $connection);
 
-        if (! isset($this->channels[$key]) || ! $this->channels[$key]->is_open()) {
+        if (isset($this->channels[$key]) && ! $this->canReuseChannel($this->channels[$key], $connection)) {
+            $this->closeChannel($purpose, $connection);
+        }
+
+        if (! isset($this->channels[$key])) {
             $this->channels[$key] = $this->createChannel($connection);
         }
 
         return $this->channels[$key];
+    }
+
+    /**
+     * Determine if a cached channel can still be used.
+     *
+     * A channel can report as open even after ConnectionManager has replaced
+     * the underlying connection instance. In long-lived workers, especially
+     * Octane or php-fpm workers that publish sporadically, reusing that stale
+     * channel causes the next publish to fail before reconnection can help.
+     */
+    protected function canReuseChannel(AMQPChannel $channel, ?string $connection = null): bool
+    {
+        if (! $channel->is_open()) {
+            return false;
+        }
+
+        $activeConnection = $this->connectionManager->connection($connection);
+
+        return $channel->getConnection() === $activeConnection;
     }
 
     /**

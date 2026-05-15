@@ -1,0 +1,71 @@
+<?php
+
+namespace {{ namespace }};
+
+use Filament\Pages\Page;
+use Illuminate\Support\Facades\Artisan;
+
+class RabbitMQFailedJobs extends Page
+{
+    protected static string $view = '{{ view }}';
+
+    public static function getNavigationIcon(): string|\BackedEnum|null
+    {
+        return 'heroicon-o-exclamation-triangle';
+    }
+
+    public static function getNavigationGroup(): ?string
+    {
+        return 'Operations';
+    }
+
+    public static function getNavigationLabel(): string
+    {
+        return 'Failed Jobs / DLQ';
+    }
+
+    public function getTitle(): string
+    {
+        return 'Failed Jobs / DLQ';
+    }
+
+    /**
+     * @var array<int, object>
+     */
+    public array $failedJobs = [];
+
+    public function mount(): void
+    {
+        $this->loadFailedJobs();
+    }
+
+    public function refresh(): void
+    {
+        $this->loadFailedJobs();
+    }
+
+    public function retry(string $id): void
+    {
+        Artisan::call('queue:retry', ['id' => [$id]]);
+
+        $this->loadFailedJobs();
+    }
+
+    public function forget(string $id): void
+    {
+        Artisan::call('queue:forget', ['id' => $id]);
+
+        $this->loadFailedJobs();
+    }
+
+    private function loadFailedJobs(): void
+    {
+        if (config('queue.failed.driver') !== 'rabbitmq-dlq') {
+            $this->failedJobs = [];
+
+            return;
+        }
+
+        $this->failedJobs = app('queue.failer')->all();
+    }
+}
