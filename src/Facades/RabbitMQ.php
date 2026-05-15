@@ -16,7 +16,7 @@ use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
  * @method static int size(?string $queue = null)
  * @method static \Illuminate\Contracts\Queue\Job|null pop(?string $queue = null)
  *
- * @see \Lettermint\RabbitMQ\Queue\RabbitMQQueue
+ * @see RabbitMQQueue
  */
 class RabbitMQ extends Facade
 {

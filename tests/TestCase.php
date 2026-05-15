@@ -4,7 +4,10 @@ declare(strict_types=1);
 
 namespace Lettermint\RabbitMQ\Tests;
 
+use Illuminate\Foundation\Application;
+use Lettermint\RabbitMQ\Facades\RabbitMQ;
 use Lettermint\RabbitMQ\RabbitMQServiceProvider;
+use Monolog\Handler\NullHandler;
 use Orchestra\Testbench\TestCase as OrchestraTestCase;
 
 abstract class TestCase extends OrchestraTestCase
@@ -17,7 +20,7 @@ abstract class TestCase extends OrchestraTestCase
     /**
      * Get package providers.
      *
-     * @param  \Illuminate\Foundation\Application  $app
+     * @param  Application  $app
      * @return array<int, class-string>
      */
     protected function getPackageProviders($app): array
@@ -30,20 +33,20 @@ abstract class TestCase extends OrchestraTestCase
     /**
      * Get package aliases.
      *
-     * @param  \Illuminate\Foundation\Application  $app
+     * @param  Application  $app
      * @return array<string, class-string>
      */
     protected function getPackageAliases($app): array
     {
         return [
-            'RabbitMQ' => \Lettermint\RabbitMQ\Facades\RabbitMQ::class,
+            'RabbitMQ' => RabbitMQ::class,
         ];
     }
 
     /**
      * Define environment setup.
      *
-     * @param  \Illuminate\Foundation\Application  $app
+     * @param  Application  $app
      */
     protected function defineEnvironment($app): void
     {
@@ -52,7 +55,7 @@ abstract class TestCase extends OrchestraTestCase
         $app['config']->set('logging.deprecations', 'null');
         $app['config']->set('logging.channels.null', [
             'driver' => 'monolog',
-            'handler' => \Monolog\Handler\NullHandler::class,
+            'handler' => NullHandler::class,
         ]);
 
         $app['config']->set('rabbitmq', [

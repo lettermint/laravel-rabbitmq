@@ -2,7 +2,10 @@
 
 declare(strict_types=1);
 
+use Lettermint\RabbitMQ\Tests\Fixtures\Payloads\PayloadFactory;
+use Lettermint\RabbitMQ\Tests\Mocks\AMQPMocks;
 use Lettermint\RabbitMQ\Tests\TestCase;
+use Mockery\MockInterface;
 
 /*
 |--------------------------------------------------------------------------
@@ -39,41 +42,41 @@ expect()->extend('toBeValidExchangeName', function () {
 /**
  * Create a mock AMQPStreamConnection.
  */
-function mockAMQPConnection(bool $connected = true, int $heartbeat = 60): Mockery\MockInterface
+function mockAMQPConnection(bool $connected = true, int $heartbeat = 60): MockInterface
 {
-    return Lettermint\RabbitMQ\Tests\Mocks\AMQPMocks::connection($connected, $heartbeat);
+    return AMQPMocks::connection($connected, $heartbeat);
 }
 
 /**
  * Create a mock AMQPChannel.
  */
-function mockAMQPChannel(?Mockery\MockInterface $connection = null): Mockery\MockInterface
+function mockAMQPChannel(?MockInterface $connection = null): MockInterface
 {
-    return Lettermint\RabbitMQ\Tests\Mocks\AMQPMocks::channel($connection);
+    return AMQPMocks::channel($connection);
 }
 
 /**
  * Create a mock AMQPMessage.
  */
-function mockAMQPMessage(array $options = []): Mockery\MockInterface
+function mockAMQPMessage(array $options = []): MockInterface
 {
-    return Lettermint\RabbitMQ\Tests\Mocks\AMQPMocks::message($options);
+    return AMQPMocks::message($options);
 }
 
 /**
  * Create a mock AMQPMessage with a specific job payload.
  */
-function mockAMQPMessageWithJob(string $jobClass, array $jobData = [], array $options = []): Mockery\MockInterface
+function mockAMQPMessageWithJob(string $jobClass, array $jobData = [], array $options = []): MockInterface
 {
-    return Lettermint\RabbitMQ\Tests\Mocks\AMQPMocks::messageWithJob($jobClass, $jobData, $options);
+    return AMQPMocks::messageWithJob($jobClass, $jobData, $options);
 }
 
 /**
  * Create a mock AMQPTable for headers.
  */
-function mockAMQPTable(array $headers = []): Mockery\MockInterface
+function mockAMQPTable(array $headers = []): MockInterface
 {
-    return Lettermint\RabbitMQ\Tests\Mocks\AMQPMocks::headersTable($headers);
+    return AMQPMocks::headersTable($headers);
 }
 
 /**
@@ -81,7 +84,7 @@ function mockAMQPTable(array $headers = []): Mockery\MockInterface
  */
 function createJobPayload(string $class, array $data = []): string
 {
-    return Lettermint\RabbitMQ\Tests\Fixtures\Payloads\PayloadFactory::create($class, $data);
+    return PayloadFactory::create($class, $data);
 }
 
 /**

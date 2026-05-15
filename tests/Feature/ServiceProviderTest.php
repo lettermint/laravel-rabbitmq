@@ -2,6 +2,9 @@
 
 declare(strict_types=1);
 
+use Laravel\Octane\Events\RequestTerminated;
+use Laravel\Octane\Events\TaskTerminated;
+use Laravel\Octane\Events\WorkerStopping;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Connection\ConnectionManager;
 use Lettermint\RabbitMQ\Consumers\Consumer;
@@ -10,6 +13,7 @@ use Lettermint\RabbitMQ\Monitoring\HealthCheck;
 use Lettermint\RabbitMQ\Monitoring\QueueMetrics;
 use Lettermint\RabbitMQ\Queue\Failed\RabbitMQDlqFailedJobProvider;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
+use Lettermint\RabbitMQ\RabbitMQServiceProvider;
 use Lettermint\RabbitMQ\Topology\TopologyManager;
 
 describe('RabbitMQServiceProvider', function () {
@@ -81,7 +85,7 @@ describe('RabbitMQServiceProvider', function () {
         it('registers RabbitMQ DLQ as Laravel failed job provider when configured', function () {
             config()->set('queue.failed.driver', 'rabbitmq-dlq');
             app()->forgetInstance('queue.failer');
-            app()->register(\Lettermint\RabbitMQ\RabbitMQServiceProvider::class, true);
+            app()->register(RabbitMQServiceProvider::class, true);
 
             expect(app('queue.failer'))->toBeInstanceOf(RabbitMQDlqFailedJobProvider::class);
         });
@@ -103,7 +107,7 @@ describe('RabbitMQServiceProvider', function () {
             declareFakeOctaneEvents();
 
             config()->set('rabbitmq.octane.flush_connections', true);
-            app()->register(\Lettermint\RabbitMQ\RabbitMQServiceProvider::class, true);
+            app()->register(RabbitMQServiceProvider::class, true);
 
             $channelManager = Mockery::mock(ChannelManager::class);
             $connectionManager = Mockery::mock(ConnectionManager::class);
@@ -114,9 +118,9 @@ describe('RabbitMQServiceProvider', function () {
             app()->instance(ChannelManager::class, $channelManager);
             app()->instance(ConnectionManager::class, $connectionManager);
 
-            event(new \Laravel\Octane\Events\RequestTerminated);
-            event(new \Laravel\Octane\Events\TaskTerminated);
-            event(new \Laravel\Octane\Events\WorkerStopping);
+            event(new RequestTerminated);
+            event(new TaskTerminated);
+            event(new WorkerStopping);
         });
     });
 
