@@ -174,7 +174,7 @@ class Consumer
                     'queue' => $this->queue,
                     'heartbeat_interval' => $connection->getHeartbeat(),
                 ]);
-            } catch (\Throwable $e) {
+            } catch (Throwable $e) {
                 // Registration can fail if signal handlers conflict or pcntl is misconfigured
                 Log::warning('RabbitMQ heartbeat sender registration failed - long-running jobs may cause connection drops', [
                     'queue' => $this->queue,

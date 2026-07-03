@@ -1,6 +1,10 @@
 <?php
 
 declare(strict_types=1);
+use Illuminate\Console\Command;
+use Illuminate\Contracts\Queue\Job;
+use Illuminate\Contracts\Queue\Queue;
+use Illuminate\Queue\Connectors\ConnectorInterface;
 
 arch('Source files use strict types')
     ->expect('Lettermint\RabbitMQ')
@@ -23,7 +27,7 @@ arch('Enums are backed by strings')
 arch('Console commands extend Illuminate Command')
     ->expect('Lettermint\RabbitMQ\Console\Commands')
     ->classes()
-    ->toExtend(Illuminate\Console\Command::class);
+    ->toExtend(Command::class);
 
 arch('No debugging statements in source')
     ->expect('Lettermint\RabbitMQ')
@@ -35,12 +39,12 @@ arch('Service Provider is not final')
 
 arch('Queue implementation implements QueueContract')
     ->expect('Lettermint\RabbitMQ\Queue\RabbitMQQueue')
-    ->toImplement(Illuminate\Contracts\Queue\Queue::class);
+    ->toImplement(Queue::class);
 
 arch('Job implementation implements JobContract')
     ->expect('Lettermint\RabbitMQ\Queue\RabbitMQJob')
-    ->toImplement(Illuminate\Contracts\Queue\Job::class);
+    ->toImplement(Job::class);
 
 arch('Connector implements ConnectorInterface')
     ->expect('Lettermint\RabbitMQ\Queue\RabbitMQConnector')
-    ->toImplement(Illuminate\Queue\Connectors\ConnectorInterface::class);
+    ->toImplement(ConnectorInterface::class);

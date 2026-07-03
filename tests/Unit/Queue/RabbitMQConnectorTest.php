@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Illuminate\Queue\Connectors\ConnectorInterface;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Discovery\AttributeScanner;
 use Lettermint\RabbitMQ\Queue\RabbitMQConnector;
@@ -19,7 +20,7 @@ describe('RabbitMQConnector', function () {
             $this->scanner
         );
 
-        expect($connector)->toBeInstanceOf(\Illuminate\Queue\Connectors\ConnectorInterface::class);
+        expect($connector)->toBeInstanceOf(ConnectorInterface::class);
     });
 
     it('returns RabbitMQQueue from connect', function () {
