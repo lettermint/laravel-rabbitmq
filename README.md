@@ -287,6 +287,41 @@ quorum queues and requires RabbitMQ 3.8 or later.
 > name or perform a controlled queue replacement when you enable this setting
 > on an existing deployment. The setting defaults to `false`.
 
+**Per-message routing keys** with `HasRoutingKey`:
+
+By default a job publishes with the static routing key from its
+`#[ConsumesQueue]` binding. Implement `HasRoutingKey` to compute the routing key
+for each dispatched instance. This can route work to an exact, declared binding:
+
+```php
+use Lettermint\RabbitMQ\Contracts\HasRoutingKey;
+
+#[Exchange(name: 'events', type: ExchangeType::Topic)]
+#[ConsumesQueue(
+    queue: 'events.shard.0',
+    bindings: ['events' => 'events.shard.0'],
+    quorum: true,
+    prefetch: 1,
+)]
+class ProjectEvent implements ShouldQueue, HasRoutingKey
+{
+    public function __construct(private string $aggregateId) {}
+
+    public function getRoutingKey(): string
+    {
+        return 'events.shard.'.(crc32($this->aggregateId) % 16);
+    }
+}
+```
+
+The routing key overrides the static binding key. The exchange still comes
+from the attribute. The package validates the key and stores it in the payload,
+so release and replay keep the original route. A dynamic key must not contain
+topic wildcards. Declare and consume every route that the job can return.
+
+Routing does not provide an ordering guarantee during redelivery. Jobs that do
+not implement `HasRoutingKey` keep the static attribute routing key.
+
 **Delayed/scheduled messages:**
 
 ```php

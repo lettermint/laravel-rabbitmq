@@ -6,6 +6,7 @@ namespace Lettermint\RabbitMQ\Queue;
 
 use DateInterval;
 use DateTimeInterface;
+use InvalidArgumentException;
 use Illuminate\Contracts\Queue\Job;
 use Illuminate\Contracts\Queue\Queue as QueueContract;
 use Illuminate\Queue\Queue;
@@ -13,6 +14,7 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Contracts\HasPriority;
+use Lettermint\RabbitMQ\Contracts\HasRoutingKey;
 use Lettermint\RabbitMQ\Discovery\AttributeScanner;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
 use Lettermint\RabbitMQ\Exceptions\PublishException;
@@ -480,13 +482,20 @@ class RabbitMQQueue extends Queue implements QueueContract
         $data = json_decode($payload, true);
         $jobClass = $data['displayName'] ?? $data['data']['commandName'] ?? null;
 
+        // Per-message routing key injected by a HasRoutingKey job (see createPayloadArray).
+        // Overrides the static binding routing key; the exchange is still resolved
+        // from the job's attribute. Survives retry: the re-published payload carries it.
+        $dynamicRoutingKey = is_array($data) && array_key_exists('routingKey', $data)
+            ? $this->validateRoutingKey((string) $data['routingKey'])
+            : null;
+
         if ($jobClass !== null) {
             // Pass queue name to match correct attribute when job has multiple
             $attribute = $this->scanner->getQueueForJob($jobClass, $queue);
 
             if ($attribute !== null) {
                 $exchange = $attribute->getPublishExchange();
-                $routingKey = $attribute->getPublishRoutingKey();
+                $routingKey = $dynamicRoutingKey ?? $attribute->getPublishRoutingKey();
 
                 Log::debug('RabbitMQ routing from ConsumesQueue attribute', [
                     'job_class' => $jobClass,
@@ -514,7 +523,7 @@ class RabbitMQQueue extends Queue implements QueueContract
         // Note: Use config('rabbitmq...') not $this->config which is the connection config
         // The 'fallback.' prefix allows you to create a catch-all queue bound to 'fallback.#'
         $exchange = config('rabbitmq.queue.exchange', '');
-        $routingKey = 'fallback.'.str_replace(':', '.', $queue);
+        $routingKey = $dynamicRoutingKey ?? 'fallback.'.str_replace(':', '.', $queue);
 
         Log::debug('RabbitMQ routing using fallback', [
             'job_class' => $jobClass,
@@ -536,6 +545,56 @@ class RabbitMQQueue extends Queue implements QueueContract
         }
 
         return null;
+    }
+
+    /**
+     * Validate a concrete AMQP routing key.
+     *
+     * Dynamic routing keys select one route. Topic binding wildcards belong in
+     * topology declarations and must not be published as message routing keys.
+     *
+     * @throws InvalidArgumentException
+     */
+    protected function validateRoutingKey(string $routingKey): string
+    {
+        if (trim($routingKey) === '') {
+            throw new InvalidArgumentException('RabbitMQ routing key cannot be empty');
+        }
+
+        if (strlen($routingKey) > 255) {
+            throw new InvalidArgumentException('RabbitMQ routing key cannot exceed 255 bytes');
+        }
+
+        if (str_contains($routingKey, '*') || str_contains($routingKey, '#')) {
+            throw new InvalidArgumentException('RabbitMQ publish routing key cannot contain topic wildcards');
+        }
+
+        if (preg_match('/[\x00-\x1F\x7F]/', $routingKey) === 1) {
+            throw new InvalidArgumentException('RabbitMQ routing key cannot contain control characters');
+        }
+
+        return $routingKey;
+    }
+
+    /**
+     * Build the payload array, injecting a per-message routing key when the job
+     * implements HasRoutingKey. Stored in the payload so getExchangeAndRoutingKey
+     * can honor it without deserializing the job, and so a retried re-publish of
+     * the same payload keeps the original route.
+     *
+     * @param  object|string  $job
+     * @param  mixed  $data
+     * @return array<string, mixed>
+     */
+    protected function createPayloadArray($job, $queue, $data = ''): array
+    {
+        $payload = parent::createPayloadArray($job, $queue, $data);
+
+        if ($job instanceof HasRoutingKey) {
+            $payload['routingKey'] = $this->validateRoutingKey($job->getRoutingKey());
+        }
+
+        return $payload;
     }
 
     /**

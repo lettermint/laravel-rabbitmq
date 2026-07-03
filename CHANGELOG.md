@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   end-to-end FIFO ordering during redelivery or failure recovery.
   Defaults to `false`; the queue-arguments table is unchanged when not set, so
   existing queues are unaffected. Compatible with quorum queues.
+* `HasRoutingKey` contract: implement it on a job to publish with a per-message
+  routing key (`getRoutingKey(): string`) instead of the static `#[ConsumesQueue]`
+  binding key. The exchange is still resolved from the attribute. The package
+  validates the key and stores it in the payload so a release or replay keeps
+  the same route. Jobs without the contract are unchanged.
 
 ## 1.0.0 - 2026-01-02
 
