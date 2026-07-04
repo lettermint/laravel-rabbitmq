@@ -112,6 +112,7 @@ class AMQPMocks
      *     routingKey?: string,
      *     exchange?: string,
      *     redelivered?: bool,
+     *     deliveryMode?: int,
      * }  $options
      */
     public static function message(array $options = []): MockInterface
@@ -134,6 +135,7 @@ class AMQPMocks
             'routingKey' => 'test.routing.key',
             'exchange' => 'test-exchange',
             'redelivered' => false,
+            'deliveryMode' => AMQPMessage::DELIVERY_MODE_PERSISTENT,
         ];
 
         $options = array_merge($defaults, $options);
@@ -152,6 +154,21 @@ class AMQPMocks
         $mock->shouldReceive('isRedelivered')->andReturn($options['redelivered']);
         $mock->shouldReceive('getRoutingKey')->andReturn($options['routingKey']);
         $mock->shouldReceive('getExchange')->andReturn($options['exchange']);
+        $mock->shouldReceive('get_properties')->andReturn([
+            'content_type' => $options['contentType'],
+            'content_encoding' => $options['contentEncoding'],
+            'application_headers' => $headersTable,
+            'delivery_mode' => $options['deliveryMode'],
+            'priority' => $options['priority'],
+            'correlation_id' => $options['correlationId'],
+            'reply_to' => $options['replyTo'],
+            'expiration' => $options['expiration'],
+            'message_id' => $options['messageId'],
+            'timestamp' => $options['timestamp'],
+            'type' => $options['type'],
+            'user_id' => $options['userId'],
+            'app_id' => $options['appId'],
+        ]);
 
         // Properties are accessed via has() and get() in php-amqplib
         // Using explicit setup to avoid closure capture issues

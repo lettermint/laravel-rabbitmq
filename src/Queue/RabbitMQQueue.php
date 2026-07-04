@@ -6,12 +6,12 @@ namespace Lettermint\RabbitMQ\Queue;
 
 use DateInterval;
 use DateTimeInterface;
-use InvalidArgumentException;
 use Illuminate\Contracts\Queue\Job;
 use Illuminate\Contracts\Queue\Queue as QueueContract;
 use Illuminate\Queue\Queue;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
+use InvalidArgumentException;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Contracts\HasPriority;
 use Lettermint\RabbitMQ\Contracts\HasRoutingKey;
@@ -157,12 +157,19 @@ class RabbitMQQueue extends Queue implements QueueContract
 
         [$exchange, $routingKey] = $this->getExchangeAndRoutingKey($queue, $payload);
 
+        $delay = max(0, (int) ($options['delay'] ?? 0));
+
+        if ($delay > 0) {
+            $exchange = (string) ($this->config['delayed_exchange'] ?? 'delayed');
+        }
+
         $this->publishMessage(
             exchange: $exchange,
             routingKey: $routingKey,
             payload: $payload,
             priority: $options['priority'] ?? null,
-            delay: null
+            delay: $delay > 0 ? $delay * 1000 : null,
+            properties: $options['properties'] ?? [],
         );
 
         return $this->getPayloadId($payload);
@@ -359,6 +366,7 @@ class RabbitMQQueue extends Queue implements QueueContract
         string $payload,
         ?int $priority = null,
         ?int $delay = null,
+        array $properties = [],
     ): void {
         try {
             $channel = $this->channelManager->publishChannel();
@@ -371,7 +379,7 @@ class RabbitMQQueue extends Queue implements QueueContract
                 $this->confirmModeChannelId = $channelId;
             }
 
-            $message = $this->buildMessage($payload, $priority, $delay);
+            $message = $this->buildMessage($payload, $priority, $delay, $properties);
 
             $channel->basic_publish($message, $exchange, $routingKey);
 
@@ -435,14 +443,18 @@ class RabbitMQQueue extends Queue implements QueueContract
     /**
      * Build an AMQPMessage with properties.
      */
-    protected function buildMessage(string $payload, ?int $priority = null, ?int $delay = null): AMQPMessage
-    {
-        $properties = [
+    protected function buildMessage(
+        string $payload,
+        ?int $priority = null,
+        ?int $delay = null,
+        array $properties = [],
+    ): AMQPMessage {
+        $properties = array_replace([
             'delivery_mode' => AMQPMessage::DELIVERY_MODE_PERSISTENT,
             'content_type' => 'application/json',
             'message_id' => Str::uuid()->toString(),
             'timestamp' => time(),
-        ];
+        ], $properties);
 
         if ($priority !== null) {
             $properties['priority'] = $priority;
@@ -450,9 +462,14 @@ class RabbitMQQueue extends Queue implements QueueContract
 
         // Add delay header for delayed exchange plugin
         if ($delay !== null && $delay > 0) {
-            $properties['application_headers'] = new AMQPTable([
-                'x-delay' => $delay,
-            ]);
+            $headers = $properties['application_headers'] ?? [];
+
+            if ($headers instanceof AMQPTable) {
+                $headers = $headers->getNativeData();
+            }
+
+            $headers['x-delay'] = $delay;
+            $properties['application_headers'] = new AMQPTable($headers);
         }
 
         return new AMQPMessage($payload, $properties);

@@ -348,9 +348,20 @@ class TopologyManager
         }
 
         try {
+            // Ensure the DLX exchange exists before binding the DLQ queue to it.
+            // The main-exchange loop in declare() only auto-creates DLX exchanges
+            // derived from `Exchange` attributes; a queue whose DLX name is
+            // derived from its own `ConsumesQueue` bindings (or set via
+            // `dlqExchange`) may not be covered there. Without this, both the
+            // bind below and — more importantly — the queue's
+            // `x-dead-letter-exchange` target (and any `x-delivery-limit`
+            // parking) would point at an undeclared exchange, dropping messages.
+            // declareDlqExchange() is idempotent, so re-declaring one already
+            // created by the exchange loop is a no-op.
+            $this->declareDlqExchange($channel, $dlqExchange);
+
             $arguments = new AMQPTable([
                 'x-queue-type' => 'quorum',
-                'x-message-ttl' => Arr::get($this->config, 'dead_letter.default_ttl', 604800000), // 7 days
             ]);
 
             // Declare DLQ queue

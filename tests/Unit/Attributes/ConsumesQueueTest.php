@@ -82,6 +82,25 @@ describe('ConsumesQueue attribute', function () {
             new ConsumesQueue(queue: 'test', timeout: 0);
         })->throws(InvalidArgumentException::class, 'timeout must be at least 1 second');
 
+        it('throws when deliveryLimit is less than 1', function () {
+            new ConsumesQueue(queue: 'test', quorum: true, deliveryLimit: 0);
+        })->throws(InvalidArgumentException::class, 'deliveryLimit must be at least 1');
+
+        it('throws when deliveryLimit is set on a classic queue', function () {
+            new ConsumesQueue(queue: 'test', quorum: false, deliveryLimit: 5);
+        })->throws(InvalidArgumentException::class, 'only supported on quorum queues');
+
+        it('throws when deliveryLimit is set without a dead-letter exchange', function () {
+            // Quorum, but no bindings and no dlqExchange => nowhere to park.
+            new ConsumesQueue(queue: 'test', quorum: true, deliveryLimit: 3);
+        })->throws(InvalidArgumentException::class, 'deliveryLimit requires a dead-letter exchange');
+
+        it('allows deliveryLimit with an explicit dlqExchange and no bindings', function () {
+            $attr = new ConsumesQueue(queue: 'test', quorum: true, dlqExchange: 'test.dlq', deliveryLimit: 3);
+
+            expect($attr->getQueueArguments()['x-delivery-limit'])->toBe(3);
+        });
+
         it('throws when retryAttempts is negative', function () {
             new ConsumesQueue(queue: 'test', retryAttempts: -1);
         })->throws(InvalidArgumentException::class, 'retryAttempts cannot be negative');
@@ -265,6 +284,23 @@ describe('ConsumesQueue attribute', function () {
 
             expect($args['x-queue-type'])->toBe('quorum');
             expect($args['x-single-active-consumer'])->toBeTrue();
+        });
+
+        it('includes delivery limit argument on a quorum queue when set', function () {
+            $attr = new ConsumesQueue(queue: 'test', bindings: ['events' => 'test.*'], quorum: true, deliveryLimit: 5);
+            $args = $attr->getQueueArguments();
+
+            expect($args)->toHaveKey('x-delivery-limit');
+            expect($args['x-delivery-limit'])->toBe(5);
+            // Parking target must be present alongside the limit.
+            expect($args)->toHaveKey('x-dead-letter-exchange');
+        });
+
+        it('omits delivery limit argument by default', function () {
+            $attr = new ConsumesQueue(queue: 'test', quorum: true);
+            $args = $attr->getQueueArguments();
+
+            expect($args)->not->toHaveKey('x-delivery-limit');
         });
 
         it('includes maxPriority argument', function () {
