@@ -16,10 +16,12 @@ use Filament\Tables\Table;
 use Illuminate\Contracts\View\Factory as ViewFactory;
 use Illuminate\Queue\Failed\FailedJobProviderInterface;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\Log;
 use Lettermint\RabbitMQ\Actions\Dlq\InspectDlqMessages;
 use Lettermint\RabbitMQ\Actions\Dlq\PurgeDlqMessages;
 use Lettermint\RabbitMQ\Actions\Dlq\ReplayDlqMessages;
+use Lettermint\RabbitMQ\Support\ExceptionReporter;
 use Lettermint\RabbitMQ\Topology\TopologyRegistry;
 use Throwable;
 
@@ -36,6 +38,15 @@ final class RabbitMQDeadLetters extends Page implements Tables\Contracts\HasTabl
     protected string $view = 'rabbitmq::filament.pages.dead-letters';
 
     public string $queue = '';
+
+    public static function canAccess(): bool
+    {
+        $ability = config('rabbitmq.filament.gate', 'viewRabbitMQDeadLetters');
+
+        return is_string($ability)
+            && trim($ability) !== ''
+            && Gate::allows($ability);
+    }
 
     public function mount(): void
     {
@@ -190,7 +201,7 @@ final class RabbitMQDeadLetters extends Page implements Tables\Contracts\HasTabl
         try {
             $provider->forget($id);
         } catch (Throwable $exception) {
-            report($exception);
+            ExceptionReporter::report($exception);
             Log::warning('RabbitMQ DLQ action could not remove optional failed-job details', [
                 'job_id' => $id,
                 'exception_class' => $exception::class,
@@ -207,7 +218,7 @@ final class RabbitMQDeadLetters extends Page implements Tables\Contracts\HasTabl
         try {
             return $provider->find($id);
         } catch (Throwable $exception) {
-            report($exception);
+            ExceptionReporter::report($exception);
             Log::warning('RabbitMQ DLQ page could not read optional failed-job details', [
                 'job_id' => $id,
                 'exception_class' => $exception::class,

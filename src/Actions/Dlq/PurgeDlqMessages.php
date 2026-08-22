@@ -13,6 +13,7 @@ use Lettermint\RabbitMQ\Exceptions\DlqOperationException;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Message\AMQPMessage;
+use PhpAmqpLib\Wire\AMQPTable;
 
 /**
  * Purge messages from a DLQ (permanently delete).
@@ -161,8 +162,9 @@ final class PurgeDlqMessages
             : [];
 
         $xDeath = $headers['x-death'][0] ?? null;
+        $xDeath = $xDeath instanceof AMQPTable ? $xDeath->getNativeData() : $xDeath;
 
-        if (isset($xDeath['time'])) {
+        if (is_array($xDeath) && isset($xDeath['time'])) {
             $timestamp = $xDeath['time'];
             if (is_object($timestamp) && method_exists($timestamp, 'getTimestamp')) {
                 return Carbon::createFromTimestamp($timestamp->getTimestamp());

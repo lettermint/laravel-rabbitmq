@@ -16,6 +16,7 @@ use Lettermint\RabbitMQ\Exceptions\ConnectionException;
 use Lettermint\RabbitMQ\Exceptions\PublishException;
 use Lettermint\RabbitMQ\Queue\RabbitMQJob;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
+use Lettermint\RabbitMQ\Support\ExceptionReporter;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Connection\Heartbeat\SIGHeartbeatSender;
 use PhpAmqpLib\Exception\AMQPChannelClosedException;
@@ -109,7 +110,7 @@ final class Consumer
                     $this->cleanup();
 
                     if ($this->shouldQuit || $recoveryAttempt >= $maximumRecoveries) {
-                        report($exception);
+                        ExceptionReporter::report($exception);
 
                         throw new ConnectionException(
                             "RabbitMQ consumer recovery failed for [{$this->queueLabel()}]: {$exception->getMessage()}",
