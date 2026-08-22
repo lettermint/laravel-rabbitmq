@@ -234,6 +234,39 @@ test('release publishes the next attempt before it acknowledges the original mes
     expect($job->isReleased())->toBeTrue();
 });
 
+test('release preserves a recorded exception in the replacement payload', function () {
+    $message = mockAMQPMessage(['deliveryTag' => 42]);
+    $publishChannel = mockAMQPChannel();
+    $channelManager = Mockery::mock(ChannelManager::class);
+    $channelManager->shouldReceive('topologyChannel')->with('default')->andReturn($publishChannel);
+    $channelManager->shouldReceive('publishChannel')->with('default')->andReturn($publishChannel);
+    $rabbitmq = testRabbitMQQueue($channelManager);
+    $publishChannel->shouldReceive('basic_publish')
+        ->once()
+        ->withArgs(function (AMQPMessage $published): bool {
+            expect(json_decode($published->getBody(), true)['exception'])->toBe([
+                'class' => RuntimeException::class,
+                'message' => 'Retry this job.',
+                'code' => 0,
+            ]);
+
+            return true;
+        });
+    $this->mockChannel->shouldReceive('basic_ack')->once()->with(42);
+
+    $job = new RabbitMQJob(
+        $this->container,
+        $rabbitmq,
+        $this->mockChannel,
+        $message,
+        'rabbitmq',
+        'test-queue'
+    );
+    $job->recordReleaseException(new RuntimeException('Retry this job.'));
+
+    $job->release();
+});
+
 test('release leaves the original unacknowledged when publish fails', function () {
     Log::spy();
 

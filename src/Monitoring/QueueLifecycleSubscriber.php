@@ -17,6 +17,7 @@ use Lettermint\RabbitMQ\Events\JobReleased;
 use Lettermint\RabbitMQ\Events\JobRetried;
 use Lettermint\RabbitMQ\Events\MessagePublished;
 use Lettermint\RabbitMQ\Events\MessagePublishFailed;
+use Lettermint\RabbitMQ\Events\UnknownQueueFallbackUsed;
 use Lettermint\RabbitMQ\Queue\RabbitMQJob;
 
 final class QueueLifecycleSubscriber
@@ -37,6 +38,7 @@ final class QueueLifecycleSubscriber
         $events->listen(MessagePublished::class, $this->published(...));
         $events->listen(MessagePublishFailed::class, $this->publishFailed(...));
         $events->listen(ConnectionRecovered::class, $this->connectionRecovered(...));
+        $events->listen(UnknownQueueFallbackUsed::class, $this->unknownQueueFallbackUsed(...));
     }
 
     private function processing(JobProcessing $event): void
@@ -187,6 +189,16 @@ final class QueueLifecycleSubscriber
             'attempt' => $event->attempt,
             'duration_ms' => round($event->durationMilliseconds, 2),
             'result' => 'recovered',
+        ]);
+    }
+
+    private function unknownQueueFallbackUsed(UnknownQueueFallbackUsed $event): void
+    {
+        Log::warning('RabbitMQ unknown queue fallback used', [
+            'event' => 'rabbitmq.queue.fallback_used',
+            'queue' => $event->queue,
+            'physical_queue' => $event->physicalQueue,
+            'result' => 'fallback',
         ]);
     }
 

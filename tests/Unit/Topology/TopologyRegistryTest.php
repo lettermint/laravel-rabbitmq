@@ -2,9 +2,11 @@
 
 declare(strict_types=1);
 
+use Illuminate\Contracts\Events\Dispatcher;
 use Lettermint\RabbitMQ\Attributes\ConsumesQueue;
 use Lettermint\RabbitMQ\Attributes\Exchange;
 use Lettermint\RabbitMQ\Discovery\AttributeScanner;
+use Lettermint\RabbitMQ\Events\UnknownQueueFallbackUsed;
 use Lettermint\RabbitMQ\Exceptions\TopologyException;
 use Lettermint\RabbitMQ\Exceptions\UnknownBindingException;
 use Lettermint\RabbitMQ\Exceptions\UnknownQueueException;
@@ -57,6 +59,64 @@ test('rejects an unknown logical queue in strict mode', function () {
 
     expect(fn () => $registry->queue('missing'))
         ->toThrow(UnknownQueueException::class, 'is not registered');
+});
+
+test('emits one event when non-strict mode uses an unknown queue fallback', function () {
+    $events = Mockery::mock(Dispatcher::class);
+    $events->shouldReceive('dispatch')
+        ->once()
+        ->with(Mockery::on(fn (mixed $event): bool => $event instanceof UnknownQueueFallbackUsed
+            && $event->queue === 'missing'
+            && $event->physicalQueue === 'staging.missing'));
+    $config = topologyRegistryConfig(['strict_topology' => false]);
+    $registry = new TopologyRegistry(new AttributeScanner, $config, $events);
+
+    expect($registry->queue('missing'))->toBe($registry->queue('missing'));
+});
+
+test('does not let an event listener block non-strict queue fallback', function () {
+    $events = Mockery::mock(Dispatcher::class);
+    $events->shouldReceive('dispatch')->once()->andThrow(new RuntimeException('listener failed'));
+    $config = topologyRegistryConfig(['strict_topology' => false]);
+    $registry = new TopologyRegistry(new AttributeScanner, $config, $events);
+
+    expect($registry->queue('missing')->physicalName)->toBe('staging.missing');
+});
+
+test('supports cached attribute queues that use the default exchange', function () {
+    $config = topologyRegistryConfig([
+        'topology' => [
+            'queues' => [
+                'default' => [
+                    'bindings' => [],
+                    'default_exchange' => true,
+                    'dead_letter' => false,
+                ],
+            ],
+        ],
+    ]);
+
+    $queue = testTopologyRegistry($config)->queue('default');
+
+    expect($queue->bindings)->toBe(['' => ['staging.default']])
+        ->and($queue->publishExchange())->toBe('')
+        ->and($queue->publishRoutingKey())->toBe('staging.default');
+});
+
+test('supports a cached attribute dead-letter queue name', function () {
+    $config = topologyRegistryConfig([
+        'topology' => [
+            'queues' => [
+                'events' => [
+                    'bindings' => ['jobs' => ['events']],
+                    'dead_letter_queue' => 'parked:events',
+                ],
+            ],
+        ],
+    ]);
+
+    expect(testTopologyRegistry($config)->queue('events')->deadLetterQueue)
+        ->toBe('staging.parked:events');
 });
 
 test('matches RabbitMQ topic wildcards including zero words for hash', function () {

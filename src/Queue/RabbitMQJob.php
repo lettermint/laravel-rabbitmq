@@ -59,6 +59,8 @@ class RabbitMQJob extends Job implements JobContract
 
     protected ?Throwable $failureException = null;
 
+    protected ?Throwable $releaseException = null;
+
     public function __construct(
         Container $container,
         RabbitMQQueue $rabbitmq,
@@ -91,7 +93,21 @@ class RabbitMQJob extends Job implements JobContract
     {
         parent::release($delay);
 
-        $this->republish($this->decoded(), (int) $delay);
+        $payload = $this->decoded();
+
+        if ($this->releaseException !== null) {
+            $payload['exception'] = $this->exceptionPayload($this->releaseException);
+        }
+
+        $this->republish($payload, (int) $delay);
+    }
+
+    /**
+     * Store the exception that caused Laravel to release this delivery.
+     */
+    public function recordReleaseException(Throwable $exception): void
+    {
+        $this->releaseException = $exception;
     }
 
     /**
@@ -110,16 +126,20 @@ class RabbitMQJob extends Job implements JobContract
      */
     public function releaseWithException(int $delay, Throwable $exception): void
     {
-        parent::release($delay);
+        $this->recordReleaseException($exception);
+        $this->release($delay);
+    }
 
-        $payload = $this->decoded();
-        $payload['exception'] = [
+    /**
+     * @return array{class: class-string<Throwable>, message: string, code: int}
+     */
+    private function exceptionPayload(Throwable $exception): array
+    {
+        return [
             'class' => get_class($exception),
             'message' => $exception->getMessage(),
             'code' => $exception->getCode(),
         ];
-
-        $this->republish($payload, $delay);
     }
 
     /**

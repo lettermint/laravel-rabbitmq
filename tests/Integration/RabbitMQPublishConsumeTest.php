@@ -15,6 +15,7 @@ use Lettermint\RabbitMQ\Events\QueueProbeProcessed;
 use Lettermint\RabbitMQ\Exceptions\PublishException;
 use Lettermint\RabbitMQ\Queue\RabbitMQJob;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
+use Lettermint\RabbitMQ\Tests\Fixtures\Jobs\ThrowingJob;
 use Lettermint\RabbitMQ\Topology\TopologyManager;
 use Lettermint\RabbitMQ\Topology\TopologyRegistry;
 
@@ -169,6 +170,32 @@ test('a delayed publish uses a TTL queue and returns to the main route', functio
     expect($job)->toBeInstanceOf(RabbitMQJob::class)
         ->and(json_decode($job->getRawBody(), true)['uuid'])->toBe('delayed-1');
     $job->delete();
+});
+
+test('a Laravel retry preserves its exception in the replacement message', function () {
+    $this->queue->push(new ThrowingJob, '', 'default');
+    $job = waitForRabbitJob($this->queue, 'default');
+    expect($job)->toBeInstanceOf(RabbitMQJob::class);
+
+    app(RabbitMQWorker::class)->processMessage(
+        $job,
+        'rabbitmq-integration',
+        new WorkerOptions(maxTries: 2, timeout: 30, backoff: 0),
+    );
+
+    $retried = waitForRabbitJob($this->queue, 'default');
+    expect($retried)->toBeInstanceOf(RabbitMQJob::class);
+
+    $payload = json_decode($retried->getRawBody(), true, flags: JSON_THROW_ON_ERROR);
+
+    expect($retried->attempts())->toBe(2)
+        ->and($payload['exception'])->toBe([
+            'class' => RuntimeException::class,
+            'message' => 'Retry this test job.',
+            'code' => 0,
+        ]);
+
+    $retried->delete();
 });
 
 test('a final rejection reaches the quorum DLQ and can be replayed', function () {
