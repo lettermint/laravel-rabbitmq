@@ -33,6 +33,8 @@ class CircuitBreaker
      */
     private CircuitBreakerState $state = CircuitBreakerState::Closed;
 
+    private bool $halfOpenProbeInFlight = false;
+
     /**
      * Create a new circuit breaker instance.
      *
@@ -60,6 +62,7 @@ class CircuitBreaker
             // Check if recovery timeout has elapsed
             if ($this->openedAt !== null && (microtime(true) - $this->openedAt) >= $this->recoveryTimeout) {
                 $this->state = CircuitBreakerState::HalfOpen;
+                $this->halfOpenProbeInFlight = true;
 
                 Log::info('RabbitMQ circuit breaker entering half-open state', [
                     'failures' => $this->failures,
@@ -72,8 +75,13 @@ class CircuitBreaker
             return false;
         }
 
-        // Half-open state: allow one request to test recovery
-        return true;
+        if (! $this->halfOpenProbeInFlight) {
+            $this->halfOpenProbeInFlight = true;
+
+            return true;
+        }
+
+        return false;
     }
 
     /**
@@ -90,6 +98,7 @@ class CircuitBreaker
         $this->failures = 0;
         $this->openedAt = null;
         $this->state = CircuitBreakerState::Closed;
+        $this->halfOpenProbeInFlight = false;
     }
 
     /**
@@ -105,6 +114,7 @@ class CircuitBreaker
             // Failure during half-open, reopen circuit
             $this->openedAt = microtime(true);
             $this->state = CircuitBreakerState::Open;
+            $this->halfOpenProbeInFlight = false;
 
             Log::warning('RabbitMQ circuit breaker reopened after failed recovery attempt', [
                 'failures' => $this->failures,
@@ -143,6 +153,7 @@ class CircuitBreaker
         $this->failures = 0;
         $this->openedAt = null;
         $this->state = CircuitBreakerState::Closed;
+        $this->halfOpenProbeInFlight = false;
 
         Log::info('RabbitMQ circuit breaker manually reset');
     }

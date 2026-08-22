@@ -2,55 +2,61 @@
 
 declare(strict_types=1);
 
+use Illuminate\Contracts\Debug\ExceptionHandler;
+use Illuminate\Contracts\Events\Dispatcher;
+use Illuminate\Queue\QueueManager;
+use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Consumers\Consumer;
-use Mockery\MockInterface;
+use Lettermint\RabbitMQ\Consumers\RabbitMQWorker;
+use PhpAmqpLib\Exception\AMQPTimeoutException;
 
-function fakeConsumer(): MockInterface
+/** @param list<string> $expectedQueues */
+function commandConsumer(array $expectedQueues): Consumer
 {
-    $consumer = Mockery::mock(Consumer::class);
+    config()->set('rabbitmq.recovery.max_attempts', 0);
 
-    // Every fluent setter returns the consumer itself.
-    $consumer->shouldReceive(
-        'setQueues',
-        'setConnection',
-        'setPrefetch',
-        'setTimeout',
-        'setMaxJobs',
-        'setMaxTime',
-        'setMaxMemory',
-        'setSleep',
-        'setTries',
-        'setRest',
-        'setStopWhenEmpty',
-    )->andReturnSelf()->byDefault();
+    $channel = mockAMQPChannel();
+    $channel->shouldReceive('basic_consume')
+        ->times(count($expectedQueues))
+        ->withArgs(fn (string $queue): bool => in_array($queue, $expectedQueues, true))
+        ->andReturn('tag');
+    $channel->shouldReceive('wait')->andThrow(new AMQPTimeoutException('empty'));
 
-    $consumer->shouldReceive('consume')->andReturnNull()->byDefault();
+    $channelManager = Mockery::mock(ChannelManager::class);
+    $channelManager->shouldReceive('consumeChannel')->with('broker')->andReturn($channel);
+    $channelManager->shouldReceive('closeChannel')->with('consume', 'broker')->andReturnNull();
 
-    return $consumer;
+    $queue = testRabbitMQQueue($channelManager, [
+        'connection' => 'broker',
+        'strict_topology' => false,
+    ]);
+    $queueManager = Mockery::mock(QueueManager::class);
+    $queueManager->shouldReceive('connection')->with('rabbitmq-native')->andReturn($queue);
+    $events = Mockery::mock(Dispatcher::class);
+    $events->shouldReceive('dispatch')->andReturnNull()->byDefault();
+    $exceptions = Mockery::mock(ExceptionHandler::class);
+    $exceptions->shouldReceive('report')->andReturnNull()->byDefault();
+    $worker = new RabbitMQWorker($queueManager, $events, $exceptions, fn (): bool => false, fn (): null => null);
+
+    return new Consumer($channelManager, $queueManager, $worker);
 }
 
 it('forwards multiple queue arguments to the consumer', function () {
-    $consumer = fakeConsumer();
-    $consumer->shouldReceive('setQueues')->with(['default', 'reporting'])->once()->andReturnSelf();
-    $consumer->shouldReceive('consume')->once();
-
-    app()->instance(Consumer::class, $consumer);
+    app()->instance(Consumer::class, commandConsumer(['default', 'reporting']));
 
     $this->artisan('rabbitmq:consume', [
         'queue' => ['default', 'reporting'],
+        '--connection' => 'rabbitmq-native',
         '--stop-when-empty' => true,
     ])->assertExitCode(0);
 });
 
 it('accepts a single queue argument', function () {
-    $consumer = fakeConsumer();
-    $consumer->shouldReceive('setQueues')->with(['default'])->once()->andReturnSelf();
-    $consumer->shouldReceive('consume')->once();
-
-    app()->instance(Consumer::class, $consumer);
+    app()->instance(Consumer::class, commandConsumer(['default']));
 
     $this->artisan('rabbitmq:consume', [
         'queue' => ['default'],
+        '--connection' => 'rabbitmq-native',
         '--stop-when-empty' => true,
     ])->assertExitCode(0);
 });

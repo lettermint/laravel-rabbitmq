@@ -4,8 +4,10 @@ declare(strict_types=1);
 
 namespace Lettermint\RabbitMQ\Connection;
 
+use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\Log;
+use Lettermint\RabbitMQ\Events\ConnectionRecovered;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
 use PhpAmqpLib\Connection\AbstractConnection;
 use PhpAmqpLib\Connection\AMQPConnectionConfig;
@@ -41,6 +43,7 @@ class ConnectionManager
     public function __construct(
         protected array $config,
         ?CircuitBreaker $circuitBreaker = null,
+        protected ?Dispatcher $events = null,
     ) {
         $this->circuitBreaker = $circuitBreaker ?? new CircuitBreaker(
             failureThreshold: (int) Arr::get($config, 'circuit_breaker.failure_threshold', 5),
@@ -80,18 +83,14 @@ class ConnectionManager
                     'connection' => $name,
                 ]);
 
-                $this->connections[$name]->reconnect();
-
-                Log::info('RabbitMQ reconnection successful', [
-                    'connection' => $name,
-                ]);
+                return $this->recover($name);
             }
 
             // Record success with circuit breaker
             $this->circuitBreaker->recordSuccess();
 
             return $this->connections[$name];
-        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPRuntimeException $e) {
+        } catch (ConnectionException|AMQPIOException|AMQPConnectionClosedException|AMQPRuntimeException $e) {
             // Record failure with circuit breaker
             $this->circuitBreaker->recordFailure();
 
@@ -107,6 +106,63 @@ class ConnectionManager
                 previous: $e
             );
         }
+    }
+
+    /**
+     * Build a fresh connection after an error.
+     */
+    public function recover(?string $name = null, ?int $maximumAttempts = null): AbstractConnection
+    {
+        $name ??= $this->getDefaultConnection();
+        $maximumAttempts ??= max(1, (int) Arr::get($this->config, 'recovery.max_attempts', 3));
+        $initialDelay = max(0, (int) Arr::get($this->config, 'recovery.initial_delay_ms', 100));
+        $maximumDelay = max($initialDelay, (int) Arr::get($this->config, 'recovery.max_delay_ms', 2000));
+        $startedAt = microtime(true);
+        $lastException = null;
+
+        $this->disconnect($name);
+
+        for ($attempt = 1; $attempt <= $maximumAttempts; $attempt++) {
+            try {
+                $connection = $this->createConnection($name);
+                $this->connections[$name] = $connection;
+                $this->circuitBreaker->recordSuccess();
+                $duration = (microtime(true) - $startedAt) * 1000;
+
+                try {
+                    $this->events?->dispatch(new ConnectionRecovered($name, $attempt, $duration));
+                } catch (\Throwable $exception) {
+                    report($exception);
+                }
+
+                Log::notice('RabbitMQ connection recovered', [
+                    'connection' => $name,
+                    'attempt' => $attempt,
+                    'duration_ms' => round($duration, 2),
+                ]);
+
+                return $connection;
+            } catch (ConnectionException $exception) {
+                $lastException = $exception;
+                $this->circuitBreaker->recordFailure();
+
+                if ($attempt < $maximumAttempts) {
+                    $delay = min($maximumDelay, $initialDelay * (2 ** ($attempt - 1)));
+
+                    if ($delay > 0) {
+                        usleep($delay * 1000);
+                    }
+                }
+            }
+        }
+
+        $exception = new ConnectionException(
+            "RabbitMQ connection recovery exhausted after {$maximumAttempts} attempts for [{$name}].",
+            previous: $lastException,
+        );
+        report($exception);
+
+        throw $exception;
     }
 
     /**

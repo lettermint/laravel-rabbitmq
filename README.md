@@ -1,907 +1,293 @@
 # Laravel RabbitMQ
 
-[![Latest Version on Packagist](https://img.shields.io/packagist/v/lettermint/laravel-rabbitmq.svg?style=flat-square)](https://packagist.org/packages/lettermint/laravel-rabbitmq)
-[![GitHub Tests Action Status](https://img.shields.io/github/actions/workflow/status/lettermint/laravel-rabbitmq/run-tests.yml?branch=main&label=tests&style=flat-square)](https://github.com/lettermint/laravel-rabbitmq/actions?query=workflow%3Arun-tests+branch%3Amain)
-[![GitHub Code Style Action Status](https://img.shields.io/github/actions/workflow/status/lettermint/laravel-rabbitmq/fix-php-code-style-issues.yml?branch=main&label=code%20style&style=flat-square)](https://github.com/lettermint/laravel-rabbitmq/actions?query=workflow%3A"Fix+PHP+code+style+issues"+branch%3Amain)
-[![Total Downloads](https://img.shields.io/packagist/dt/lettermint/laravel-rabbitmq.svg?style=flat-square)](https://packagist.org/packages/lettermint/laravel-rabbitmq)
+Laravel RabbitMQ is a Laravel queue driver that uses RabbitMQ as the message broker. It provides an explicit topology registry, mandatory publishing, publisher confirmations, delayed releases, dead-letter queues, Laravel worker behavior, and optional Filament dead-letter tools.
 
-**A production-ready RabbitMQ queue driver for Laravel with attribute-based topology, automatic retries, and Kubernetes-native deployment.**
+The driver provides at-least-once delivery. A connection failure can cause the same job to run more than once. Jobs must be idempotent. Do not use a successful dispatch call as proof that a job was processed. A successful dispatch call means that RabbitMQ confirmed the publish and did not return the message as unroutable.
 
-Build resilient, scalable queue systems using RabbitMQ's powerful routing with Laravel's familiar job syntax. No Horizon required.
+## Requirements
 
-## ✨ Features
+- PHP 8.2 or later
+- Laravel 11, 12, or 13
+- RabbitMQ 4.x for the documented quorum queue behavior
+- The PHP sockets extension
+- The PHP PCNTL and POSIX extensions for worker timeouts, signals, and heartbeats during long jobs
+- Filament 5 only when you use the optional dead-letter page
 
-- 🎯 **Attribute-Based Topology** - Define exchanges and queues using PHP 8 attributes on your job classes
-- 🔄 **Automatic Retries & DLQ** - Built-in dead letter queues with configurable retry strategies
-- 📊 **Priority Queues** - Support for message priorities (0-255) on classic queues
-- ⏰ **Delayed Messages** - Schedule jobs with native RabbitMQ delayed message exchange
-- 🚀 **Laravel-Native** - Works with standard `dispatch()` - no learning curve
-- ☸️ **Kubernetes-Ready** - Custom consumer commands designed for containerized deployments
-- 💪 **Production-Proven** - Built on php-amqplib with heartbeat support and publisher confirms
+The package does not require Redis. It does not require the RabbitMQ delayed-message plug-in.
 
-## 🤔 Why Use RabbitMQ?
-
-This package is ideal for applications that need:
-
-- **Advanced Routing** - Route messages based on patterns, headers, or broadcast to multiple queues
-- **Guaranteed Delivery** - RabbitMQ's persistence and publisher confirms ensure messages aren't lost
-- **Complex Workflows** - Multi-tenant systems, event-driven architectures, microservices communication
-- **Infrastructure-Level Control** - Manage queue topology, clustering, and federation through RabbitMQ itself
-- **Kubernetes-Native Workers** - Deploy queue consumers as standard Kubernetes Deployments with HPA
-- **Protocol Flexibility** - AMQP protocol support for cross-platform messaging (Node.js, Python, Go, etc.)
-
-## 📋 Requirements
-
-- PHP 8.2+
-- Laravel 11.0+ or 12.0+
-- RabbitMQ 3.12+
-- php-amqplib/php-amqplib ^3.6
-
-**Optional:**
-- `rabbitmq_delayed_message_exchange` plugin for delayed messages
-- `rabbitmq_prometheus` plugin for Prometheus metrics
-
-## 📦 Installation
+## Install
 
 ```bash
 composer require lettermint/laravel-rabbitmq
-```
-
-Publish the configuration file:
-
-```bash
 php artisan vendor:publish --tag=rabbitmq-config
 ```
 
-Update your `config/queue.php`:
+Add a Laravel queue connection. The `driver` value must match `rabbitmq.driver_name`.
+
+```php
+// config/queue.php
+'connections' => [
+    'rabbitmq-native' => [
+        'driver' => 'rabbitmq-native',
+        'connection' => 'default',
+        'queue' => 'default',
+    ],
+],
+```
+
+Set the driver name and the broker connection in the package configuration.
+
+```php
+// config/rabbitmq.php
+'driver_name' => env('RABBITMQ_DRIVER_NAME', 'rabbitmq-native'),
+'default' => env('RABBITMQ_CONNECTION', 'default'),
+```
+
+This separate name lets an application run a new connection beside an older RabbitMQ driver.
+
+## Broker connection
+
+Configure one or more broker hosts. The package tries each host in order. It uses a bounded connection recovery process after a connection failure.
 
 ```php
 'connections' => [
-    'rabbitmq' => [
-        'driver' => 'rabbitmq',
-        'queue' => env('RABBITMQ_QUEUE', 'default'),
-        'exchange' => env('RABBITMQ_EXCHANGE', ''),
+    'default' => [
+        'hosts' => [
+            [
+                'host' => env('RABBITMQ_HOST', 'localhost'),
+                'port' => env('RABBITMQ_PORT', 5672),
+                'user' => env('RABBITMQ_USER', 'guest'),
+                'password' => env('RABBITMQ_PASSWORD', 'guest'),
+                'vhost' => env('RABBITMQ_VHOST', '/'),
+            ],
+        ],
+        'options' => [
+            'heartbeat' => 60,
+            'connection_timeout' => 30,
+            'read_timeout' => 300,
+            'write_timeout' => 300,
+            'channel_rpc_timeout' => 0,
+        ],
+        'ssl' => [
+            'enabled' => false,
+            'verify_peer' => true,
+        ],
     ],
 ],
-
-// Set as default if desired
-'default' => env('QUEUE_CONNECTION', 'rabbitmq'),
 ```
 
-Add to your `.env`:
+Do not set a read timeout that is less than two heartbeat intervals.
 
-```env
-QUEUE_CONNECTION=rabbitmq
-RABBITMQ_HOST=localhost
-RABBITMQ_PORT=5672
-RABBITMQ_USER=guest
-RABBITMQ_PASSWORD=guest
-RABBITMQ_VHOST=/
-```
+## Explicit topology
 
-## 🚀 Quick Start
-
-Here's a complete example - from defining a job to processing it:
-
-### 1. Define Your Job
+Use one canonical queue registry. Strict mode rejects a dispatch to a logical queue that is not in this registry. A physical prefix lets two deployments use separate broker objects in the same virtual host.
 
 ```php
-<?php
+'physical_prefix' => env('RABBITMQ_PHYSICAL_PREFIX', ''),
+'strict_topology' => env('RABBITMQ_STRICT_TOPOLOGY', true),
 
-namespace App\Jobs;
-
-use Illuminate\Contracts\Queue\ShouldQueue;
-use Illuminate\Foundation\Bus\Dispatchable;
-use Illuminate\Queue\InteractsWithQueue;
-use Illuminate\Queue\SerializesModels;
-use Lettermint\RabbitMQ\Attributes\ConsumesQueue;
-
-#[ConsumesQueue(
-    queue: 'emails',
-    bindings: ['notifications' => 'email.*'],  // Listens to notifications exchange
-    quorum: true,                               // High availability queue
-    retryAttempts: 3,                           // Retry up to 3 times
-)]
-class SendEmailJob implements ShouldQueue
-{
-    use Dispatchable, InteractsWithQueue, SerializesModels;
-
-    public function __construct(
-        public string $email,
-        public string $subject,
-        public string $message,
-    ) {}
-
-    public function handle(): void
-    {
-        // Send your email
-        Mail::to($this->email)->send(new NotificationMail($this->subject, $this->message));
-    }
-}
+'topology' => [
+    'exchanges' => [
+        'jobs' => ['type' => 'topic'],
+        'dlx' => ['type' => 'direct'],
+    ],
+    'queues' => [
+        'default' => [
+            'bindings' => [
+                'jobs' => ['default'],
+            ],
+            'quorum' => true,
+            'delivery_limit' => 20,
+            'dead_letter' => true,
+            'dead_letter_exchange' => 'dlx',
+        ],
+        'events' => [
+            'bindings' => [
+                'jobs' => ['events.#'],
+            ],
+            'quorum' => true,
+            'single_active_consumer' => false,
+            'delivery_limit' => 20,
+            'max_length' => 100000,
+            'max_length_bytes' => 1073741824,
+            'dead_letter' => true,
+            'dead_letter_exchange' => 'dlx',
+        ],
+    ],
+],
 ```
 
-### 2. Declare Topology
+The registry supports direct, topic, and fanout exchanges. It rejects headers exchanges and `x-delayed-message` exchanges. It also rejects invalid names, physical-name conflicts, unknown exchange bindings, empty publish keys, wildcard publish keys, and publish keys that do not match the registered queue bindings.
+
+Main queues and final dead-letter queues are durable quorum queues by default. A quorum queue uses `reject-publish`. When dead lettering is active, it also uses RabbitMQ at-least-once dead lettering. The final dead-letter queue has no default message TTL.
+
+RabbitMQ queue arguments are immutable. A change to a queue type, delivery limit, length limit, priority, message TTL, or single-active-consumer setting can require a controlled queue replacement. Test a topology change before you apply it to an existing broker.
+
+Declare the topology before producers or workers start:
 
 ```bash
-# Create the exchange, queue, and bindings in RabbitMQ
+php artisan rabbitmq:declare --dry-run
 php artisan rabbitmq:declare
 ```
 
-### 3. Dispatch & Consume
+Use `rabbitmq:topology --format=json` as normalized input for CI checks.
+
+### Attribute compatibility
+
+The `#[Exchange]` and `#[ConsumesQueue]` attributes remain available for applications that do not use an explicit registry. Attribute discovery runs only in console processes. It does not scan application files during a normal web request.
+
+Strict mode requires an explicit queue registry. Use the explicit registry for deployments that must reject every unknown queue.
+
+## Dispatch and routing
+
+Laravel queue APIs work with the driver:
 
 ```php
-// Dispatch the job (from anywhere in your app)
-SendEmailJob::dispatch('user@example.com', 'Welcome!', 'Thanks for signing up');
+ProcessEvent::dispatch($event)->onConnection('rabbitmq-native')->onQueue('events');
 ```
 
-```bash
-# Start consuming (in production, run this in a container/supervisor)
-php artisan rabbitmq:consume emails
-```
+Jobs without `onQueue()` use the configured default logical queue. Register that queue before you enable strict mode.
 
-That's it! Your job will be routed through RabbitMQ and processed with automatic retries and dead letter handling.
-
-> **💡 Tip:** In production, run consumers as Kubernetes Deployments or supervisor processes.
-
-## 📚 Core Concepts
-
-Understanding these RabbitMQ concepts will help you use this package effectively:
-
-### Exchange → Binding → Queue Flow
-
-```
-┌─────────────┐    routing key: email.welcome     ┌──────────────┐
-│   Producer  │──────────────────────────────────►│   Exchange   │
-└─────────────┘                                   │ "notifications"│
-                                                  └───────┬────────┘
-                                                          │ binding: email.*
-                                                          ▼
-                                                  ┌──────────────┐
-                                                  │    Queue     │
-                                                  │   "emails"   │
-                                                  └───────┬──────┘
-                                                          │
-                                                          ▼
-                                                  ┌──────────────┐
-                                                  │   Consumer   │
-                                                  │ (Your Job)   │
-                                                  └──────────────┘
-```
-
-- **Exchange**: Routes messages based on routing keys (like a post office)
-- **Queue**: Stores messages until consumed (like a mailbox)
-- **Binding**: Routing rule connecting exchange to queue (e.g., `email.*` matches `email.welcome`)
-- **Routing Key**: Label on each message determining which queue(s) receive it
-
-### Attribute-Based Configuration
-
-Instead of manually configuring exchanges and queues in RabbitMQ, define them with attributes:
-
-```php
-// This attribute tells the package:
-// 1. Create a queue named "emails"
-// 2. Create a quorum queue (HA, durable)
-// 3. Bind it to the "notifications" exchange with pattern "email.*"
-// 4. Set up DLQ with 3 retry attempts
-#[ConsumesQueue(
-    queue: 'emails',
-    bindings: ['notifications' => 'email.*'],
-    quorum: true,
-    retryAttempts: 3,
-)]
-```
-
-When you run `php artisan rabbitmq:declare`, the package scans your job classes and creates everything automatically.
-
-## 📖 Usage Examples
-
-### Basic Usage
-
-**Simple job with a queue:**
-
-```php
-#[ConsumesQueue(
-    queue: 'default',
-    bindings: ['tasks' => '#'],  // Catch all messages from 'tasks' exchange
-)]
-class ProcessTaskJob implements ShouldQueue
-{
-    public function handle(): void
-    {
-        // Process the task
-    }
-}
-```
-
-**Creating an exchange** (optional - useful for organization):
-
-```php
-<?php
-
-namespace App\RabbitMQ\Exchanges;
-
-use Lettermint\RabbitMQ\Attributes\Exchange;
-use Lettermint\RabbitMQ\Enums\ExchangeType;
-
-#[Exchange(name: 'tasks', type: ExchangeType::Topic)]
-class TasksExchange {}
-```
-
-### Intermediate Usage
-
-**Priority queues** for time-sensitive jobs:
-
-```php
-use Lettermint\RabbitMQ\Contracts\HasPriority;
-
-#[ConsumesQueue(
-    queue: 'urgent-tasks',
-    bindings: ['tasks' => 'urgent.*'],
-    quorum: false,        // Priority requires classic queue
-    maxPriority: 10,      // 0 = lowest, 10 = highest
-)]
-class UrgentTaskJob implements ShouldQueue, HasPriority
-{
-    public function __construct(
-        public string $taskId,
-        public int $priority = 5,
-    ) {}
-
-    public function getPriority(): int
-    {
-        return $this->priority;
-    }
-}
-
-// Dispatch with high priority
-UrgentTaskJob::dispatch($taskId, priority: 10);
-```
-
-**Single active consumption** for an ordered workload:
-
-```php
-#[ConsumesQueue(
-    queue: 'ordered-events',
-    bindings: ['events' => '#'],
-    quorum: true,
-    prefetch: 1,                 // one unacked message at a time
-    singleActiveConsumer: true,  // one consumer processes; others stand by
-)]
-class OrderedEventJob implements ShouldQueue
-{
-    // ...
-}
-```
-
-RabbitMQ normally distributes deliveries across connected consumers.
-`singleActiveConsumer: true` elects one active consumer per queue. Other
-consumers remain available for failover. Combine it with `prefetch: 1` to
-limit the active consumer to one unacknowledged delivery.
-
-This setting prevents concurrent consumption from the queue. It does not
-guarantee strict end-to-end FIFO ordering. A rejected or redelivered message
-can be delivered in a different order after a failure. It is compatible with
-quorum queues and requires RabbitMQ 3.8 or later.
-
-> **Note:** queue arguments are immutable after declaration. Use a new queue
-> name or perform a controlled queue replacement when you enable this setting
-> on an existing deployment. The setting defaults to `false`.
-
-**Per-message routing keys** with `HasRoutingKey`:
-
-By default a job publishes with the static routing key from its
-`#[ConsumesQueue]` binding. Implement `HasRoutingKey` to compute the routing key
-for each dispatched instance. This can route work to an exact, declared binding:
+Use `HasRoutingKey` only when one logical queue has more than one valid route:
 
 ```php
 use Lettermint\RabbitMQ\Contracts\HasRoutingKey;
 
-#[Exchange(name: 'events', type: ExchangeType::Topic)]
-#[ConsumesQueue(
-    queue: 'events.shard.0',
-    bindings: ['events' => 'events.shard.0'],
-    quorum: true,
-    prefetch: 1,
-)]
-class ProjectEvent implements ShouldQueue, HasRoutingKey
+final class ProcessEvent implements HasRoutingKey
 {
-    public function __construct(private string $aggregateId) {}
-
     public function getRoutingKey(): string
     {
-        return 'events.shard.'.(crc32($this->aggregateId) % 16);
+        return 'events.account.created';
     }
 }
 ```
 
-The routing key overrides the static binding key. The exchange still comes
-from the attribute. The package validates the key and stores it in the payload,
-so release and replay keep the original route. A dynamic key must not contain
-topic wildcards. Declare and consume every route that the job can return.
+The routing key is stored in the Laravel payload. A release or dead-letter replay keeps the same routing data. The package also keeps the AMQP message ID, correlation ID, timestamp, headers, priority, payload, and other message properties.
 
-Routing does not provide an ordering guarantee during redelivery. Jobs that do
-not implement `HasRoutingKey` keep the static attribute routing key.
+Publisher confirmations and mandatory routing cannot be disabled. The package treats a returned message, a negative confirmation, and a confirmation timeout as a dispatch failure. A timeout has an uncertain result: RabbitMQ can have the message even though the dispatch call failed. The application must use an idempotency key when it retries such a dispatch.
 
-**Delayed/scheduled messages:**
+`pushBatch()` publishes and confirms messages in order. It is not an atomic operation. A later publish can fail after earlier messages were confirmed.
 
-```php
-// Requires rabbitmq_delayed_message_exchange plugin
-// Enable in config/rabbitmq.php: 'delayed.enabled' => true
+## Workers
 
-// Delay by seconds
-SendEmailJob::dispatch($email)->delay(300);  // 5 minutes
+Start one consumer for one logical queue:
 
-// Delay with Carbon
-SendEmailJob::dispatch($email)->delay(now()->addHours(2));
-
-// Schedule for specific time
-SendEmailJob::dispatch($email)->delay(now()->tomorrow()->setHour(9));
+```bash
+php artisan rabbitmq:consume events \
+    --connection=rabbitmq-native \
+    --prefetch=1 \
+    --tries=3 \
+    --timeout=60 \
+    --backoff=10,60,300
 ```
 
-### Advanced Usage
+The command can accept more than one queue, but one queue per worker gives clear scaling and failure isolation.
 
-**Multiple bindings** (listen to multiple routing patterns):
+The consumer delegates job execution to Laravel `Worker`. Laravel job options remain active, including `$tries`, `$backoff`, `retryUntil()`, `$maxExceptions`, `$timeout`, maintenance mode, and queue events. Job settings take priority over the command defaults where Laravel defines that behavior.
 
-```php
-#[ConsumesQueue(
-    queue: 'notifications',
-    bindings: [
-        'events' => ['user.created', 'user.updated'],
-        'alerts' => 'critical.*',
-    ],
-)]
-```
+Intentional releases use the `x-lettermint-attempt` header. RabbitMQ delivery count is separate and protects against crash loops. A worker crash, a lost connection, or an uncertain acknowledgement can cause redelivery without increasing the Laravel attempt count.
 
-**Exchange-to-exchange binding** (hierarchical routing):
+Use prefetch 1 when a KEDA deployment has one queue per worker. A higher value can improve throughput, but it also reserves more jobs in each worker and can reduce scaling accuracy.
 
-```php
-// Parent exchange
-#[Exchange(name: 'events', type: ExchangeType::Topic)]
-class EventsExchange {}
+The consumer closes and rebuilds all channels for the affected broker connection during recovery. Recovery has a fixed maximum. The process exits with a failure after it uses that limit, so the process supervisor can restart it.
 
-// Child exchange bound to parent
-#[Exchange(
-    name: 'user-events',
-    type: ExchangeType::Topic,
-    bindTo: 'events',
-    bindRoutingKey: 'user.#',
-)]
-class UserEventsExchange {}
-```
+The default heartbeat sender needs PCNTL and POSIX. It keeps the broker heartbeat active while a long PHP job blocks the consumer loop. Do not disable it for long-running workers unless another process provides the same protection.
 
-**Custom retry strategy:**
+Single-active-consumer mode prevents concurrent consumption from one queue. It does not provide strict end-to-end FIFO order. A release, rejection, worker failure, or broker redelivery can change order.
+
+## Delayed releases and retries
+
+Laravel releases and delayed jobs use durable classic TTL queues. Each delay and route gets an internal delay queue. RabbitMQ moves the message to the normal exchange after the TTL expires. The internal queue expires after its cleanup period.
+
+Set a maximum delay to prevent an unbounded number of delay queues:
 
 ```php
-use Lettermint\RabbitMQ\Enums\RetryStrategy;
-
-#[ConsumesQueue(
-    queue: 'api-calls',
-    bindings: ['tasks' => 'api.*'],
-    retryAttempts: 5,
-    retryStrategy: RetryStrategy::Exponential,
-    retryDelays: [30, 60, 300, 900, 3600],  // 30s, 1m, 5m, 15m, 1h
-)]
-```
-
-**Repeatable attribute** (one job, multiple queues):
-
-```php
-// This job can be consumed from either queue
-#[ConsumesQueue(queue: 'primary', bindings: ['tasks' => 'important.*'])]
-#[ConsumesQueue(queue: 'secondary', bindings: ['tasks' => 'background.*'])]
-class FlexibleJob implements ShouldQueue
-{
-    // ...
-}
-```
-
-## ⚙️ Configuration Reference
-
-### Environment Variables
-
-```env
-# Connection
-RABBITMQ_HOST=localhost
-RABBITMQ_PORT=5672
-RABBITMQ_USER=guest
-RABBITMQ_PASSWORD=guest
-RABBITMQ_VHOST=/
-
-# Behavior
-RABBITMQ_HEARTBEAT=60
-RABBITMQ_PREFETCH_COUNT=10
-RABBITMQ_DELAYED_ENABLED=true
-
-# Publisher
-RABBITMQ_PUBLISHER_CONFIRM=true
-```
-
-### Attribute: `#[Exchange]`
-
-```php
-#[Exchange(
-    name: 'events',                    // Required: Exchange name
-    type: ExchangeType::Topic,         // topic, direct, fanout, headers, x-delayed-message
-    durable: true,                     // Survive broker restart
-    autoDelete: false,                 // Delete when no bindings
-    internal: false,                   // Only accessible via e2e bindings
-    bindTo: 'parent-exchange',         // Parent exchange for e2e binding
-    bindRoutingKey: 'events.#',        // Routing pattern for parent
-    arguments: [],                     // Custom exchange arguments
-)]
-```
-
-**Exchange Types:**
-- `Topic`: Pattern-based routing (e.g., `user.*.created`)
-- `Direct`: Exact routing key match
-- `Fanout`: Broadcast to all bound queues
-- `Headers`: Route by message headers
-- `DelayedMessage`: Delayed delivery (requires plugin)
-
-### Attribute: `#[ConsumesQueue]`
-
-```php
-#[ConsumesQueue(
-    // Required
-    queue: 'my-queue',                           // Queue name
-
-    // Bindings
-    bindings: [                                  // Exchange => routing key(s)
-        'exchange-name' => 'routing.key',
-        'other-exchange' => ['key1', 'key2'],
-    ],
-
-    // Queue type (choose one)
-    quorum: true,                                // Quorum queue (HA, recommended)
-    maxPriority: 10,                             // Classic with priority (quorum: false)
-
-    // Limits
-    messageTtl: 86400000,                        // Message TTL in ms (24h)
-    maxLength: 1000000,                          // Max queue length
-    overflow: OverflowBehavior::RejectPublishDlx, // Overflow behavior
-
-    // Dead letter & retry
-    dlqExchange: null,                           // Custom DLQ exchange (auto-derived if null)
-    retryAttempts: 3,                            // Max retries before permanent DLQ
-    retryStrategy: RetryStrategy::Exponential,   // exponential, fixed, linear
-    retryDelays: [60, 300, 900],                 // Delays in seconds
-
-    // Consumer settings
-    prefetch: 10,                                // Messages to prefetch (QoS)
-    timeout: 30,                                 // Job timeout in seconds
-)]
-```
-
-**Important Notes:**
-- Quorum queues provide high availability but don't support priorities
-- Use classic queues (`quorum: false`) if you need `maxPriority`
-- DLQ exchange is auto-created based on your first binding exchange
-
-### Config File Options
-
-See `config/rabbitmq.php` for full options. Key settings:
-
-```php
-// Discovery paths (where to scan for attributes)
-'discovery' => [
-    'paths' => [
-        app_path('Jobs'),
-        app_path('RabbitMQ'),
-    ],
-],
-
-// Default queue settings (for jobs without attributes)
-'queue' => [
-    'exchange' => '',  // Fallback exchange
-],
-
-// Delayed messages
-'delayed' => [
-    'enabled' => true,
-    'max_delay' => 86400000,  // 24 hours max
+'retry' => [
+    'maximum_delay' => 86400,
+    'delay_queue_cleanup_grace' => 86400000,
 ],
 ```
 
-## 🎮 Artisan Commands
+The package does not use the archived delayed-message plug-in. Laravel job and worker settings control retry attempts and backoff. Legacy retry fields on `ConsumesQueue` remain only for source compatibility.
 
-### Topology Management
+## Dead-letter operations
+
+RabbitMQ is the canonical store for final failed messages. A replay publishes and confirms the replacement before it acknowledges the dead-letter message. An acknowledgement failure can cause a duplicate, but the package does not acknowledge the source before the replacement is confirmed.
+
+Use these commands:
 
 ```bash
-# Declare all exchanges, queues, and bindings
-php artisan rabbitmq:declare
-
-# Preview what will be created (dry run)
-php artisan rabbitmq:declare --dry-run
-
-# View topology as tree
-php artisan rabbitmq:topology
-
-# Export topology as JSON
-php artisan rabbitmq:topology --format=json
+php artisan rabbitmq:dlq-inspect events --limit=20
+php artisan rabbitmq:replay-dlq events --id=JOB_UUID
+php artisan rabbitmq:replay-dlq events --limit=100 --rate=10
+php artisan rabbitmq:dlq-purge events --id=JOB_UUID --dry-run
+php artisan rabbitmq:dlq-purge events --id=JOB_UUID --force
 ```
 
-### Queue Operations
+Inspection and ID search consume and requeue messages. This operation can change dead-letter queue order. Do not use the DLQ as an ordered audit database.
 
-```bash
-# List all queues with stats
-php artisan rabbitmq:queues
+### Filament
 
-# Include DLQ queues in list
-php artisan rabbitmq:queues --include-dlq
+Register the optional plugin on a Filament panel:
 
-# Watch mode (updates every 2s)
-php artisan rabbitmq:queues --watch
+```php
+use Lettermint\RabbitMQ\Filament\RabbitMQPlugin;
 
-# Purge a queue (delete all messages)
-php artisan rabbitmq:purge my-queue
+return $panel->plugins([
+    RabbitMQPlugin::make(),
+]);
 ```
 
-### Consumer
+The page can inspect, retry, forget, retry in bulk, and forget in bulk. It writes an operator audit log for changes. RabbitMQ remains the canonical dead-letter store. If Laravel has a failed-job provider, the page can read exception details from it and remove those optional details after a retry or forget action. The page does not require Redis or a new database migration.
+
+Protect the Filament panel with the application authorization rules. Dead-letter payloads can contain sensitive application data.
+
+## Diagnostics and monitoring
+
+Use the broker commands for deployment and runtime checks:
 
 ```bash
-# Start consuming from a queue
-php artisan rabbitmq:consume my-queue
-
-# With custom settings
-php artisan rabbitmq:consume my-queue \
-    --prefetch=25 \
-    --timeout=120 \
-    --max-jobs=500 \
-    --max-memory=256
-
-# Stop when empty (useful for testing)
-php artisan rabbitmq:consume my-queue --stop-when-empty
-
-# Consume from several queues with one worker process
-php artisan rabbitmq:consume orders payments notifications
-```
-
-One worker can consume from multiple queues by passing more than one queue
-name. The worker registers a separate consumer for each queue on one channel
-and processes the next available delivery. RabbitMQ applies the `--prefetch`
-limit to each consumer. Redelivery does not have an ordering guarantee.
-
-**Consumer Options:**
-- `--prefetch`: Messages to prefetch (default: 10)
-- `--timeout`: Job timeout in seconds (default: 60)
-- `--max-jobs`: Exit after N jobs (0 = unlimited)
-- `--max-time`: Exit after N seconds (0 = unlimited)
-- `--max-memory`: Exit if memory exceeds N MB (default: 128)
-- `--stop-when-empty`: Exit when queue is empty
-
-### Dead Letter Queue Operations
-
-```bash
-# Replay DLQ messages back to original queue
-php artisan rabbitmq:replay-dlq my-queue
-
-# Preview replay without moving messages
-php artisan rabbitmq:replay-dlq my-queue --dry-run
-
-# Limit number of messages to replay
-php artisan rabbitmq:replay-dlq my-queue --limit=100
-
-# Inspect DLQ messages without removing them
-php artisan rabbitmq:dlq-inspect my-queue
-
-# Inspect specific message
-php artisan rabbitmq:dlq-inspect my-queue --id=message-uuid
-
-# Limit number of messages shown
-php artisan rabbitmq:dlq-inspect my-queue --limit=20
-
-# JSON output
-php artisan rabbitmq:dlq-inspect my-queue --format=json
-
-# Purge DLQ messages (permanently delete)
-php artisan rabbitmq:dlq-purge my-queue
-
-# Purge specific message
-php artisan rabbitmq:dlq-purge my-queue --id=message-uuid
-
-# Purge old messages only
-php artisan rabbitmq:dlq-purge my-queue --older-than=7d
-
-# Preview without deleting
-php artisan rabbitmq:dlq-purge my-queue --dry-run
-
-# Skip confirmation
-php artisan rabbitmq:dlq-purge my-queue --force
-```
-
-### Monitoring
-
-```bash
-# Health check
-php artisan rabbitmq:health
-
-# JSON output (for monitoring tools)
 php artisan rabbitmq:health --json
+php artisan rabbitmq:audit --strict --json
+php artisan rabbitmq:probe --all --connection=rabbitmq-native --json
+php artisan rabbitmq:test-event default --connection=rabbitmq-native --roundtrip --json
+php artisan rabbitmq:queues --include-dlq
 ```
 
-## 🔄 Dead Letter Queues
+`rabbitmq:health` performs a real passive broker operation. `rabbitmq:audit` passively checks all registered exchanges, main queues, and dead-letter queues. `rabbitmq:probe` publishes a safe Laravel job to each selected logical queue. The application must collect the matching `rabbitmq.queue_probe.processed` log or `QueueProbeProcessed` event to prove end-to-end processing. `rabbitmq:test-event --roundtrip` uses a temporary isolated queue and deletes it after the test.
 
-DLQs are automatically created for every queue to handle failed messages.
+The package emits events for confirmed and failed publishes, releases, retries, dead lettering, replay, connection recovery, and completed probes. It also writes structured lifecycle logs with queue, job class, job ID, attempt, result, processing time, observed queue wait time, redelivery state, and broker delivery count. The lifecycle logs do not contain a job payload or exception message.
 
-### How It Works
+The package does not include a Prometheus exporter or a Grafana dashboard. Use the RabbitMQ Prometheus plug-in, KEDA metrics, application logs, and an error reporter such as Sentry for deployment monitoring.
 
-```
-┌──────────────┐
-│ Original Queue│  Job fails or times out
-│  "emails"    │─────────────┐
-└──────────────┘             │
-                             ▼
-                     ┌──────────────┐
-                     │  DLQ Exchange│
-                     │ "notifications.dlq"
-                     └───────┬──────┘
-                             │
-                             ▼
-                     ┌──────────────┐
-                     │   DLQ Queue  │  Retry after delay
-                     │ "dlq:emails" │─────────────┐
-                     └──────────────┘             │
-                                                  │
-         ┌────────────────────────────────────────┘
-         │
-         ▼
-┌──────────────┐
-│ Original Queue│  If retries exhausted → stays in DLQ
-│  "emails"    │
-└──────────────┘
-```
+Laravel queue metrics have broker limits. `size()` and `pendingSize()` report ready messages. `delayedSize()` and `reservedSize()` return zero because AMQP 0-9-1 does not expose these totals through queue declaration. `creationTimeOfOldestPendingJob()` returns `null` because the broker cannot inspect the oldest message without consuming it. Use RabbitMQ management metrics for production dashboards.
 
-### Retry Strategies
+## Delivery model
 
-**Exponential** (recommended for API calls):
-```php
-retryStrategy: RetryStrategy::Exponential,
-retryDelays: [60, 300, 900],  // 1m, 5m, 15m, then 15m for remaining
+The package reduces silent-loss risks with these controls:
+
+- A strict logical queue registry
+- Mandatory routing
+- Publisher confirmations
+- Publish-before-acknowledge release and replay operations
+- Durable queues and persistent messages
+- Bounded connection recovery
+- Runtime topology audits
+- End-to-end queue probes
+
+These controls do not provide exactly-once delivery. Network failures and lost acknowledgements can cause duplicates. Broker durability also depends on the RabbitMQ cluster, storage, policies, and operator procedures. Test broker restarts, worker termination, delayed releases, final failures, and replay in the target environment before a production rollout.
+
+## Development
+
+```bash
+composer test
+composer analyse
+composer format
+RABBITMQ_USER=guest RABBITMQ_PASSWORD=guest composer test-integration
 ```
 
-**Fixed** (same delay every time):
-```php
-retryStrategy: RetryStrategy::Fixed,
-retryDelays: [300],  // Always 5 minutes
-```
+The integration tests need a real RabbitMQ broker.
 
-**Linear** (increasing delay):
-```php
-retryStrategy: RetryStrategy::Linear,
-retryDelays: [60],  // 1m, 2m, 3m, 4m...
-```
+## License
 
-### Messages Go to DLQ When:
-
-1. Job throws unhandled exception (after retries)
-2. Job exceeds timeout
-3. Consumer rejects without requeue
-4. Queue message TTL expires
-5. Queue max-length exceeded (with `overflow: RejectPublishDlx`)
-
-## ☸️ Kubernetes Deployment
-
-Deploy workers as Kubernetes Deployments for automatic scaling and restarts.
-
-### Basic Worker Deployment
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: queue-worker-emails
-spec:
-  replicas: 3
-  selector:
-    matchLabels:
-      app: queue-worker
-      queue: emails
-  template:
-    metadata:
-      labels:
-        app: queue-worker
-        queue: emails
-    spec:
-      containers:
-        - name: worker
-          image: your-app:latest
-          command: ["php", "artisan", "rabbitmq:consume", "emails"]
-          args:
-            - "--prefetch=25"
-            - "--max-jobs=500"
-            - "--max-memory=256"
-          env:
-            - name: RABBITMQ_HOST
-              value: "rabbitmq.default.svc.cluster.local"
-            - name: RABBITMQ_USER
-              valueFrom:
-                secretKeyRef:
-                  name: rabbitmq-credentials
-                  key: username
-            - name: RABBITMQ_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: rabbitmq-credentials
-                  key: password
-          resources:
-            requests:
-              memory: "128Mi"
-              cpu: "100m"
-            limits:
-              memory: "512Mi"
-              cpu: "500m"
-```
-
-### Horizontal Pod Autoscaler (HPA)
-
-Scale based on queue depth using KEDA or RabbitMQ metrics:
-
-```yaml
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: queue-worker-emails-hpa
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: queue-worker-emails
-  minReplicas: 2
-  maxReplicas: 20
-  metrics:
-    - type: External
-      external:
-        metric:
-          name: rabbitmq_queue_messages_ready
-          selector:
-            matchLabels:
-              queue: emails
-        target:
-          type: AverageValue
-          averageValue: "100"  # Target: 100 messages per pod
-```
-
-### Best Practices
-
-- Set `--max-jobs` to restart workers periodically (prevents memory leaks)
-- Set `--max-memory` slightly below container limits
-- Use `livenessProbe` and `readinessProbe` for health checks
-- Run `rabbitmq:declare` in init container or CI/CD pipeline
-- Use `PodDisruptionBudget` to maintain availability during updates
-
-## 🔧 Advanced Topics
-
-### Fallback Routing for Third-Party Jobs
-
-Jobs without `#[ConsumesQueue]` (e.g., from packages) use fallback routing:
-
-**Routing:** `config('rabbitmq.queue.exchange')` with key `'fallback.{queue_name}'`
-
-Create a catch-all queue for these:
-
-```php
-#[ConsumesQueue(
-    queue: 'fallback',
-    bindings: ['your-exchange' => 'fallback.#'],
-)]
-class FallbackJob implements ShouldQueue {}
-```
-
-### Quorum vs Classic Queues
-
-**Use Quorum Queues (default) when:**
-- You need high availability (HA)
-- Data durability is critical
-- Running in clustered RabbitMQ
-
-**Use Classic Queues when:**
-- You need message priorities
-- You need very low latency (single-node)
-- Legacy compatibility required
-
-**Cannot combine:** `quorum: true` and `maxPriority` are mutually exclusive.
-
-### Publisher Confirms
-
-Publisher confirms ensure messages reach RabbitMQ successfully. Enabled by default:
-
-```php
-'publisher' => [
-    'confirm' => true,  // Wait for RabbitMQ acknowledgment
-],
-```
-
-If confirm fails, Laravel throws an exception and the job can be retried by your queue worker.
-
-### Heartbeats & Long-Running Jobs
-
-The package sends heartbeats automatically during job execution to prevent connection timeouts.
-
-**For jobs longer than 2× heartbeat interval:**
-- Heartbeats work automatically with `ext-pcntl`
-- If job has `$timeout` property, heartbeats are disabled during execution (both use `SIGALRM`)
-- For long jobs needing heartbeat: set `public $timeout = 0;` on the job class
-
-## 🐛 Troubleshooting
-
-### Connection Issues
-
-**Problem:** `AMQPConnectionException: Connection refused`
-
-**Solutions:**
-- Verify RabbitMQ is running: `docker ps` or `systemctl status rabbitmq-server`
-- Check connection details in `.env` match your RabbitMQ instance
-- Ensure firewall allows port 5672
-- Test connection: `telnet rabbitmq-host 5672`
-
-### Messages Not Routing
-
-**Problem:** Messages published but not appearing in queue
-
-**Solutions:**
-- Run `php artisan rabbitmq:topology` to verify bindings
-- Check routing key matches binding pattern:
-  - `email.*` matches `email.welcome` but not `email.welcome.urgent`
-  - `email.#` matches `email.welcome.urgent`
-- Verify exchange and queue were declared: `php artisan rabbitmq:declare`
-- Check RabbitMQ management UI (port 15672) for unrouted messages
-
-### Consumer Stops Unexpectedly
-
-**Problem:** `rabbitmq:consume` exits without error
-
-**Solutions:**
-- Check memory limit: `--max-memory=256` (increase if needed)
-- Check job limit: `--max-jobs=500` (consumer exits after N jobs by design)
-- Check time limit: `--max-time=3600` (consumer exits after N seconds)
-- Review logs for connection errors or exceptions
-- Verify heartbeat settings if jobs run longer than 2× heartbeat interval
-
-### Jobs Fail Silently
-
-**Problem:** Jobs marked as processed but work not completed
-
-**Solutions:**
-- Check your job's `handle()` method for unhandled exceptions
-- Enable failed job logging: check `failed_jobs` table
-- Review RabbitMQ DLQ: `php artisan rabbitmq:dlq-inspect your-queue`
-- Add logging to job: `Log::info('Job started', ['id' => $this->id]);`
-
-### Priority Not Working
-
-**Problem:** High priority messages not processed first
-
-**Solutions:**
-- Verify `quorum: false` (quorum queues don't support priority)
-- Verify `maxPriority` is set on queue attribute
-- Ensure job implements `HasPriority` interface
-- Check messages have priority set before prefetched messages processed
-
-### Delayed Messages Not Working
-
-**Problem:** `->delay()` doesn't delay message
-
-**Solutions:**
-- Install plugin: `rabbitmq-plugins enable rabbitmq_delayed_message_exchange`
-- Verify enabled in config: `'delayed.enabled' => true`
-- Run `php artisan rabbitmq:declare` to create delayed exchange
-- Check delay is within max: default 24 hours (`delayed.max_delay`)
-
-### High Memory Usage
-
-**Problem:** Worker memory grows over time
-
-**Solutions:**
-- Set `--max-memory=256` to restart worker before OOM
-- Set `--max-jobs=500` to periodically restart workers
-- Check for memory leaks in job code
-- Ensure job releases large objects: `unset($largeVariable);`
-- Use `--max-time=3600` for time-based restarts
-
-## 🤝 Contributing
-
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for details.
-
-## 📄 License
-
-MIT License. See [LICENSE](LICENSE) for details.
+Laravel RabbitMQ is available under the MIT License.

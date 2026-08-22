@@ -15,8 +15,8 @@ use Symfony\Component\Console\Helper\ProgressBar;
  * Artisan command to replay messages from a dead letter queue.
  *
  * This command moves messages from a DLQ back to their original queue
- * for reprocessing. Uses transactions to ensure atomic publish+ack
- * preventing message loss or duplication.
+ * for reprocessing. It confirms the replacement publish before it acknowledges
+ * the DLQ message. A lost acknowledgement can cause a duplicate message.
  */
 class ReplayDlqCommand extends Command
 {
@@ -97,8 +97,7 @@ class ReplayDlqCommand extends Command
                 if ($dryRun) {
                     $this->line("  Would replay: {$msg->jobClass}");
                 } else {
-                    $newAttempts = $msg->attempts + 1;
-                    $this->components->success("Message '{$msg->id}' replayed to '{$queueName}' (attempt #{$newAttempts})");
+                    $this->components->success("Message '{$msg->id}' replayed to '{$queueName}'");
                 }
             }
 
@@ -139,10 +138,9 @@ class ReplayDlqCommand extends Command
             return function (DlqMessageData $msg, bool $success, ?string $error): void {
                 if ($this->getOutput()->isVerbose()) {
                     if ($success) {
-                        $newAttempts = $msg->attempts + 1;
-                        $this->line("  <fg=green>✓</> Replayed: {$msg->jobClass} (attempt #{$newAttempts})");
+                        $this->line("  <fg=green>OK</> Replayed: {$msg->jobClass}");
                     } else {
-                        $this->line("  <fg=red>✗</> Failed: {$msg->jobClass} - {$error}");
+                        $this->line("  <fg=red>FAILED</> {$msg->jobClass} - {$error}");
                     }
                 }
             };
@@ -150,8 +148,7 @@ class ReplayDlqCommand extends Command
 
         return function (DlqMessageData $msg, bool $success, ?string $error): void {
             if ($success) {
-                $newAttempts = $msg->attempts + 1;
-                $this->progressBar->setMessage("{$msg->jobClass} (#{$newAttempts})");
+                $this->progressBar->setMessage($msg->jobClass);
             } else {
                 $this->progressBar->setMessage("<fg=red>Failed: {$msg->jobClass}</>");
             }

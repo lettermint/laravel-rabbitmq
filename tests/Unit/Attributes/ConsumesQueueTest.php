@@ -319,7 +319,7 @@ describe('ConsumesQueue attribute', function () {
             expect($args['x-message-ttl'])->toBe(86400000);
         });
 
-        it('includes maxLength and overflow arguments', function () {
+        it('keeps safe overflow for a quorum queue with a length limit', function () {
             $attr = new ConsumesQueue(
                 queue: 'test',
                 maxLength: 10000,
@@ -330,7 +330,18 @@ describe('ConsumesQueue attribute', function () {
             expect($args)->toHaveKey('x-max-length');
             expect($args['x-max-length'])->toBe(10000);
             expect($args)->toHaveKey('x-overflow');
-            expect($args['x-overflow'])->toBe('reject-publish-dlx');
+            expect($args['x-overflow'])->toBe('reject-publish');
+        });
+
+        it('uses the selected overflow for a classic queue with a length limit', function () {
+            $attr = new ConsumesQueue(
+                queue: 'test',
+                quorum: false,
+                maxLength: 10000,
+                overflow: OverflowBehavior::RejectPublishDlx
+            );
+
+            expect($attr->getQueueArguments()['x-overflow'])->toBe('reject-publish-dlx');
         });
 
         it('includes dead letter exchange arguments when bindings exist', function () {

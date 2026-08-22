@@ -5,10 +5,9 @@ declare(strict_types=1);
 namespace Lettermint\RabbitMQ\Monitoring;
 
 use Illuminate\Support\Facades\Log;
-use Lettermint\RabbitMQ\Connection\ConnectionManager;
-use Lettermint\RabbitMQ\Exceptions\ConnectionException;
-use PhpAmqpLib\Exception\AMQPConnectionClosedException;
-use PhpAmqpLib\Exception\AMQPIOException;
+use Lettermint\RabbitMQ\Connection\ChannelManager;
+use Lettermint\RabbitMQ\Topology\TopologyRegistry;
+use Throwable;
 
 /**
  * RabbitMQ health check service.
@@ -19,7 +18,9 @@ use PhpAmqpLib\Exception\AMQPIOException;
 class HealthCheck
 {
     public function __construct(
-        protected ConnectionManager $connectionManager,
+        protected ChannelManager $channelManager,
+        protected TopologyRegistry $registry,
+        protected array $config,
     ) {}
 
     /**
@@ -53,22 +54,17 @@ class HealthCheck
     protected function checkConnection(): array
     {
         try {
-            $connection = $this->connectionManager->connection();
-
-            if ($connection->isConnected()) {
-                return [
-                    'healthy' => true,
-                    'message' => 'Connected to RabbitMQ',
-                ];
-            }
-
-            Log::error('RabbitMQ health check: connection exists but not connected');
+            $logicalQueue = $this->defaultQueue();
+            $physicalQueue = $this->registry->physicalQueue($logicalQueue);
+            $this->channelManager
+                ->topologyChannel($this->brokerConnection())
+                ->queue_declare($physicalQueue, true, false, false, false);
 
             return [
-                'healthy' => false,
-                'message' => 'Connection established but not connected',
+                'healthy' => true,
+                'message' => "Broker operation succeeded for queue [{$logicalQueue}]",
             ];
-        } catch (ConnectionException|AMQPIOException|AMQPConnectionClosedException $e) {
+        } catch (Throwable $e) {
             Log::error('RabbitMQ health check failed', [
                 'error' => $e->getMessage(),
                 'exception_class' => get_class($e),
@@ -88,21 +84,7 @@ class HealthCheck
      */
     public function ping(): bool
     {
-        try {
-            $connected = $this->connectionManager->connection()->isConnected();
-
-            if (! $connected) {
-                Log::error('RabbitMQ ping: connection not connected');
-            }
-
-            return $connected;
-        } catch (ConnectionException|AMQPIOException|AMQPConnectionClosedException $e) {
-            Log::error('RabbitMQ ping failed', [
-                'error' => $e->getMessage(),
-            ]);
-
-            return false;
-        }
+        return $this->checkConnection()['healthy'];
     }
 
     /**
@@ -155,5 +137,17 @@ class HealthCheck
     public function readiness(): bool
     {
         return $this->ping();
+    }
+
+    protected function brokerConnection(): string
+    {
+        return (string) ($this->config['connection'] ?? $this->config['default'] ?? 'default');
+    }
+
+    protected function defaultQueue(): string
+    {
+        $queue = $this->config['queue'] ?? 'default';
+
+        return is_array($queue) ? (string) ($queue['default'] ?? 'default') : (string) $queue;
     }
 }

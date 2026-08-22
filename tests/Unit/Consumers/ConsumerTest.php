@@ -2,367 +2,244 @@
 
 declare(strict_types=1);
 
-use Illuminate\Container\Container;
 use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Events\Dispatcher;
+use Illuminate\Contracts\Queue\Job as QueueJobContract;
+use Illuminate\Queue\Jobs\Job;
+use Illuminate\Queue\QueueManager;
+use Illuminate\Queue\WorkerOptions;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Consumers\Consumer;
-use Lettermint\RabbitMQ\Discovery\AttributeScanner;
+use Lettermint\RabbitMQ\Consumers\RabbitMQWorker;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
-use Lettermint\RabbitMQ\Queue\RabbitMQJob;
-use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
+use Lettermint\RabbitMQ\Exceptions\PublishException;
 use Mockery\MockInterface;
 use PhpAmqpLib\Exception\AMQPIOException;
 use PhpAmqpLib\Exception\AMQPTimeoutException;
-use PhpAmqpLib\Message\AMQPMessage;
-use PhpAmqpLib\Wire\AMQPTable;
 
 /**
- * A Consumer subclass that exposes failure handling for tests.
+ * @return array{0: Consumer, 1: MockInterface, 2: MockInterface}
  */
-class RetryProbeConsumer extends Consumer
+function makeConsumerForTest(): array
 {
-    public function callHandleJobException(RabbitMQJob $job, Throwable $e): void
-    {
-        $this->handleJobException($job, $e);
-    }
-}
+    config()->set('rabbitmq.recovery.max_attempts', 0);
 
-/**
- * Build a retry consumer with a real queue over a mock AMQP channel.
- *
- * @return array{0: RetryProbeConsumer, 1: MockInterface, 2: RabbitMQQueue}
- */
-function makeRetryConsumer(MockInterface $scanner): array
-{
-    $connection = mockAMQPConnection(heartbeat: 0);
-    $channel = mockAMQPChannel($connection);
+    $channel = mockAMQPChannel();
+    $channel->shouldReceive('wait')->andThrow(new AMQPTimeoutException('empty'));
 
     $channelManager = Mockery::mock(ChannelManager::class);
-    $channelManager->shouldReceive('consumeChannel')->andReturn($channel);
-    $channelManager->shouldReceive('publishChannel')->andReturn($channel);
-    $channelManager->shouldReceive('getConnection')->andReturn($connection);
+    $channelManager->shouldReceive('consumeChannel')->with('broker')->andReturn($channel)->byDefault();
+    $channelManager->shouldReceive('closeChannel')->with('consume', 'broker')->andReturnNull()->byDefault();
 
-    $rabbitmq = new RabbitMQQueue($channelManager, $scanner, []);
-    $rabbitmq->setContainer(new Container);
+    $queue = testRabbitMQQueue($channelManager, [
+        'connection' => 'broker',
+        'strict_topology' => false,
+    ]);
+
+    $queueManager = Mockery::mock(QueueManager::class);
+    $queueManager->shouldReceive('connection')->with('rabbitmq-native')->andReturn($queue)->byDefault();
 
     $events = Mockery::mock(Dispatcher::class);
-    $events->shouldReceive('dispatch')->andReturnNull();
-
+    $events->shouldReceive('dispatch')->andReturnNull()->byDefault();
     $exceptions = Mockery::mock(ExceptionHandler::class);
-    $exceptions->shouldReceive('report')->andReturnNull();
+    $exceptions->shouldReceive('report')->andReturnNull()->byDefault();
 
-    $consumer = new RetryProbeConsumer($channelManager, $scanner, $rabbitmq, $exceptions, $events);
-
-    return [$consumer, $channel, $rabbitmq];
-}
-
-/**
- * Wrap a mock message as a RabbitMQ job.
- */
-function retryJob(RabbitMQQueue $rabbitmq, MockInterface $channel, MockInterface $message, string $queue): RabbitMQJob
-{
-    return new RabbitMQJob(new Container, $rabbitmq, $channel, $message, 'rabbitmq', $queue);
-}
-
-/**
- * Build a consumer with a channel that reports an empty queue set.
- *
- * @return array{0: Consumer, 1: MockInterface}
- */
-function makeMultiQueueConsumer(): array
-{
-    $connection = mockAMQPConnection(heartbeat: 0);
-    $channel = mockAMQPChannel($connection);
-    $channel->shouldReceive('wait')->andThrow(new AMQPTimeoutException('timeout'));
-
-    $channelManager = Mockery::mock(ChannelManager::class);
-    $channelManager->shouldReceive('consumeChannel')->with('rabbitmq')->andReturn($channel);
-    $channelManager->shouldReceive('getConnection')->with('rabbitmq')->andReturn($connection);
-    $channelManager->shouldReceive('closeChannel')->with('consume', 'rabbitmq')->andReturnNull()->byDefault();
-
-    $events = Mockery::mock(Dispatcher::class);
-    $events->shouldReceive('dispatch')->andReturnNull();
-
-    $consumer = new Consumer(
-        $channelManager,
-        Mockery::mock(AttributeScanner::class),
-        Mockery::mock(RabbitMQQueue::class),
-        Mockery::mock(ExceptionHandler::class),
+    $worker = new RabbitMQWorker(
+        $queueManager,
         $events,
+        $exceptions,
+        fn (): bool => false,
+        fn (): null => null,
     );
 
-    return [$consumer, $channel];
+    return [
+        new Consumer($channelManager, $queueManager, $worker),
+        $channel,
+        $channelManager,
+    ];
 }
 
-describe('failure handling', function () {
-    it('publishes an intentional retry with the next package attempt', function () {
-        $scanner = Mockery::mock(AttributeScanner::class);
-        $scanner->shouldReceive('getQueueForJob')->andReturnNull();
-        $scanner->shouldReceive('getQueues')->andReturn(collect([]));
+test('rejects an empty queue list', function () {
+    [$consumer] = makeConsumerForTest();
 
-        [$consumer, $channel, $rabbitmq] = makeRetryConsumer($scanner);
-
-        $message = mockAMQPMessage(['deliveryTag' => 7, 'headers' => []]);
-
-        $channel->shouldReceive('basic_publish')
-            ->once()
-            ->withArgs(function (AMQPMessage $published): bool {
-                $headers = $published->get('application_headers');
-
-                return $headers instanceof AMQPTable
-                    && $headers->getNativeData()[RabbitMQJob::ATTEMPT_HEADER] === 2;
-            });
-        $channel->shouldReceive('basic_ack')->once()->with(7);
-        $channel->shouldNotReceive('basic_reject');
-        $channel->shouldNotReceive('tx_select');
-
-        $consumer->callHandleJobException(
-            retryJob($rabbitmq, $channel, $message, 'events:ordered'),
-            new RuntimeException('transient failure'),
-        );
-
-        expect(true)->toBeTrue();
-    });
-
-    it('does not treat broker redelivery after a crash as an application retry', function () {
-        $scanner = Mockery::mock(AttributeScanner::class);
-        $scanner->shouldReceive('getQueueForJob')->andReturnNull();
-        $scanner->shouldReceive('getQueues')->andReturn(collect([]));
-
-        [$consumer, $channel, $rabbitmq] = makeRetryConsumer($scanner);
-
-        $message = mockAMQPMessage([
-            'deliveryTag' => 9,
-            'headers' => ['x-delivery-count' => 12],
-        ]);
-
-        $channel->shouldReceive('basic_publish')->once();
-        $channel->shouldReceive('basic_ack')->once()->with(9);
-        $channel->shouldNotReceive('basic_reject');
-
-        $consumer->callHandleJobException(
-            retryJob($rabbitmq, $channel, $message, 'events:ordered'),
-            new RuntimeException('transient failure'),
-        );
-
-        expect(true)->toBeTrue();
-    });
-
-    it('dead-letters a job that reaches the application tries limit', function () {
-        $scanner = Mockery::mock(AttributeScanner::class);
-
-        [$consumer, $channel, $rabbitmq] = makeRetryConsumer($scanner);
-
-        $message = mockAMQPMessage([
-            'deliveryTag' => 5,
-            'headers' => [RabbitMQJob::ATTEMPT_HEADER => 3],
-        ]);
-
-        $channel->shouldReceive('basic_reject')->once()->with(5, false)->andReturnNull();
-        $channel->shouldNotReceive('basic_publish');
-
-        $consumer->callHandleJobException(
-            retryJob($rabbitmq, $channel, $message, 'events:ordered'),
-            new RuntimeException('poison'),
-        );
-
-        expect(true)->toBeTrue();
-    });
+    expect(fn () => $consumer->setQueues([]))
+        ->toThrow(InvalidArgumentException::class, 'At least one');
 });
 
-describe('multi-queue consumption', function () {
-    it('closes the selected consume channel when QoS setup fails', function () {
-        $channel = mockAMQPChannel();
-        $channel->shouldReceive('basic_qos')
-            ->once()
-            ->andThrow(new AMQPIOException('qos failed'));
+test('rejects blank and duplicate queue names', function (array $queues, string $message) {
+    [$consumer] = makeConsumerForTest();
 
-        $channelManager = Mockery::mock(ChannelManager::class);
-        $channelManager->shouldReceive('consumeChannel')->with('custom')->once()->andReturn($channel);
-        $channelManager->shouldReceive('closeChannel')->with('consume', 'custom')->once();
-        $channelManager->shouldNotReceive('getConnection');
+    expect(fn () => $consumer->setQueues($queues))
+        ->toThrow(InvalidArgumentException::class, $message);
+})->with([
+    'blank' => [['queue-a', '  '], 'non-empty'],
+    'duplicate' => [['queue-a', 'queue-a'], 'unique'],
+]);
 
-        $consumer = new Consumer(
-            $channelManager,
-            Mockery::mock(AttributeScanner::class),
-            Mockery::mock(RabbitMQQueue::class),
-            Mockery::mock(ExceptionHandler::class),
-            Mockery::mock(Dispatcher::class),
-        );
+test('rejects invalid worker settings', function (string $method, int|float $value, string $message) {
+    [$consumer] = makeConsumerForTest();
 
-        expect(fn () => $consumer->setConnection('custom')->consume())
-            ->toThrow(ConnectionException::class, 'qos failed');
-    });
+    expect(fn () => $consumer->{$method}($value))
+        ->toThrow(InvalidArgumentException::class, $message);
+})->with([
+    'prefetch' => ['setPrefetch', 0, 'prefetch'],
+    'job timeout' => ['setTimeout', 0, 'job timeout'],
+    'wait timeout' => ['setWaitTimeout', 0.0, 'wait timeout'],
+    'memory' => ['setMaxMemory', 0, 'memory limit'],
+]);
 
-    it('closes the selected consume channel when connection lookup fails', function () {
-        $channel = mockAMQPChannel();
-        $channelManager = Mockery::mock(ChannelManager::class);
-        $channelManager->shouldReceive('consumeChannel')->with('custom')->once()->andReturn($channel);
-        $channelManager->shouldReceive('getConnection')
-            ->with('custom')
-            ->once()
-            ->andThrow(new ConnectionException('connection failed'));
-        $channelManager->shouldReceive('closeChannel')->with('consume', 'custom')->once();
+test('registers one broker consumer for each logical queue', function () {
+    [$consumer, $channel] = makeConsumerForTest();
 
-        $consumer = new Consumer(
-            $channelManager,
-            Mockery::mock(AttributeScanner::class),
-            Mockery::mock(RabbitMQQueue::class),
-            Mockery::mock(ExceptionHandler::class),
-            Mockery::mock(Dispatcher::class),
-        );
+    $channel->shouldReceive('basic_qos')->once()->with(0, 2, false);
+    $channel->shouldReceive('basic_consume')
+        ->once()
+        ->withArgs(fn (string $queue): bool => $queue === 'queue-a')
+        ->andReturn('tag-a');
+    $channel->shouldReceive('basic_consume')
+        ->once()
+        ->withArgs(fn (string $queue): bool => $queue === 'queue-b')
+        ->andReturn('tag-b');
 
-        expect(fn () => $consumer->setConnection('custom')->consume())
-            ->toThrow(ConnectionException::class, 'connection failed');
-    });
+    $consumer->setConnection('rabbitmq-native')
+        ->setQueues(['queue-a', 'queue-b'])
+        ->setPrefetch(2)
+        ->setStopWhenEmpty(true)
+        ->consume();
+});
 
-    it('rejects an empty queue list', function () {
-        $consumer = new Consumer(
-            Mockery::mock(ChannelManager::class),
-            Mockery::mock(AttributeScanner::class),
-            Mockery::mock(RabbitMQQueue::class),
-            Mockery::mock(ExceptionHandler::class),
-            Mockery::mock(Dispatcher::class),
-        );
+test('uses the configured physical queue names', function () {
+    [$consumer, $channel] = makeConsumerForTest();
 
-        expect(fn () => $consumer->setQueues([]))
-            ->toThrow(InvalidArgumentException::class, 'At least one');
-    });
-
-    it('rejects blank and duplicate queue names', function (array $queues, string $message) {
-        $consumer = new Consumer(
-            Mockery::mock(ChannelManager::class),
-            Mockery::mock(AttributeScanner::class),
-            Mockery::mock(RabbitMQQueue::class),
-            Mockery::mock(ExceptionHandler::class),
-            Mockery::mock(Dispatcher::class),
-        );
-
-        expect(fn () => $consumer->setQueues($queues))
-            ->toThrow(InvalidArgumentException::class, $message);
-    })->with([
-        'blank' => [['queue-a', '  '], 'non-empty'],
-        'duplicate' => [['queue-a', 'queue-a'], 'unique'],
+    $channelManager = Mockery::mock(ChannelManager::class);
+    $channelManager->shouldReceive('consumeChannel')->with('broker')->andReturn($channel);
+    $channelManager->shouldReceive('closeChannel')->andReturnNull();
+    $queue = testRabbitMQQueue($channelManager, [
+        'connection' => 'broker',
+        'physical_prefix' => 'staging.',
+        'strict_topology' => false,
     ]);
+    $queueManager = Mockery::mock(QueueManager::class);
+    $queueManager->shouldReceive('connection')->with('rabbitmq-native')->andReturn($queue);
+    $worker = app(RabbitMQWorker::class);
+    $consumer = new Consumer($channelManager, $queueManager, $worker);
 
-    it('rejects invalid QoS and wait values', function (string $method, int $value, string $message) {
-        $consumer = new Consumer(
-            Mockery::mock(ChannelManager::class),
-            Mockery::mock(AttributeScanner::class),
-            Mockery::mock(RabbitMQQueue::class),
-            Mockery::mock(ExceptionHandler::class),
-            Mockery::mock(Dispatcher::class),
-        );
+    $channel->shouldReceive('basic_consume')
+        ->once()
+        ->withArgs(fn (string $queue): bool => $queue === 'staging.default')
+        ->andReturn('tag');
 
-        expect(fn () => $consumer->{$method}($value))
-            ->toThrow(InvalidArgumentException::class, $message);
-    })->with([
-        'prefetch' => ['setPrefetch', 0, 'prefetch'],
-        'timeout' => ['setTimeout', 0, 'wait timeout'],
-    ]);
+    $consumer->setConnection('rabbitmq-native')->setQueue('default')->setStopWhenEmpty(true)->consume();
+});
 
-    it('registers one consumer per queue', function () {
-        [$consumer, $channel] = makeMultiQueueConsumer();
+test('cancels all registered consumers during shutdown', function () {
+    [$consumer, $channel] = makeConsumerForTest();
 
-        $channel->shouldReceive('basic_qos')->once()->with(0, 2, false);
+    $channel->shouldReceive('basic_consume')->andReturn('tag-a', 'tag-b');
+    $channel->shouldReceive('basic_cancel')->once()->with('tag-a');
+    $channel->shouldReceive('basic_cancel')->once()->with('tag-b');
 
-        $channel->shouldReceive('basic_consume')
-            ->withArgs(fn ($queue) => $queue === 'queue-a')
-            ->once()
-            ->andReturn('tag-a');
-        $channel->shouldReceive('basic_consume')
-            ->withArgs(fn ($queue) => $queue === 'queue-b')
-            ->once()
-            ->andReturn('tag-b');
+    $consumer->setConnection('rabbitmq-native')
+        ->setQueues(['queue-a', 'queue-b'])
+        ->setStopWhenEmpty(true)
+        ->consume();
+});
 
-        $consumer->setQueues(['queue-a', 'queue-b'])
-            ->setPrefetch(2)
-            ->setStopWhenEmpty(true)
-            ->consume();
+test('closes the consume channel when QoS setup fails', function () {
+    [$consumer, $channel, $channelManager] = makeConsumerForTest();
+    $channel->shouldReceive('basic_qos')->once()->andThrow(new AMQPIOException('qos failed'));
+    $channelManager->shouldReceive('closeChannel')->with('consume', 'broker')->atLeast()->once();
 
-        expect(true)->toBeTrue();
-    });
+    expect(fn () => $consumer->setConnection('rabbitmq-native')->consume())
+        ->toThrow(ConnectionException::class, 'qos failed');
+});
 
-    it('cancels every registered consumer on cleanup', function () {
-        [$consumer, $channel] = makeMultiQueueConsumer();
+test('recovers a connection and rebuilds the consume channel', function () {
+    config()->set('rabbitmq.recovery.max_attempts', 1);
 
-        $channel->shouldReceive('basic_consume')->andReturn('tag-a', 'tag-b');
-        $channel->shouldReceive('basic_cancel')->with('tag-a')->once();
-        $channel->shouldReceive('basic_cancel')->with('tag-b')->once();
+    $workingChannel = mockAMQPChannel();
+    $workingChannel->shouldReceive('wait')->andThrow(new AMQPTimeoutException('empty'));
+    $channelManager = Mockery::mock(ChannelManager::class);
+    $channelManager->shouldReceive('consumeChannel')
+        ->with('broker')
+        ->once()
+        ->andThrow(new AMQPIOException('connection lost'));
+    $channelManager->shouldReceive('consumeChannel')
+        ->with('broker')
+        ->once()
+        ->andReturn($workingChannel);
+    $channelManager->shouldReceive('recoverConnection')->once()->with('broker', 1);
+    $channelManager->shouldReceive('closeChannel')->andReturnNull()->byDefault();
 
-        $consumer->setQueues(['queue-a', 'queue-b'])
-            ->setStopWhenEmpty(true)
-            ->consume();
+    $queue = testRabbitMQQueue($channelManager, ['connection' => 'broker']);
+    $queueManager = Mockery::mock(QueueManager::class);
+    $queueManager->shouldReceive('connection')->with('rabbitmq-native')->andReturn($queue);
+    $events = Mockery::mock(Dispatcher::class);
+    $events->shouldReceive('dispatch')->andReturnNull()->byDefault();
+    $exceptions = Mockery::mock(ExceptionHandler::class);
+    $exceptions->shouldReceive('report')->andReturnNull()->byDefault();
+    $worker = new RabbitMQWorker($queueManager, $events, $exceptions, fn (): bool => false, fn (): null => null);
 
-        expect(true)->toBeTrue();
-    });
+    (new Consumer($channelManager, $queueManager, $worker))
+        ->setConnection('rabbitmq-native')
+        ->setStopWhenEmpty(true)
+        ->consume();
+});
 
-    it('cancels a registered consumer when a later registration fails', function () {
-        [$consumer, $channel] = makeMultiQueueConsumer();
+test('rejects a Laravel connection that does not use this driver', function () {
+    [$consumer] = makeConsumerForTest();
+    $queueManager = Mockery::mock(QueueManager::class);
+    $queueManager->shouldReceive('connection')->with('other')->andReturn(new stdClass);
 
-        $channel->shouldReceive('basic_consume')
-            ->withArgs(fn ($queue) => $queue === 'queue-a')
-            ->once()
-            ->andReturn('tag-a');
-        $channel->shouldReceive('basic_consume')
-            ->withArgs(fn ($queue) => $queue === 'queue-b')
-            ->once()
-            ->andThrow(new AMQPIOException('registration failed'));
-        $channel->shouldReceive('basic_cancel')->with('tag-a')->once();
+    $reflection = new ReflectionClass($consumer);
+    $property = $reflection->getProperty('queueManager');
+    $property->setValue($consumer, $queueManager);
 
-        expect(fn () => $consumer->setQueues(['queue-a', 'queue-b'])->consume())
-            ->toThrow(ConnectionException::class, 'registration failed');
-    });
+    expect(fn () => $consumer->setConnection('other')->consume())
+        ->toThrow(InvalidArgumentException::class, 'does not use');
+});
 
-    it('clears consumer tags before the consumer is used again', function () {
-        [$consumer, $channel] = makeMultiQueueConsumer();
-
-        $channel->shouldReceive('basic_consume')->andReturn('tag-a', 'tag-b');
-        $channel->shouldReceive('basic_cancel')->with('tag-a')->once();
-        $channel->shouldReceive('basic_cancel')->with('tag-b')->once();
-
-        $consumer->setQueue('queue-a')->setStopWhenEmpty(true)->consume();
-        $consumer->setQueue('queue-b')->setStopWhenEmpty(true)->consume();
-
-        expect(true)->toBeTrue();
-    });
-
-    it('still supports a single queue through setQueue', function () {
-        [$consumer, $channel] = makeMultiQueueConsumer();
-
-        $channel->shouldReceive('basic_consume')
-            ->withArgs(fn ($queue) => $queue === 'solo')
-            ->once()
-            ->andReturn('tag-solo');
-
-        $consumer->setQueue('solo')
-            ->setStopWhenEmpty(true)
-            ->consume();
-
-        expect(true)->toBeTrue();
-    });
-
-    it('tags each job with its source queue', function () {
-        $consumer = new class(Mockery::mock(ChannelManager::class), Mockery::mock(AttributeScanner::class), Mockery::mock(RabbitMQQueue::class), Mockery::mock(ExceptionHandler::class), Mockery::mock(Dispatcher::class)) extends Consumer
+test('does not hide a failed replacement publish', function () {
+    $queueManager = Mockery::mock(QueueManager::class);
+    $events = Mockery::mock(Dispatcher::class);
+    $events->shouldReceive('dispatch')->andReturnNull()->byDefault();
+    $exceptions = Mockery::mock(ExceptionHandler::class);
+    $exceptions->shouldNotReceive('report');
+    $worker = new RabbitMQWorker(
+        $queueManager,
+        $events,
+        $exceptions,
+        fn (): bool => false,
+        fn (): null => null,
+    );
+    $job = new class extends Job implements QueueJobContract
+    {
+        public function getJobId(): string
         {
-            /** @var list<string> */
-            public array $handledQueues = [];
+            return 'job-1';
+        }
 
-            public function dispatchTo(AMQPMessage $message, string $queue): void
-            {
-                $this->handleMessage($message, $queue);
-            }
+        public function getRawBody(): string
+        {
+            return '{"uuid":"job-1","job":"Example@handle","data":{}}';
+        }
 
-            protected function processJob(RabbitMQJob $job): void
-            {
-                $this->handledQueues[] = $job->getQueue();
-            }
-        };
+        public function attempts(): int
+        {
+            return 1;
+        }
 
-        $consumer->dispatchTo(mockAMQPMessage(), 'queue-b');
-        $consumer->dispatchTo(mockAMQPMessage(), 'queue-a');
+        public function fire(): void
+        {
+            throw new RuntimeException('job failed');
+        }
 
-        expect($consumer->handledQueues)->toBe(['queue-b', 'queue-a']);
-    });
+        public function release($delay = 0): void
+        {
+            throw new PublishException('replacement publish failed');
+        }
+    };
+
+    expect(fn () => $worker->processMessage($job, 'rabbitmq-native', new WorkerOptions(maxTries: 0)))
+        ->toThrow(PublishException::class, 'replacement publish failed');
 });

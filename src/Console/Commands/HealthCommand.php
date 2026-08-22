@@ -13,10 +13,9 @@ use Lettermint\RabbitMQ\Monitoring\HealthCheck;
 class HealthCommand extends Command
 {
     protected $signature = 'rabbitmq:health
-        {--consumer : Check consumer-specific health}
         {--json : Output as JSON}';
 
-    protected $description = 'Check RabbitMQ connection and cluster health';
+    protected $description = 'Check RabbitMQ access with a broker operation';
 
     public function handle(HealthCheck $healthCheck): int
     {
@@ -32,7 +31,7 @@ class HealthCommand extends Command
         $this->newLine();
 
         foreach ($results['checks'] as $check => $status) {
-            $icon = $status['healthy'] ? '<fg=green>✓</>' : '<fg=red>✗</>';
+            $icon = $status['healthy'] ? '<fg=green>OK</>' : '<fg=red>FAILED</>';
             $message = $status['message'];
 
             $this->line("  {$icon} {$check}: {$message}");

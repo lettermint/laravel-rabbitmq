@@ -4,15 +4,19 @@ declare(strict_types=1);
 
 namespace Lettermint\RabbitMQ\Actions\Dlq;
 
+use Illuminate\Contracts\Events\Dispatcher;
 use Lettermint\RabbitMQ\Actions\Dlq\Results\DlqMessageData;
 use Lettermint\RabbitMQ\Actions\Dlq\Results\DlqQueueConfig;
 use Lettermint\RabbitMQ\Actions\Dlq\Results\DlqReplayResult;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
+use Lettermint\RabbitMQ\Events\DlqMessageReplayed;
 use Lettermint\RabbitMQ\Exceptions\DlqOperationException;
+use Lettermint\RabbitMQ\Queue\RabbitMQJob;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Message\AMQPMessage;
 use PhpAmqpLib\Wire\AMQPTable;
+use Throwable;
 
 /**
  * Replay messages from a DLQ back to the original queue.
@@ -26,6 +30,7 @@ final class ReplayDlqMessages
         private ResolveDlqQueue $resolveDlqQueue,
         private FindDlqMessage $findDlqMessage,
         private RabbitMQQueue $rabbitmq,
+        private Dispatcher $events,
     ) {}
 
     /**
@@ -59,7 +64,10 @@ final class ReplayDlqMessages
     public function getQueueMessageCount(string $queueName): int
     {
         $config = ($this->resolveDlqQueue)($queueName);
-        $channel = $this->channelManager->channel('dlq-count');
+        $channel = $this->channelManager->channel(
+            'dlq-count',
+            $this->rabbitmq->getBrokerConnectionName(),
+        );
 
         try {
             [$name, $messageCount, $consumerCount] = $channel->queue_declare(
@@ -72,7 +80,10 @@ final class ReplayDlqMessages
 
             return $messageCount;
         } catch (\Exception $e) {
-            return 0;
+            throw DlqOperationException::connectionFailed(
+                "Failed to read DLQ [{$config->dlqQueueName}]: {$e->getMessage()}",
+                $e,
+            );
         }
     }
 
@@ -81,7 +92,10 @@ final class ReplayDlqMessages
         string $messageId,
         bool $dryRun,
     ): DlqReplayResult {
-        $channel = $this->channelManager->channel('dlq-replay');
+        $channel = $this->channelManager->channel(
+            'dlq-replay',
+            $this->rabbitmq->getBrokerConnectionName(),
+        );
 
         $result = ($this->findDlqMessage)(
             dlqName: $config->dlqQueueName,
@@ -117,11 +131,7 @@ final class ReplayDlqMessages
         }
 
         try {
-            $channel->tx_select();
-            $preparedPayload = $this->preparePayloadForReplay($result['target']);
-            $this->rabbitmq->pushRaw($preparedPayload, $config->originalQueueName);
-            $channel->basic_ack($result['target']->getDeliveryTag());
-            $channel->tx_commit();
+            $this->replayMessage($channel, $config, $result['target'], $messageData);
 
             return new DlqReplayResult(
                 replayedCount: 1,
@@ -129,16 +139,10 @@ final class ReplayDlqMessages
                 wasDryRun: false,
                 replayedMessages: [$messageData],
             );
-        } catch (\Exception $e) {
-            try {
-                $channel->tx_rollback();
-            } catch (\Exception $rollbackException) {
-                // Channel may be closed
-            }
-
+        } catch (Throwable $e) {
             try {
                 $channel->basic_reject($result['target']->getDeliveryTag(), true);
-            } catch (\Exception $rejectException) {
+            } catch (Throwable) {
                 // Message will be requeued automatically when channel closes
             }
 
@@ -162,7 +166,10 @@ final class ReplayDlqMessages
         bool $dryRun,
         ?callable $onProgress,
     ): DlqReplayResult {
-        $channel = $this->channelManager->channel('dlq-replay');
+        $channel = $this->channelManager->channel(
+            'dlq-replay',
+            $this->rabbitmq->getBrokerConnectionName(),
+        );
 
         // For dry-run, use "fetch all, then reject all" pattern
         if ($dryRun) {
@@ -194,11 +201,7 @@ final class ReplayDlqMessages
             $messageData = DlqMessageData::fromAmqpMessage($message);
 
             try {
-                $channel->tx_select();
-                $preparedPayload = $this->preparePayloadForReplay($message);
-                $this->rabbitmq->pushRaw($preparedPayload, $config->originalQueueName);
-                $channel->basic_ack($message->getDeliveryTag());
-                $channel->tx_commit();
+                $this->replayMessage($channel, $config, $message, $messageData);
 
                 $replayed++;
                 $replayedMessages[] = $messageData;
@@ -206,13 +209,7 @@ final class ReplayDlqMessages
                 if ($onProgress !== null) {
                     $onProgress($messageData, true, null);
                 }
-            } catch (\Exception $e) {
-                try {
-                    $channel->tx_rollback();
-                } catch (\Exception $rollbackException) {
-                    $channel = $this->channelManager->channel('dlq-replay');
-                }
-
+            } catch (Throwable $e) {
                 $failed++;
                 $failures[] = ['message' => $messageData, 'error' => $e->getMessage()];
 
@@ -222,9 +219,11 @@ final class ReplayDlqMessages
 
                 try {
                     $channel->basic_reject($message->getDeliveryTag(), true);
-                } catch (\Exception $rejectException) {
+                } catch (Throwable) {
                     // Message will be requeued automatically when channel closes
                 }
+
+                break;
             }
 
             // Apply rate limiting
@@ -287,45 +286,44 @@ final class ReplayDlqMessages
         );
     }
 
-    private function preparePayloadForReplay(AMQPMessage $message): string
-    {
-        $payload = json_decode($message->getBody(), true) ?? [];
-        $currentAttempts = $this->getAttemptsFromMessage($message);
+    private function replayMessage(
+        AMQPChannel $channel,
+        DlqQueueConfig $config,
+        AMQPMessage $message,
+        DlqMessageData $messageData,
+    ): void {
+        $properties = $message->get_properties();
+        $headers = $properties['application_headers'] ?? null;
+        $headers = $headers instanceof AMQPTable ? $headers->getNativeData() : [];
 
-        // Increment attempts for the upcoming retry
-        $payload['attempts'] = $currentAttempts + 1;
-
-        return json_encode($payload, JSON_THROW_ON_ERROR);
-    }
-
-    private function getAttemptsFromMessage(AMQPMessage $message): int
-    {
-        $payload = json_decode($message->getBody(), true) ?? [];
-
-        // Check payload first (for previously replayed messages)
-        if (isset($payload['attempts']) && is_int($payload['attempts'])) {
-            return $payload['attempts'];
-        }
-
-        // Fall back to x-death headers
-        $headers = $message->has('application_headers')
-            ? $message->get('application_headers')
-            : null;
-
-        if ($headers instanceof AMQPTable) {
-            $nativeHeaders = $headers->getNativeData();
-
-            if (isset($nativeHeaders['x-death']) && is_array($nativeHeaders['x-death'])) {
-                $totalCount = 0;
-                foreach ($nativeHeaders['x-death'] as $death) {
-                    $deathData = $death instanceof AMQPTable ? $death->getNativeData() : $death;
-                    $totalCount += (int) ($deathData['count'] ?? 0);
-                }
-
-                return $totalCount + 1;
+        foreach (array_keys($headers) as $name) {
+            if ($name === 'x-delivery-count' || str_starts_with($name, 'x-death') || str_starts_with($name, 'x-first-death') || str_starts_with($name, 'x-last-death')) {
+                unset($headers[$name]);
             }
         }
 
-        return 1;
+        // An operator replay starts a new Laravel attempt sequence. Keeping the
+        // exhausted attempt count would make Laravel fail the replay at once.
+        $attempt = 1;
+        $headers[RabbitMQJob::ATTEMPT_HEADER] = $attempt;
+        $properties['application_headers'] = new AMQPTable($headers);
+
+        $this->rabbitmq->pushRaw(
+            $message->getBody(),
+            $config->originalQueueName,
+            ['properties' => $properties],
+        );
+        $channel->basic_ack($message->getDeliveryTag());
+
+        try {
+            $this->events->dispatch(new DlqMessageReplayed(
+                queue: $config->originalQueueName,
+                jobId: $messageData->id,
+                jobName: $messageData->jobClass,
+                attempt: $attempt,
+            ));
+        } catch (Throwable $exception) {
+            report($exception);
+        }
     }
 }

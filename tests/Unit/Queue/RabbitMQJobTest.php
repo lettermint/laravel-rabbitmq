@@ -5,10 +5,12 @@ declare(strict_types=1);
 use Illuminate\Container\Container;
 use Illuminate\Support\Facades\Log;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
-use Lettermint\RabbitMQ\Discovery\AttributeScanner;
+use Lettermint\RabbitMQ\Exceptions\ConnectionException;
 use Lettermint\RabbitMQ\Exceptions\PublishException;
 use Lettermint\RabbitMQ\Queue\RabbitMQJob;
-use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
+use PhpAmqpLib\Exception\AMQPIOException;
+use PhpAmqpLib\Exception\AMQPTimeoutException;
+use PhpAmqpLib\Message\AMQPMessage;
 use PhpAmqpLib\Wire\AMQPTable;
 
 beforeEach(function () {
@@ -16,9 +18,7 @@ beforeEach(function () {
     $this->mockChannel = mockAMQPChannel();
 
     $channelManager = Mockery::mock(ChannelManager::class);
-    $scanner = Mockery::mock(AttributeScanner::class);
-
-    $this->rabbitmq = new RabbitMQQueue($channelManager, $scanner, []);
+    $this->rabbitmq = testRabbitMQQueue($channelManager);
     $this->rabbitmq->setContainer($this->container);
 });
 
@@ -193,33 +193,32 @@ test('release publishes the next attempt before it acknowledges the original mes
         ],
     ]);
 
-    $rabbitmq = Mockery::mock(RabbitMQQueue::class);
-    $rabbitmq->shouldReceive('pushRaw')
+    $publishChannel = mockAMQPChannel();
+    $channelManager = Mockery::mock(ChannelManager::class);
+    $channelManager->shouldReceive('topologyChannel')->with('default')->andReturn($publishChannel);
+    $channelManager->shouldReceive('publishChannel')->with('default')->andReturn($publishChannel);
+    $rabbitmq = testRabbitMQQueue($channelManager);
+    $publishChannel->shouldReceive('basic_publish')
         ->once()
         ->ordered()
-        ->withArgs(function (string $payload, string $queue, array $options): bool {
-            $properties = $options['properties'];
-            $headers = $properties['application_headers'];
+        ->withArgs(function (AMQPMessage $published, string $exchange, string $routingKey): bool {
+            $headers = $published->get('application_headers');
 
-            expect(json_decode($payload, true)['uuid'])->toBe('test-uuid')
-                ->and($queue)->toBe('test-queue')
-                ->and($options['delay'])->toBe(15)
-                ->and($properties['message_id'])->toBe('message-123')
-                ->and($properties['correlation_id'])->toBe('correlation-456')
-                ->and($properties['timestamp'])->toBe(123456789)
-                ->and($properties['priority'])->toBe(7)
+            expect(json_decode($published->getBody(), true)['uuid'])->toBe('test-uuid')
+                ->and($exchange)->toBe('')
+                ->and($routingKey)->toContain('delay:test-queue:15000:')
+                ->and($published->get('message_id'))->toBe('message-123')
+                ->and($published->get('correlation_id'))->toBe('correlation-456')
+                ->and($published->get('timestamp'))->toBe(123456789)
+                ->and($published->get('priority'))->toBe(7)
                 ->and($headers)->toBeInstanceOf(AMQPTable::class)
                 ->and($headers->getNativeData()['x-custom'])->toBe('keep-me')
                 ->and($headers->getNativeData()[RabbitMQJob::ATTEMPT_HEADER])->toBe(2)
                 ->and($headers->getNativeData())->not->toHaveKey('x-delivery-count');
 
             return true;
-        })
-        ->andReturn('test-uuid');
-    $rabbitmq->shouldReceive('ack')
-        ->once()
-        ->ordered()
-        ->with($message, $this->mockChannel);
+        });
+    $this->mockChannel->shouldReceive('basic_ack')->once()->ordered()->with(42);
 
     $job = new RabbitMQJob(
         $this->container,
@@ -239,12 +238,16 @@ test('release leaves the original unacknowledged when publish fails', function (
     Log::spy();
 
     $message = mockAMQPMessage(['deliveryTag' => 42]);
-    $rabbitmq = Mockery::mock(RabbitMQQueue::class);
-    $rabbitmq->shouldReceive('pushRaw')
+    $publishChannel = mockAMQPChannel();
+    $publishChannel->shouldReceive('wait_for_pending_acks_returns')
         ->once()
-        ->andThrow(new PublishException('publish failed'));
-    $rabbitmq->shouldNotReceive('ack');
-    $rabbitmq->shouldNotReceive('reject');
+        ->andThrow(new AMQPTimeoutException('publish failed'));
+    $channelManager = Mockery::mock(ChannelManager::class);
+    $channelManager->shouldReceive('publishChannel')->with('default')->andReturn($publishChannel);
+    $channelManager->shouldReceive('closeChannel')->once()->with('publish', 'default');
+    $rabbitmq = testRabbitMQQueue($channelManager);
+    $this->mockChannel->shouldNotReceive('basic_ack');
+    $this->mockChannel->shouldNotReceive('basic_reject');
 
     $job = new RabbitMQJob(
         $this->container,
@@ -256,10 +259,30 @@ test('release leaves the original unacknowledged when publish fails', function (
     );
 
     expect(fn () => $job->release(0))
-        ->toThrow(PublishException::class, 'publish failed');
+        ->toThrow(PublishException::class, 'result is uncertain');
 
     Log::shouldHaveReceived('critical')
         ->withArgs(fn (string $message): bool => str_contains($message, 'remains unacknowledged'));
+});
+
+test('propagates an acknowledgement failure after successful work', function () {
+    Log::spy();
+    $message = mockAMQPMessage(['deliveryTag' => 42]);
+    $this->mockChannel->shouldReceive('basic_ack')
+        ->once()
+        ->with(42)
+        ->andThrow(new AMQPIOException('ack failed'));
+    $job = new RabbitMQJob(
+        $this->container,
+        $this->rabbitmq,
+        $this->mockChannel,
+        $message,
+        'rabbitmq',
+        'test-queue',
+    );
+
+    expect(fn () => $job->delete())
+        ->toThrow(ConnectionException::class, 'acknowledge');
 });
 
 test('decodes payload correctly', function () {

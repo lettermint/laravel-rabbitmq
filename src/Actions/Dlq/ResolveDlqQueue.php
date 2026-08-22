@@ -5,8 +5,8 @@ declare(strict_types=1);
 namespace Lettermint\RabbitMQ\Actions\Dlq;
 
 use Lettermint\RabbitMQ\Actions\Dlq\Results\DlqQueueConfig;
-use Lettermint\RabbitMQ\Discovery\AttributeScanner;
 use Lettermint\RabbitMQ\Exceptions\DlqOperationException;
+use Lettermint\RabbitMQ\Topology\TopologyRegistry;
 
 /**
  * Resolve a queue name to its DLQ configuration.
@@ -14,7 +14,7 @@ use Lettermint\RabbitMQ\Exceptions\DlqOperationException;
 final class ResolveDlqQueue
 {
     public function __construct(
-        private AttributeScanner $scanner,
+        private TopologyRegistry $registry,
     ) {}
 
     /**
@@ -24,21 +24,29 @@ final class ResolveDlqQueue
      */
     public function __invoke(string $queueName): DlqQueueConfig
     {
-        $topology = $this->scanner->getTopology();
+        $topology = $this->registry->queues();
 
-        if (! isset($topology['queues'][$queueName])) {
+        if (! isset($topology[$queueName])) {
             throw DlqOperationException::queueNotFound(
                 $queueName,
-                array_keys($topology['queues']),
+                array_keys($topology),
             );
         }
 
-        $attribute = $topology['queues'][$queueName]['attribute'];
+        $definition = $topology[$queueName];
+
+        if (! $definition->deadLetterEnabled) {
+            throw new DlqOperationException(
+                "Queue '{$queueName}' does not have a dead-letter queue.",
+                queueName: $queueName,
+                availableQueues: array_keys($topology),
+            );
+        }
 
         return new DlqQueueConfig(
             originalQueueName: $queueName,
-            dlqQueueName: $attribute->getDlqQueueName(),
-            attribute: $attribute,
+            dlqQueueName: $definition->deadLetterQueue,
+            definition: $definition,
         );
     }
 }

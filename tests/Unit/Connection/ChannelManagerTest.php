@@ -144,6 +144,50 @@ test('provides publish channel', function () {
     expect($channel)->toBe($this->mockChannel);
 });
 
+test('enables publisher confirmations once for a shared publish channel', function () {
+    $this->mockChannel->shouldReceive('confirm_select')->once();
+    $channelManager = new class($this->connectionManager, $this->mockChannel) extends ChannelManager
+    {
+        public function __construct(ConnectionManager $connectionManager, private $mockChannel)
+        {
+            parent::__construct($connectionManager);
+        }
+
+        protected function createChannel(?string $connection = null): AMQPChannel
+        {
+            return $this->mockChannel;
+        }
+    };
+
+    expect($channelManager->publishChannel())->toBe($this->mockChannel)
+        ->and($channelManager->publishChannel())->toBe($this->mockChannel);
+});
+
+test('enables publisher confirmations on a replacement publish channel', function () {
+    $closedChannel = mockAMQPChannel();
+    $closedChannel->shouldReceive('is_open')->andReturn(false);
+    $closedChannel->shouldReceive('confirm_select')->once();
+    $replacementChannel = mockAMQPChannel();
+    $replacementChannel->shouldReceive('confirm_select')->once();
+    $channels = [$closedChannel, $replacementChannel];
+
+    $channelManager = new class($this->connectionManager, $channels) extends ChannelManager
+    {
+        public function __construct(ConnectionManager $connectionManager, private array $mockChannels)
+        {
+            parent::__construct($connectionManager);
+        }
+
+        protected function createChannel(?string $connection = null): AMQPChannel
+        {
+            return array_shift($this->mockChannels);
+        }
+    };
+
+    expect($channelManager->publishChannel())->toBe($closedChannel)
+        ->and($channelManager->publishChannel())->toBe($replacementChannel);
+});
+
 test('provides consume channel', function () {
     $channelManager = new class($this->connectionManager, $this->mockChannel) extends ChannelManager
     {
@@ -226,6 +270,80 @@ test('closes all channels', function () {
 
     // Just verify no exception
     expect(true)->toBeTrue();
+});
+
+test('closes channels when connection and purpose names contain colons', function () {
+    $firstChannel = mockAMQPChannel();
+    $secondChannel = mockAMQPChannel();
+    $firstChannel->shouldReceive('close')->once();
+    $secondChannel->shouldReceive('close')->once();
+    $channels = [$firstChannel, $secondChannel];
+
+    $channelManager = new class($this->connectionManager, $channels) extends ChannelManager
+    {
+        public function __construct(ConnectionManager $connectionManager, private array $mockChannels)
+        {
+            parent::__construct($connectionManager);
+        }
+
+        protected function createChannel(?string $connection = null): AMQPChannel
+        {
+            return array_shift($this->mockChannels);
+        }
+    };
+
+    $channelManager->channel('audit:queue:one', 'broker:primary');
+    $channelManager->channel('consume:two', 'broker:primary');
+    $channelManager->closeConnectionChannels('broker:primary');
+});
+
+test('only closes channels for the selected connection', function () {
+    $primaryChannel = mockAMQPChannel();
+    $secondaryChannel = mockAMQPChannel();
+    $primaryChannel->shouldReceive('close')->once();
+    $secondaryChannel->shouldNotReceive('close');
+    $channels = [$primaryChannel, $secondaryChannel];
+
+    $channelManager = new class($this->connectionManager, $channels) extends ChannelManager
+    {
+        public function __construct(ConnectionManager $connectionManager, private array $mockChannels)
+        {
+            parent::__construct($connectionManager);
+        }
+
+        protected function createChannel(?string $connection = null): AMQPChannel
+        {
+            return array_shift($this->mockChannels);
+        }
+    };
+
+    $channelManager->channel('publish', 'broker:primary');
+    $channelManager->channel('publish', 'broker:secondary');
+    $channelManager->closeConnectionChannels('broker:primary');
+
+    expect($channelManager->channel('publish', 'broker:secondary'))->toBe($secondaryChannel);
+});
+
+test('does not reuse a channel for ambiguous colon-separated names', function () {
+    $firstChannel = mockAMQPChannel();
+    $secondChannel = mockAMQPChannel();
+    $channels = [$firstChannel, $secondChannel];
+
+    $channelManager = new class($this->connectionManager, $channels) extends ChannelManager
+    {
+        public function __construct(ConnectionManager $connectionManager, private array $mockChannels)
+        {
+            parent::__construct($connectionManager);
+        }
+
+        protected function createChannel(?string $connection = null): AMQPChannel
+        {
+            return array_shift($this->mockChannels);
+        }
+    };
+
+    expect($channelManager->channel('c', 'a:b'))->toBe($firstChannel)
+        ->and($channelManager->channel('b:c', 'a'))->toBe($secondChannel);
 });
 
 test('provides access to underlying connection', function () {

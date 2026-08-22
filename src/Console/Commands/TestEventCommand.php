@@ -5,222 +5,141 @@ declare(strict_types=1);
 namespace Lettermint\RabbitMQ\Console\Commands;
 
 use Illuminate\Console\Command;
+use Illuminate\Queue\QueueManager;
 use Illuminate\Support\Str;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
-use Lettermint\RabbitMQ\Exceptions\ConnectionException;
+use Lettermint\RabbitMQ\Diagnostics\QueueProbeJob;
+use Lettermint\RabbitMQ\Exceptions\PublishException;
+use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
 use PhpAmqpLib\Message\AMQPMessage;
+use Throwable;
 
-/**
- * Artisan command to send a test event to RabbitMQ.
- *
- * This command is useful for verifying RabbitMQ connectivity and
- * testing the publish/consume flow manually.
- */
-class TestEventCommand extends Command
+final class TestEventCommand extends Command
 {
     protected $signature = 'rabbitmq:test-event
-        {queue=test-events : The queue to publish the test event to}
-        {--message= : Custom message content}
-        {--roundtrip : Publish and consume to verify round-trip}
-        {--json : Output as JSON}';
+        {queue=default : Registered logical queue for a safe worker probe}
+        {--connection=rabbitmq : Laravel queue connection}
+        {--roundtrip : Use an isolated broker queue for a publish and consume check}
+        {--json : Write machine-readable output}';
 
-    protected $description = 'Send a test event to RabbitMQ and optionally verify round-trip';
+    protected $description = 'Run a safe RabbitMQ publish or broker round-trip diagnostic';
 
-    public function handle(ChannelManager $channelManager): int
+    public function handle(QueueManager $manager, ChannelManager $channels): int
     {
-        $queue = $this->argument('queue');
-        $customMessage = $this->option('message');
-        $roundtrip = $this->option('roundtrip');
-        $jsonOutput = $this->option('json');
+        $connectionName = (string) $this->option('connection');
+        $connection = $manager->connection($connectionName);
 
-        $messageId = Str::uuid()->toString();
-        $timestamp = now()->toIso8601String();
+        if (! $connection instanceof RabbitMQQueue) {
+            $this->error("Queue connection [{$connectionName}] does not use this RabbitMQ driver.");
 
-        // When doing round-trip, use a temporary exclusive queue to avoid conflicts with workers
-        $useTemporaryQueue = $roundtrip;
-        $temporaryQueue = null;
-
-        $payload = [
-            'uuid' => $messageId,
-            'type' => 'test_event',
-            'message' => $customMessage ?? 'Test event from rabbitmq:test-event command',
-            'timestamp' => $timestamp,
-            'metadata' => [
-                'source' => 'rabbitmq:test-event',
-                'environment' => app()->environment(),
-            ],
-        ];
+            return self::FAILURE;
+        }
 
         try {
-            $topologyChannel = $channelManager->topologyChannel();
+            $result = $this->option('roundtrip')
+                ? $this->roundTrip($connection, $channels)
+                : $this->publishProbe($connection);
 
-            if ($useTemporaryQueue) {
-                // Create a temporary exclusive queue for round-trip testing
-                // This avoids conflicts with workers consuming from the target queue
-                $temporaryQueue = 'test-event-'.Str::random(8);
-                $topologyChannel->queue_declare(
-                    $temporaryQueue,
-                    false,  // passive
-                    false,  // durable (temporary queue)
-                    true,   // exclusive (only this connection)
-                    true    // auto_delete (deleted when connection closes)
-                );
-                $publishQueue = $temporaryQueue;
+            if ($this->option('json')) {
+                $this->line((string) json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
             } else {
-                // Declare the target queue if it doesn't exist
-                $topologyChannel->queue_declare(
-                    $queue,
-                    false,  // passive
-                    true,   // durable
-                    false,  // exclusive
-                    false   // auto_delete
-                );
-                $publishQueue = $queue;
-            }
-
-            // Publish the message
-            $publishChannel = $channelManager->publishChannel();
-
-            $message = new AMQPMessage(json_encode($payload), [
-                'delivery_mode' => $useTemporaryQueue
-                    ? AMQPMessage::DELIVERY_MODE_NON_PERSISTENT
-                    : AMQPMessage::DELIVERY_MODE_PERSISTENT,
-                'content_type' => 'application/json',
-                'message_id' => $messageId,
-                'timestamp' => time(),
-            ]);
-
-            $publishChannel->basic_publish($message, '', $publishQueue);
-
-            $result = [
-                'success' => true,
-                'action' => 'published',
-                'queue' => $useTemporaryQueue ? $temporaryQueue : $queue,
-                'message_id' => $messageId,
-                'timestamp' => $timestamp,
-            ];
-
-            if (! $jsonOutput) {
-                $this->components->info('Test event published to RabbitMQ');
-                $this->newLine();
-                $this->line("  <fg=gray>Queue:</> {$publishQueue}".($useTemporaryQueue ? ' (temporary)' : ''));
-                $this->line("  <fg=gray>Message ID:</> {$messageId}");
-                $this->line("  <fg=gray>Timestamp:</> {$timestamp}");
-            }
-
-            // Consume and verify from the temporary queue
-            if ($roundtrip) {
-                $consumeResult = $this->consumeAndVerify($channelManager, $publishQueue, $messageId, $jsonOutput);
-
-                if (! $consumeResult['success']) {
-                    $result['success'] = false;
-                    $result['consume_error'] = $consumeResult['error'] ?? 'Unknown error';
-
-                    if ($jsonOutput) {
-                        $this->line(json_encode($result, JSON_PRETTY_PRINT));
-                    }
-
-                    return self::FAILURE;
-                }
-
-                $result['consumed'] = true;
-                $result['round_trip_ms'] = $consumeResult['round_trip_ms'] ?? null;
-            }
-
-            if ($jsonOutput) {
-                $this->line(json_encode($result, JSON_PRETTY_PRINT));
-            } else {
-                $this->newLine();
-                $this->components->success('Test event sent successfully');
+                $this->line("OK {$result['action']} {$result['message_id']}");
             }
 
             return self::SUCCESS;
-        } catch (ConnectionException $e) {
-            $error = [
-                'success' => false,
-                'error' => $e->getMessage(),
-            ];
+        } catch (Throwable $exception) {
+            $result = ['success' => false, 'error' => $exception->getMessage()];
 
-            if ($jsonOutput) {
-                $this->line(json_encode($error, JSON_PRETTY_PRINT));
+            if ($this->option('json')) {
+                $this->line((string) json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
             } else {
-                $this->components->error("Failed to send test event: {$e->getMessage()}");
+                $this->error($exception->getMessage());
             }
 
             return self::FAILURE;
         }
     }
 
-    /**
-     * Consume a message from the queue and verify it matches the sent message.
-     *
-     * @return array{success: bool, error?: string, round_trip_ms?: float}
-     */
-    protected function consumeAndVerify(
-        ChannelManager $channelManager,
-        string $queue,
-        string $expectedMessageId,
-        bool $jsonOutput
-    ): array {
-        $startTime = microtime(true);
+    /** @return array<string, mixed> */
+    protected function publishProbe(RabbitMQQueue $connection): array
+    {
+        $logicalQueue = (string) $this->argument('queue');
+        $probeId = (string) Str::uuid();
+        $dispatchedAt = time();
+        $connection->push(new QueueProbeJob($probeId, $logicalQueue, $dispatchedAt), '', $logicalQueue);
+
+        return [
+            'success' => true,
+            'action' => 'probe_published',
+            'queue' => $logicalQueue,
+            'message_id' => $probeId,
+            'dispatched_at' => $dispatchedAt,
+        ];
+    }
+
+    /** @return array<string, mixed> */
+    protected function roundTrip(RabbitMQQueue $connection, ChannelManager $channels): array
+    {
+        $brokerConnection = $connection->getBrokerConnectionName();
+        $queueName = 'lettermint.diagnostic.'.Str::lower(Str::random(20));
+        $messageId = (string) Str::uuid();
+        $startedAt = microtime(true);
+        $returned = false;
+        $nacked = false;
+        $topology = $channels->topologyChannel($brokerConnection);
+        $declared = false;
 
         try {
-            $consumeChannel = $channelManager->consumeChannel();
+            $topology->queue_declare($queueName, false, false, true, true);
+            $declared = true;
 
-            // Try to get the message with a short timeout
-            $maxAttempts = 10;
-            $receivedMessage = null;
+            $publisher = $channels->publishChannel($brokerConnection);
+            $publisher->set_return_listener(function () use (&$returned): void {
+                $returned = true;
+            });
+            $publisher->set_nack_handler(function () use (&$nacked): void {
+                $nacked = true;
+            });
+            $publisher->basic_publish(
+                new AMQPMessage(
+                    (string) json_encode(['uuid' => $messageId, 'type' => 'rabbitmq_round_trip'], JSON_THROW_ON_ERROR),
+                    ['message_id' => $messageId, 'content_type' => 'application/json'],
+                ),
+                '',
+                $queueName,
+                true,
+            );
+            $publisher->wait_for_pending_acks_returns((float) config('rabbitmq.publisher.confirm_timeout', 5.0));
 
-            for ($i = 0; $i < $maxAttempts; $i++) {
-                $receivedMessage = $consumeChannel->basic_get($queue, false);
-
-                if ($receivedMessage !== null) {
-                    break;
-                }
-
-                usleep(100000); // 100ms
+            if ($returned || $nacked) {
+                throw new PublishException('RabbitMQ did not confirm the diagnostic message.');
             }
 
-            if ($receivedMessage === null) {
-                return [
-                    'success' => false,
-                    'error' => 'No message received within timeout',
-                ];
+            $consumer = $channels->channel('diagnostic-roundtrip', $brokerConnection);
+            $message = $consumer->basic_get($queueName, false);
+
+            if (! $message instanceof AMQPMessage || $message->get('message_id') !== $messageId) {
+                throw new PublishException('RabbitMQ did not return the expected diagnostic message.');
             }
 
-            $payload = json_decode($receivedMessage->getBody(), true);
-            $receivedId = $payload['uuid'] ?? null;
-
-            if ($receivedId !== $expectedMessageId) {
-                // Acknowledge and report mismatch
-                $consumeChannel->basic_ack($receivedMessage->getDeliveryTag());
-
-                return [
-                    'success' => false,
-                    'error' => "Message ID mismatch: expected {$expectedMessageId}, got {$receivedId}",
-                ];
-            }
-
-            // Acknowledge the message
-            $consumeChannel->basic_ack($receivedMessage->getDeliveryTag());
-
-            $roundTripMs = (microtime(true) - $startTime) * 1000;
-
-            if (! $jsonOutput) {
-                $this->newLine();
-                $this->components->info('Message consumed and verified');
-                $this->line(sprintf('  <fg=gray>Round-trip time:</> %.2f ms', $roundTripMs));
-            }
+            $consumer->basic_ack($message->getDeliveryTag());
 
             return [
                 'success' => true,
-                'round_trip_ms' => round($roundTripMs, 2),
+                'action' => 'roundtrip',
+                'message_id' => $messageId,
+                'round_trip_ms' => round((microtime(true) - $startedAt) * 1000, 2),
             ];
-        } catch (\Exception $e) {
-            return [
-                'success' => false,
-                'error' => $e->getMessage(),
-            ];
+        } finally {
+            $channels->closeChannel('diagnostic-roundtrip', $brokerConnection);
+
+            if ($declared) {
+                try {
+                    $topology->queue_delete($queueName);
+                } catch (Throwable $exception) {
+                    report($exception);
+                }
+            }
         }
     }
 }

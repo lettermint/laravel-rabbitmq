@@ -3,157 +3,68 @@
 declare(strict_types=1);
 
 use Illuminate\Support\Facades\Log;
-use Lettermint\RabbitMQ\Connection\ConnectionManager;
-use Lettermint\RabbitMQ\Exceptions\ConnectionException;
+use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Monitoring\HealthCheck;
 
 beforeEach(function () {
-    $this->mockConnection = mockAMQPConnection(true);
-
-    $this->connectionManager = Mockery::mock(ConnectionManager::class);
-    $this->connectionManager->shouldReceive('connection')
-        ->andReturn($this->mockConnection)
-        ->byDefault();
+    $this->channel = mockAMQPChannel();
+    $this->channelManager = Mockery::mock(ChannelManager::class);
+    $this->channelManager->shouldReceive('topologyChannel')->with('broker')->andReturn($this->channel)->byDefault();
+    $this->config = [
+        'connection' => 'broker',
+        'queue' => ['default' => 'default'],
+        'physical_prefix' => 'staging.',
+    ];
+    $this->health = new HealthCheck(
+        $this->channelManager,
+        testTopologyRegistry($this->config),
+        $this->config,
+    );
 });
 
-test('check returns healthy when connection is active', function () {
-    $healthCheck = new HealthCheck($this->connectionManager);
+test('is healthy only after a passive broker queue operation succeeds', function () {
+    $this->channel->shouldReceive('queue_declare')
+        ->once()
+        ->with('staging.default', true, false, false, false)
+        ->andReturn(['staging.default', 0, 1]);
 
-    $result = $healthCheck->check();
+    $result = $this->health->check();
 
-    expect($result['healthy'])->toBeTrue();
-    expect($result['checks']['connection']['healthy'])->toBeTrue();
-    expect($result['checks']['connection']['message'])->toBe('Connected to RabbitMQ');
+    expect($result['healthy'])->toBeTrue()
+        ->and($result['checks']['connection']['healthy'])->toBeTrue()
+        ->and($result['checks']['connection']['message'])->toContain('Broker operation succeeded');
 });
 
-test('check returns unhealthy when connection fails', function () {
-    $this->connectionManager->shouldReceive('connection')
-        ->andThrow(new ConnectionException('Connection refused'));
-
-    $healthCheck = new HealthCheck($this->connectionManager);
-
-    $result = $healthCheck->check();
-
-    expect($result['healthy'])->toBeFalse();
-    expect($result['checks']['connection']['healthy'])->toBeFalse();
-    expect($result['checks']['connection']['message'])->toContain('Failed to connect');
-});
-
-test('check returns unhealthy when connection exists but not connected', function () {
-    $this->mockConnection->shouldReceive('isConnected')->andReturn(false);
-
-    $healthCheck = new HealthCheck($this->connectionManager);
-
-    $result = $healthCheck->check();
-
-    expect($result['healthy'])->toBeFalse();
-    expect($result['checks']['connection']['healthy'])->toBeFalse();
-    expect($result['checks']['connection']['message'])->toContain('not connected');
-});
-
-test('check logs error when connection exists but not connected', function () {
+test('is unhealthy when the broker operation fails', function () {
     Log::spy();
+    $this->channelManager->shouldReceive('topologyChannel')->with('broker')->andThrow(new RuntimeException('unavailable'));
 
-    $this->mockConnection->shouldReceive('isConnected')->andReturn(false);
+    $result = $this->health->check();
 
-    $healthCheck = new HealthCheck($this->connectionManager);
-    $healthCheck->check();
-
-    Log::shouldHaveReceived('error')
-        ->withArgs(fn ($msg) => str_contains($msg, 'not connected'));
+    expect($result['healthy'])->toBeFalse()
+        ->and($result['checks']['connection']['message'])->toContain('unavailable');
+    Log::shouldHaveReceived('error')->withArgs(fn (string $message): bool => $message === 'RabbitMQ health check failed');
 });
 
-test('ping returns true when connected', function () {
-    $healthCheck = new HealthCheck($this->connectionManager);
+test('ping and readiness use the real broker check', function () {
+    $this->channel->shouldReceive('queue_declare')->twice()->andReturn(['staging.default', 0, 1]);
 
-    expect($healthCheck->ping())->toBeTrue();
+    expect($this->health->ping())->toBeTrue()
+        ->and($this->health->readiness())->toBeTrue();
 });
 
-test('ping returns false when disconnected', function () {
-    $this->mockConnection->shouldReceive('isConnected')->andReturn(false);
+test('returns a Kubernetes down response when the broker check fails', function () {
+    $this->channelManager->shouldReceive('topologyChannel')->andThrow(new RuntimeException('unavailable'));
 
-    $healthCheck = new HealthCheck($this->connectionManager);
+    $result = $this->health->kubernetes();
 
-    expect($healthCheck->ping())->toBeFalse();
+    expect($result['status'])->toBe('DOWN')
+        ->and($result['components']['rabbitmq']['status'])->toBe('DOWN')
+        ->and($result['components']['rabbitmq']['details']['connection']['healthy'])->toBeFalse();
 });
 
-test('ping returns false on exception', function () {
-    $this->connectionManager->shouldReceive('connection')
-        ->andThrow(new ConnectionException('Connection failed'));
+test('keeps liveness independent from RabbitMQ availability', function () {
+    $this->channelManager->shouldNotReceive('topologyChannel');
 
-    $healthCheck = new HealthCheck($this->connectionManager);
-
-    expect($healthCheck->ping())->toBeFalse();
-});
-
-test('ping logs error when ping fails', function () {
-    Log::spy();
-
-    $this->connectionManager->shouldReceive('connection')
-        ->andThrow(new ConnectionException('Connection failed'));
-
-    $healthCheck = new HealthCheck($this->connectionManager);
-    $healthCheck->ping();
-
-    Log::shouldHaveReceived('error')
-        ->withArgs(fn ($msg) => str_contains($msg, 'ping failed'));
-});
-
-test('kubernetes returns UP status when healthy', function () {
-    $healthCheck = new HealthCheck($this->connectionManager);
-
-    $result = $healthCheck->kubernetes();
-
-    expect($result['status'])->toBe('UP');
-    expect($result['components']['rabbitmq']['status'])->toBe('UP');
-});
-
-test('kubernetes returns DOWN status when unhealthy', function () {
-    $this->connectionManager->shouldReceive('connection')
-        ->andThrow(new ConnectionException('Connection failed'));
-
-    $healthCheck = new HealthCheck($this->connectionManager);
-
-    $result = $healthCheck->kubernetes();
-
-    expect($result['status'])->toBe('DOWN');
-    expect($result['components']['rabbitmq']['status'])->toBe('DOWN');
-});
-
-test('kubernetes includes check details in components', function () {
-    $healthCheck = new HealthCheck($this->connectionManager);
-
-    $result = $healthCheck->kubernetes();
-
-    expect($result['components']['rabbitmq'])->toHaveKey('details');
-    expect($result['components']['rabbitmq']['details'])->toHaveKey('connection');
-});
-
-test('liveness always returns true', function () {
-    $healthCheck = new HealthCheck($this->connectionManager);
-
-    expect($healthCheck->liveness())->toBeTrue();
-});
-
-test('liveness returns true even when RabbitMQ is down', function () {
-    $this->connectionManager->shouldReceive('connection')
-        ->andThrow(new ConnectionException('Connection failed'));
-
-    $healthCheck = new HealthCheck($this->connectionManager);
-
-    expect($healthCheck->liveness())->toBeTrue();
-});
-
-test('readiness returns true when connected', function () {
-    $healthCheck = new HealthCheck($this->connectionManager);
-
-    expect($healthCheck->readiness())->toBeTrue();
-});
-
-test('readiness returns false when not connected', function () {
-    $this->mockConnection->shouldReceive('isConnected')->andReturn(false);
-
-    $healthCheck = new HealthCheck($this->connectionManager);
-
-    expect($healthCheck->readiness())->toBeFalse();
+    expect($this->health->liveness())->toBeTrue();
 });

@@ -7,6 +7,8 @@ namespace Lettermint\RabbitMQ\Discovery;
 use Illuminate\Support\Collection;
 use Lettermint\RabbitMQ\Attributes\ConsumesQueue;
 use Lettermint\RabbitMQ\Attributes\Exchange;
+use Lettermint\RabbitMQ\Enums\TopologyEntityType;
+use Lettermint\RabbitMQ\Exceptions\TopologyException;
 use ReflectionAttribute;
 use ReflectionClass;
 use Symfony\Component\Finder\Finder;
@@ -207,7 +209,17 @@ class AttributeScanner
     {
         $exchanges = [];
         foreach ($this->exchanges as $item) {
-            $exchanges[$item['attribute']->name] = $item['attribute'];
+            $name = $item['attribute']->name;
+
+            if (isset($exchanges[$name]) && $this->exchangeSignature($exchanges[$name]) !== $this->exchangeSignature($item['attribute'])) {
+                throw new TopologyException(
+                    "Exchange [{$name}] has conflicting attribute definitions.",
+                    TopologyEntityType::Exchange,
+                    $name,
+                );
+            }
+
+            $exchanges[$name] = $item['attribute'];
         }
 
         $queues = [];
@@ -219,9 +231,20 @@ class AttributeScanner
                 $queues[$queueName] = [
                     'attribute' => $item['attribute'],
                     'class' => $item['class'],
-                    'allBindings' => $item['attribute']->bindings,
+                    'allBindings' => array_map(
+                        fn (string|array $routingKeys): array => array_values((array) $routingKeys),
+                        $item['attribute']->bindings,
+                    ),
                 ];
             } else {
+                if ($this->queueSignature($queues[$queueName]['attribute']) !== $this->queueSignature($item['attribute'])) {
+                    throw new TopologyException(
+                        "Queue [{$queueName}] has conflicting immutable attribute definitions.",
+                        TopologyEntityType::Queue,
+                        $queueName,
+                    );
+                }
+
                 // Additional declaration of same queue - merge bindings
                 foreach ($item['attribute']->bindings as $exchange => $routingKeys) {
                     $routingKeys = (array) $routingKeys;
@@ -242,6 +265,28 @@ class AttributeScanner
         return [
             'exchanges' => $exchanges,
             'queues' => $queues,
+        ];
+    }
+
+    /** @return array<string, mixed> */
+    private function exchangeSignature(Exchange $exchange): array
+    {
+        return [
+            'type' => $exchange->getTypeValue(),
+            'durable' => $exchange->durable,
+            'auto_delete' => $exchange->autoDelete,
+            'internal' => $exchange->internal,
+            'bind_to' => $exchange->bindTo,
+            'bind_routing_key' => $exchange->bindRoutingKey,
+            'arguments' => $exchange->arguments,
+        ];
+    }
+
+    /** @return array<string, mixed> */
+    private function queueSignature(ConsumesQueue $queue): array
+    {
+        return [
+            'arguments' => $queue->getQueueArguments(),
         ];
     }
 }

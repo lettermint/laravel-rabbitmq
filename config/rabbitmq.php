@@ -2,6 +2,12 @@
 
 return [
 
+    'driver_name' => env('RABBITMQ_DRIVER_NAME', 'rabbitmq'),
+
+    'physical_prefix' => env('RABBITMQ_PHYSICAL_PREFIX', ''),
+
+    'strict_topology' => env('RABBITMQ_STRICT_TOPOLOGY', false),
+
     /*
     |--------------------------------------------------------------------------
     | Default Connection
@@ -53,11 +59,27 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Topology Discovery
+    | Explicit Topology
     |--------------------------------------------------------------------------
     |
-    | Directories to scan for Exchange and ConsumesQueue attributes.
-    | The package will automatically discover and register these.
+    | Use logical names as keys. The physical prefix is added to every queue
+    | and exchange. An empty queue list keeps attribute discovery available for
+    | existing applications. Strict mode requires an explicit queue list.
+    |
+    */
+
+    'topology' => [
+        'exchanges' => [],
+        'queues' => [],
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Attribute Discovery
+    |--------------------------------------------------------------------------
+    |
+    | Attribute discovery runs only for console commands. It does not scan
+    | application files during a normal web request.
     |
     */
 
@@ -72,44 +94,16 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Default Queue Settings
+    | Default Logical Queue
     |--------------------------------------------------------------------------
     |
-    | Default settings applied to queues when not specified in attributes.
-    |
-    | The 'exchange' setting is used for jobs WITHOUT the #[ConsumesQueue]
-    | attribute. When set, jobs are published to this exchange with a routing
-    | key of 'fallback.{queue_name}'. Options:
-    |
-    | - Empty string '': Uses RabbitMQ's default exchange (routes directly
-    |   to queues by name). Simple but no DLQ support.
-    |
-    | - Custom exchange name: Your fallback exchange for non-attributed jobs.
-    |   Create a queue bound to 'fallback.#' to catch these messages.
+    | Jobs without an explicit queue use this logical queue. The queue must be
+    | present in the topology registry when strict mode is active.
     |
     */
 
     'queue' => [
         'default' => env('RABBITMQ_QUEUE', 'default'),
-        'exchange' => env('RABBITMQ_EXCHANGE', ''),  // Fallback exchange for jobs without attributes
-        'durable' => true,
-        'quorum' => true,
-        'auto_delete' => false,
-    ],
-
-    /*
-    |--------------------------------------------------------------------------
-    | Default Exchange Settings
-    |--------------------------------------------------------------------------
-    |
-    | Default settings applied to exchanges when not specified in attributes.
-    |
-    */
-
-    'exchange' => [
-        'type' => 'topic',
-        'durable' => true,
-        'auto_delete' => false,
     ],
 
     /*
@@ -125,30 +119,22 @@ return [
         'enabled' => true,
         'exchange_suffix' => '.dlq',
         'queue_prefix' => 'dlq:',
-        'default_ttl' => 604800000, // 7 days in milliseconds
-        'retry' => [
-            'enabled' => true,
-            'max_attempts' => 3,
-            'strategy' => 'exponential', // exponential, linear, fixed
-            'delays' => [60, 300, 900, 3600], // seconds
-        ],
+        'exchange' => 'dlx',
     ],
 
     /*
     |--------------------------------------------------------------------------
-    | Delayed Messages
+    | Retry and Delayed Release
     |--------------------------------------------------------------------------
     |
-    | Configuration for delayed message support.
-    | Requires the rabbitmq_delayed_message_exchange plugin.
+    | Delayed releases use durable classic TTL queues. The package does not
+    | require the RabbitMQ delayed-message plug-in.
     |
     */
 
-    'delayed' => [
-        'enabled' => env('RABBITMQ_DELAYED_ENABLED', true),
-        'exchange' => 'delayed',
-        'type' => 'x-delayed-message',
-        'max_delay' => 86400000, // 24 hours in milliseconds
+    'retry' => [
+        'maximum_delay' => env('RABBITMQ_MAXIMUM_DELAY', 86400),
+        'delay_queue_cleanup_grace' => env('RABBITMQ_DELAY_QUEUE_CLEANUP_GRACE', 86400000),
     ],
 
     /*
@@ -161,29 +147,26 @@ return [
     */
 
     'consumer' => [
-        'prefetch_count' => env('RABBITMQ_PREFETCH_COUNT', 10),
-        'prefetch_size' => 0, // 0 = no limit
+        'prefetch_count' => env('RABBITMQ_PREFETCH_COUNT', 1),
         'timeout' => 30,
-        'auto_ack' => false,
+        'heartbeat_sender' => env('RABBITMQ_HEARTBEAT_SENDER', true),
     ],
 
     /*
     |--------------------------------------------------------------------------
-    | Heartbeat Sender
+    | Connection Recovery
     |--------------------------------------------------------------------------
     |
-    | The PCNTLHeartbeatSender uses SIGALRM signals to send heartbeats during
-    | blocking PHP operations. This prevents RabbitMQ from closing connections
-    | when jobs run longer than heartbeat * 2 seconds.
-    |
-    | Note: Jobs with Laravel's $timeout property set will have heartbeats
-    | disabled during execution (both use SIGALRM). For long-running jobs
-    | that need heartbeat support, set $timeout = 0 on the job class.
+    | The package closes all channels for a failed connection and then builds a
+    | fresh connection. Recovery is bounded so a worker can exit for Kubernetes
+    | to restart it when the broker stays unavailable.
     |
     */
 
-    'heartbeat_sender' => [
-        'enabled' => env('RABBITMQ_HEARTBEAT_SENDER', true),
+    'recovery' => [
+        'max_attempts' => env('RABBITMQ_RECOVERY_ATTEMPTS', 3),
+        'initial_delay_ms' => env('RABBITMQ_RECOVERY_INITIAL_DELAY', 100),
+        'max_delay_ms' => env('RABBITMQ_RECOVERY_MAX_DELAY', 2000),
     ],
 
     /*
@@ -197,8 +180,8 @@ return [
 
     'publisher' => [
         'confirm' => env('RABBITMQ_PUBLISHER_CONFIRM', true),
-        // Note: mandatory routing (returning unroutable messages) is planned for a future release
-        'mandatory' => false,
+        'mandatory' => env('RABBITMQ_PUBLISHER_MANDATORY', true),
+        'confirm_timeout' => env('RABBITMQ_PUBLISHER_CONFIRM_TIMEOUT', 5.0),
     ],
 
     /*
@@ -214,10 +197,6 @@ return [
         'health_check' => [
             'enabled' => true,
             'interval' => 30, // seconds
-        ],
-        'metrics' => [
-            'enabled' => env('RABBITMQ_METRICS_ENABLED', true),
-            'driver' => 'prometheus', // prometheus, statsd
         ],
     ],
 

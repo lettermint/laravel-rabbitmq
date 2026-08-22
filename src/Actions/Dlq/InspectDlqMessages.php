@@ -9,6 +9,7 @@ use Lettermint\RabbitMQ\Actions\Dlq\Results\DlqMessageData;
 use Lettermint\RabbitMQ\Actions\Dlq\Results\DlqQueueConfig;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Exceptions\DlqOperationException;
+use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
 use PhpAmqpLib\Channel\AMQPChannel;
 
 /**
@@ -20,6 +21,7 @@ final class InspectDlqMessages
         private ChannelManager $channelManager,
         private ResolveDlqQueue $resolveDlqQueue,
         private FindDlqMessage $findDlqMessage,
+        private RabbitMQQueue $rabbitmq,
     ) {}
 
     /**
@@ -33,7 +35,10 @@ final class InspectDlqMessages
         int $limit = 10,
     ): DlqInspectResult {
         $config = ($this->resolveDlqQueue)($queueName);
-        $channel = $this->channelManager->channel('dlq-inspect');
+        $channel = $this->channelManager->channel(
+            'dlq-inspect',
+            $this->rabbitmq->getBrokerConnectionName(),
+        );
 
         if ($messageId !== null) {
             return $this->inspectById($channel, $config, $messageId);

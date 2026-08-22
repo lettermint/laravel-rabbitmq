@@ -2,22 +2,28 @@
 
 declare(strict_types=1);
 
+use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Queue\Connectors\ConnectorInterface;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
-use Lettermint\RabbitMQ\Discovery\AttributeScanner;
 use Lettermint\RabbitMQ\Queue\RabbitMQConnector;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
 
 describe('RabbitMQConnector', function () {
     beforeEach(function () {
         $this->channelManager = Mockery::mock(ChannelManager::class);
-        $this->scanner = Mockery::mock(AttributeScanner::class);
+        $this->registry = testTopologyRegistry();
+        $this->events = Mockery::mock(Dispatcher::class);
+        $this->config = [
+            'publisher' => ['confirm' => true, 'mandatory' => true],
+        ];
     });
 
     it('implements ConnectorInterface', function () {
         $connector = new RabbitMQConnector(
             $this->channelManager,
-            $this->scanner
+            $this->registry,
+            $this->events,
+            $this->config,
         );
 
         expect($connector)->toBeInstanceOf(ConnectorInterface::class);
@@ -26,7 +32,9 @@ describe('RabbitMQConnector', function () {
     it('returns RabbitMQQueue from connect', function () {
         $connector = new RabbitMQConnector(
             $this->channelManager,
-            $this->scanner
+            $this->registry,
+            $this->events,
+            $this->config,
         );
 
         $queue = $connector->connect([
@@ -39,7 +47,9 @@ describe('RabbitMQConnector', function () {
     it('passes config to queue instance', function () {
         $connector = new RabbitMQConnector(
             $this->channelManager,
-            $this->scanner
+            $this->registry,
+            $this->events,
+            $this->config,
         );
 
         $queue = $connector->connect([

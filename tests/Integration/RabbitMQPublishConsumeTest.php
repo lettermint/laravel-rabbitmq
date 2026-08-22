@@ -2,243 +2,261 @@
 
 declare(strict_types=1);
 
+use Illuminate\Queue\QueueManager;
+use Illuminate\Queue\WorkerOptions;
+use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Str;
+use Lettermint\RabbitMQ\Actions\Dlq\ReplayDlqMessages;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Connection\ConnectionManager;
+use Lettermint\RabbitMQ\Consumers\RabbitMQWorker;
+use Lettermint\RabbitMQ\Diagnostics\QueueProbeJob;
+use Lettermint\RabbitMQ\Events\QueueProbeProcessed;
+use Lettermint\RabbitMQ\Exceptions\PublishException;
+use Lettermint\RabbitMQ\Queue\RabbitMQJob;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
-use PhpAmqpLib\Message\AMQPMessage;
+use Lettermint\RabbitMQ\Topology\TopologyManager;
+use Lettermint\RabbitMQ\Topology\TopologyRegistry;
 
 pest()->group('integration');
 
-/**
- * Integration tests for RabbitMQ publish/consume flow.
- *
- * These tests require a running RabbitMQ instance and are only run
- * in CI environments where the RabbitMQ service is available.
- */
-describe('RabbitMQ Publish/Consume Integration', function () {
-    beforeEach(function () {
-        // Skip if RabbitMQ is not available
-        if (! canConnectToRabbitMQ()) {
-            $this->markTestSkipped('RabbitMQ is not available');
-        }
+beforeEach(function () {
+    if (! canConnectToRabbitMQ()) {
+        $this->markTestSkipped('RabbitMQ is not available');
+    }
 
-        // Configure RabbitMQ connection from environment
-        config([
-            'rabbitmq.connections.default.hosts' => [
-                [
+    $prefix = 'integration.'.Str::lower(Str::random(12)).'.';
+    $config = [
+        'driver_name' => 'rabbitmq',
+        'default' => 'default',
+        'physical_prefix' => $prefix,
+        'strict_topology' => true,
+        'connections' => [
+            'default' => [
+                'hosts' => [[
                     'host' => env('RABBITMQ_HOST', 'localhost'),
                     'port' => (int) env('RABBITMQ_PORT', 5672),
                     'user' => env('RABBITMQ_USER', 'guest'),
                     'password' => env('RABBITMQ_PASSWORD', 'guest'),
                     'vhost' => env('RABBITMQ_VHOST', '/'),
+                ]],
+                'options' => [
+                    'heartbeat' => 60,
+                    'connection_timeout' => 5,
+                    'read_timeout' => 10,
+                    'write_timeout' => 10,
+                    'channel_rpc_timeout' => 5,
+                ],
+                'ssl' => ['enabled' => false],
+            ],
+        ],
+        'queue' => ['default' => 'default'],
+        'publisher' => [
+            'confirm' => true,
+            'mandatory' => true,
+            'confirm_timeout' => 5.0,
+        ],
+        'retry' => [
+            'maximum_delay' => 30,
+            'delay_queue_cleanup_grace' => 60000,
+        ],
+        'recovery' => [
+            'max_attempts' => 2,
+            'initial_delay_ms' => 10,
+            'max_delay_ms' => 50,
+        ],
+        'dead_letter' => [
+            'enabled' => true,
+            'exchange' => 'dlx',
+            'queue_prefix' => 'dlq:',
+        ],
+        'topology' => [
+            'exchanges' => [
+                'jobs' => ['type' => 'direct'],
+                'dlx' => ['type' => 'direct'],
+            ],
+            'queues' => [
+                'default' => [
+                    'bindings' => ['jobs' => ['default']],
+                    'delivery_limit' => 5,
                 ],
             ],
-        ]);
-    });
+        ],
+    ];
 
-    afterEach(function () {
-        // Clean up: delete test queue if it exists
-        try {
-            $channelManager = app(ChannelManager::class);
-            $channel = $channelManager->topologyChannel();
-            $channel->queue_delete('integration-test-queue');
-        } catch (\Throwable $e) {
-            // Queue may not exist, ignore
-        }
+    config()->set('rabbitmq', $config);
+    config()->set('queue.connections.rabbitmq-integration', [
+        'driver' => 'rabbitmq',
+        'connection' => 'default',
+        'queue' => 'default',
+    ]);
 
-        // Close connections
-        try {
-            $connectionManager = app(ConnectionManager::class);
-            $connectionManager->disconnect();
-        } catch (\Throwable $e) {
-            // Ignore cleanup errors
-        }
-    });
+    /** @var QueueManager $manager */
+    $manager = app('queue');
 
-    it('can publish a message and consume it from RabbitMQ', function () {
-        // Arrange: Set up a simple queue
-        $channelManager = app(ChannelManager::class);
-        $channel = $channelManager->topologyChannel();
+    $this->registry = app(TopologyRegistry::class);
+    $this->topology = app(TopologyManager::class);
+    $this->topology->declare();
+    $this->channels = app(ChannelManager::class);
+    $this->queue = $manager->connection('rabbitmq-integration');
+    expect($this->queue)->toBeInstanceOf(RabbitMQQueue::class);
 
-        // Declare a simple queue for testing
-        $channel->queue_declare(
-            'integration-test-queue',
-            false,  // passive
-            true,   // durable
-            false,  // exclusive
-            false   // auto_delete
-        );
-
-        // Bind to the default exchange (direct routing by queue name)
-        // For this simple test, we'll publish directly to the default exchange
-
-        $rabbitmqQueue = app(RabbitMQQueue::class);
-
-        // Create a test payload
-        $testPayload = json_encode([
-            'uuid' => 'test-uuid-'.time(),
-            'displayName' => 'TestJob',
-            'job' => 'Illuminate\\Queue\\CallQueuedHandler@call',
-            'data' => [
-                'commandName' => 'TestCommand',
-                'command' => serialize((object) ['message' => 'Hello from integration test']),
-            ],
-            'attempts' => 0,
-        ]);
-
-        // Act: Publish the message
-        $publishChannel = $channelManager->publishChannel();
-
-        $message = new AMQPMessage($testPayload, [
-            'delivery_mode' => AMQPMessage::DELIVERY_MODE_PERSISTENT,
-            'content_type' => 'application/json',
-        ]);
-
-        $publishChannel->basic_publish($message, '', 'integration-test-queue');
-
-        // Consume the message
-        $consumeChannel = $channelManager->consumeChannel();
-        $receivedMessage = $consumeChannel->basic_get('integration-test-queue', false);
-
-        // Assert
-        expect($receivedMessage)->not->toBeNull();
-        expect($receivedMessage)->toBeInstanceOf(AMQPMessage::class);
-
-        $receivedPayload = json_decode($receivedMessage->getBody(), true);
-        expect($receivedPayload['uuid'])->toStartWith('test-uuid-');
-        expect($receivedPayload['displayName'])->toBe('TestJob');
-
-        // Acknowledge the message
-        $consumeChannel->basic_ack($receivedMessage->getDeliveryTag());
-
-        // Verify queue is now empty
-        $queueInfo = $channel->queue_declare(
-            'integration-test-queue',
-            true,   // passive - just check
-            false,
-            false,
-            false
-        );
-
-        expect($queueInfo[1])->toBe(0); // message count should be 0
-    });
-
-    it('can publish multiple messages and consume them in order', function () {
-        // Arrange
-        $channelManager = app(ChannelManager::class);
-        $channel = $channelManager->topologyChannel();
-
-        $channel->queue_declare(
-            'integration-test-queue',
-            false,
-            true,
-            false,
-            false
-        );
-
-        // Act: Publish multiple messages
-        $publishChannel = $channelManager->publishChannel();
-        $messageIds = [];
-
-        for ($i = 1; $i <= 3; $i++) {
-            $payload = json_encode([
-                'uuid' => "test-uuid-{$i}",
-                'displayName' => "TestJob{$i}",
-                'sequence' => $i,
-            ]);
-
-            $message = new AMQPMessage($payload, [
-                'delivery_mode' => AMQPMessage::DELIVERY_MODE_PERSISTENT,
-                'content_type' => 'application/json',
-            ]);
-
-            $publishChannel->basic_publish($message, '', 'integration-test-queue');
-            $messageIds[] = "test-uuid-{$i}";
-        }
-
-        // Consume all messages
-        $consumeChannel = $channelManager->consumeChannel();
-        $receivedIds = [];
-
-        for ($i = 0; $i < 3; $i++) {
-            $receivedMessage = $consumeChannel->basic_get('integration-test-queue', false);
-            expect($receivedMessage)->not->toBeNull();
-
-            $payload = json_decode($receivedMessage->getBody(), true);
-            $receivedIds[] = $payload['uuid'];
-
-            $consumeChannel->basic_ack($receivedMessage->getDeliveryTag());
-        }
-
-        // Assert messages received in order
-        expect($receivedIds)->toBe($messageIds);
-    });
-
-    it('reports correct queue size after publishing', function () {
-        // Arrange
-        $channelManager = app(ChannelManager::class);
-        $channel = $channelManager->topologyChannel();
-
-        $channel->queue_declare(
-            'integration-test-queue',
-            false,
-            true,
-            false,
-            false
-        );
-
-        // Act: Publish 5 messages with publisher confirms to ensure delivery
-        $publishChannel = $channelManager->publishChannel();
-        $publishChannel->confirm_select();
-
-        for ($i = 1; $i <= 5; $i++) {
-            $message = new AMQPMessage(json_encode(['id' => $i]), [
-                'delivery_mode' => AMQPMessage::DELIVERY_MODE_PERSISTENT,
-            ]);
-            $publishChannel->basic_publish($message, '', 'integration-test-queue');
-        }
-
-        // Wait for all messages to be confirmed
-        $publishChannel->wait_for_pending_acks(5.0);
-
-        // Use RabbitMQQueue to check size
-        $rabbitmqQueue = app(RabbitMQQueue::class);
-
-        // Assert
-        expect($rabbitmqQueue->size('integration-test-queue'))->toBe(5);
-
-        // Clean up - consume all messages
-        $consumeChannel = $channelManager->consumeChannel();
-        for ($i = 0; $i < 5; $i++) {
-            $msg = $consumeChannel->basic_get('integration-test-queue', true); // auto-ack
-        }
-    });
-
-    it('handles connection to RabbitMQ service', function () {
-        // This test verifies basic connectivity
-        $connectionManager = app(ConnectionManager::class);
-        $connection = $connectionManager->connection();
-
-        expect($connection)->not->toBeNull();
-        expect($connection->isConnected())->toBeTrue();
-    });
+    $this->integrationPrefix = $prefix;
+    $this->cleanupQueues = [
+        $this->registry->queue('default')->physicalName,
+        $this->registry->queue('default')->deadLetterQueue,
+    ];
+    $this->cleanupExchanges = array_column($this->registry->exchanges(), 'name');
 });
 
-/**
- * Check if RabbitMQ is available for integration tests.
- */
-function canConnectToRabbitMQ(): bool
-{
-    $host = env('RABBITMQ_HOST', 'localhost');
-    $port = (int) env('RABBITMQ_PORT', 5672);
-
-    $socket = @fsockopen($host, $port, $errno, $errstr, 2);
-
-    if ($socket !== false) {
-        fclose($socket);
-
-        return true;
+afterEach(function () {
+    if (! isset($this->channels)) {
+        return;
     }
 
-    return false;
+    foreach (array_unique($this->cleanupQueues) as $index => $queue) {
+        try {
+            $this->channels->channel('integration-cleanup-queue-'.$index)->queue_delete($queue);
+        } catch (Throwable) {
+            // The test can delete a queue before cleanup.
+        }
+    }
+
+    foreach (array_reverse(array_unique($this->cleanupExchanges)) as $index => $exchange) {
+        try {
+            $this->channels->channel('integration-cleanup-exchange-'.$index)->exchange_delete($exchange);
+        } catch (Throwable) {
+            // The exchange can already be unavailable after a failed test.
+        }
+    }
+
+    app(ConnectionManager::class)->disconnectAll();
+});
+
+test('the driver publishes with confirms and processes a Laravel job', function () {
+    $processedProbe = null;
+    Event::listen(QueueProbeProcessed::class, function (QueueProbeProcessed $event) use (&$processedProbe): void {
+        $processedProbe = $event;
+    });
+    $probe = new QueueProbeJob('probe-1', 'default', time());
+    $this->queue->push($probe, '', 'default');
+
+    $job = waitForRabbitJob($this->queue, 'default');
+    expect($job)->toBeInstanceOf(RabbitMQJob::class);
+
+    app(RabbitMQWorker::class)->processMessage(
+        $job,
+        'rabbitmq-integration',
+        new WorkerOptions(maxTries: 1, timeout: 30),
+    );
+
+    expect($processedProbe)->toBeInstanceOf(QueueProbeProcessed::class)
+        ->and($processedProbe->probeId)->toBe('probe-1')
+        ->and($this->queue->size('default'))->toBe(0)
+        ->and($this->topology->audit()['healthy'])->toBeTrue();
+});
+
+test('a delayed publish uses a TTL queue and returns to the main route', function () {
+    $exchange = $this->registry->exchanges()['jobs']['name'];
+    $suffix = substr(hash('sha256', $exchange."\0default"), 0, 12);
+    $delayQueue = $this->integrationPrefix.'delay:default:1000:'.$suffix;
+    $this->cleanupQueues[] = $delayQueue;
+
+    $this->queue->pushRaw('{"uuid":"delayed-1"}', 'default', ['delay' => 1]);
+    expect($this->queue->pop('default'))->toBeNull();
+
+    $job = waitForRabbitJob($this->queue, 'default', 4.0);
+    expect($job)->toBeInstanceOf(RabbitMQJob::class)
+        ->and(json_decode($job->getRawBody(), true)['uuid'])->toBe('delayed-1');
+    $job->delete();
+});
+
+test('a final rejection reaches the quorum DLQ and can be replayed', function () {
+    $this->queue->pushRaw('{"uuid":"failed-1","displayName":"ExampleJob"}', 'default');
+    $job = waitForRabbitJob($this->queue, 'default');
+    expect($job)->toBeInstanceOf(RabbitMQJob::class);
+    $this->queue->reject($job->getMessage(), $job->getChannel(), false);
+
+    waitForQueueDepth(
+        $this->channels,
+        $this->registry->queue('default')->deadLetterQueue,
+        1,
+    );
+
+    $result = app(ReplayDlqMessages::class)('default', messageId: 'failed-1');
+    expect($result->replayedCount)->toBe(1)
+        ->and($result->failedCount)->toBe(0);
+
+    $replayed = waitForRabbitJob($this->queue, 'default');
+    expect($replayed)->toBeInstanceOf(RabbitMQJob::class)
+        ->and($replayed->attempts())->toBe(1)
+        ->and(json_decode($replayed->getRawBody(), true)['uuid'])->toBe('failed-1');
+    $replayed->delete();
+});
+
+test('mandatory routing reports a deleted route as a publish failure', function () {
+    $physicalQueue = $this->registry->queue('default')->physicalName;
+    $this->channels->topologyChannel()->queue_delete($physicalQueue);
+
+    expect(fn () => $this->queue->pushRaw('{"uuid":"unroutable-1"}', 'default'))
+        ->toThrow(PublishException::class, 'unroutable');
+});
+
+test('the broker connection is available', function () {
+    expect(app(ConnectionManager::class)->connection()->isConnected())->toBeTrue();
+});
+
+function waitForRabbitJob(RabbitMQQueue $queue, string $logicalQueue, float $timeout = 2.0): ?RabbitMQJob
+{
+    $deadline = microtime(true) + $timeout;
+
+    do {
+        $job = $queue->pop($logicalQueue);
+
+        if ($job instanceof RabbitMQJob) {
+            return $job;
+        }
+
+        usleep(50000);
+    } while (microtime(true) < $deadline);
+
+    return null;
+}
+
+function waitForQueueDepth(ChannelManager $channels, string $physicalQueue, int $minimum, float $timeout = 3.0): void
+{
+    $deadline = microtime(true) + $timeout;
+
+    do {
+        [, $messages] = $channels
+            ->channel('integration-depth-'.hash('sha256', $physicalQueue))
+            ->queue_declare($physicalQueue, true, false, false, false);
+
+        if ($messages >= $minimum) {
+            return;
+        }
+
+        usleep(50000);
+    } while (microtime(true) < $deadline);
+
+    throw new RuntimeException("Queue [{$physicalQueue}] did not reach depth [{$minimum}].");
+}
+
+function canConnectToRabbitMQ(): bool
+{
+    $socket = @fsockopen(
+        (string) env('RABBITMQ_HOST', 'localhost'),
+        (int) env('RABBITMQ_PORT', 5672),
+        $errorCode,
+        $errorMessage,
+        2,
+    );
+
+    if ($socket === false) {
+        return false;
+    }
+
+    fclose($socket);
+
+    return true;
 }

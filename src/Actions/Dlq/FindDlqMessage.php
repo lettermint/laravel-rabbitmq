@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Lettermint\RabbitMQ\Actions\Dlq;
 
 use Lettermint\RabbitMQ\Connection\ChannelManager;
+use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Message\AMQPMessage;
 
@@ -17,6 +18,7 @@ final class FindDlqMessage
 
     public function __construct(
         private ChannelManager $channelManager,
+        private RabbitMQQueue $rabbitmq,
     ) {}
 
     /**
@@ -32,7 +34,10 @@ final class FindDlqMessage
         string $targetId,
         ?AMQPChannel $channel = null,
     ): array {
-        $channel ??= $this->channelManager->channel('dlq-search');
+        $channel ??= $this->channelManager->channel(
+            'dlq-search',
+            $this->rabbitmq->getBrokerConnectionName(),
+        );
 
         $checked = 0;
         $otherMessages = [];
@@ -47,8 +52,9 @@ final class FindDlqMessage
 
             $payload = json_decode($message->getBody(), true);
             $messageId = $payload['uuid'] ?? $payload['id'] ?? null;
+            $propertyId = $message->has('message_id') ? $message->get('message_id') : null;
 
-            if ($messageId === $targetId) {
+            if ($messageId === $targetId || $propertyId === $targetId) {
                 $targetMessage = $message;
                 break;
             }
