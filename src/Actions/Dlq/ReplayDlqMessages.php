@@ -13,6 +13,7 @@ use Lettermint\RabbitMQ\Events\DlqMessageReplayed;
 use Lettermint\RabbitMQ\Exceptions\DlqOperationException;
 use Lettermint\RabbitMQ\Queue\RabbitMQJob;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
+use Lettermint\RabbitMQ\Support\ExceptionReporter;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Message\AMQPMessage;
 use PhpAmqpLib\Wire\AMQPTable;
@@ -323,7 +324,7 @@ final class ReplayDlqMessages
                 attempt: $attempt,
             ));
         } catch (Throwable $exception) {
-            report($exception);
+            ExceptionReporter::report($exception);
         }
     }
 }

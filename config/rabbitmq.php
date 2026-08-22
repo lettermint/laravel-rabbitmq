@@ -202,6 +202,21 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Filament Authorization
+    |--------------------------------------------------------------------------
+    |
+    | The optional dead-letter page denies access unless the current user can
+    | use this Laravel Gate ability. Define the ability in the application
+    | before the RabbitMQ Filament plugin is registered.
+    |
+    */
+
+    'filament' => [
+        'gate' => env('RABBITMQ_FILAMENT_GATE', 'viewRabbitMQDeadLetters'),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Logging
     |--------------------------------------------------------------------------
     |

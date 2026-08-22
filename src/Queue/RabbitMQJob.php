@@ -14,6 +14,7 @@ use Lettermint\RabbitMQ\Events\JobReleased;
 use Lettermint\RabbitMQ\Events\JobRetried;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
 use Lettermint\RabbitMQ\Exceptions\PublishException;
+use Lettermint\RabbitMQ\Support\ExceptionReporter;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Message\AMQPMessage;
 use PhpAmqpLib\Wire\AMQPTable;
@@ -242,7 +243,7 @@ class RabbitMQJob extends Job implements JobContract
         try {
             event($event);
         } catch (Throwable $exception) {
-            report($exception);
+            ExceptionReporter::report($exception);
         }
     }
 

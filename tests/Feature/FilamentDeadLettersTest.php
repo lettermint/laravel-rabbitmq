@@ -2,7 +2,10 @@
 
 declare(strict_types=1);
 
+use Illuminate\Auth\GenericUser;
 use Illuminate\Queue\Failed\FailedJobProviderInterface;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Gate;
 use Lettermint\RabbitMQ\Actions\Dlq\FindDlqMessage;
 use Lettermint\RabbitMQ\Actions\Dlq\InspectDlqMessages;
 use Lettermint\RabbitMQ\Actions\Dlq\ResolveDlqQueue;
@@ -12,6 +15,24 @@ use Lettermint\RabbitMQ\Filament\RabbitMQPlugin;
 
 test('the Filament plugin has a stable identifier', function () {
     expect(RabbitMQPlugin::make()->getId())->toBe('lettermint-rabbitmq');
+});
+
+test('the dead-letter page denies access without a valid application gate', function (string $ability) {
+    config()->set('rabbitmq.filament.gate', $ability);
+    Auth::setUser(new GenericUser(['id' => 1]));
+
+    expect(RabbitMQDeadLetters::canAccess())->toBeFalse();
+})->with([
+    'undefined ability' => 'manageRabbitMQDeadLetters',
+    'empty ability' => '',
+]);
+
+test('the dead-letter page permits a user authorized by the application gate', function () {
+    config()->set('rabbitmq.filament.gate', 'manageRabbitMQDeadLetters');
+    Auth::setUser(new GenericUser(['id' => 1]));
+    Gate::define('manageRabbitMQDeadLetters', fn (GenericUser $user): bool => $user->getAuthIdentifier() === 1);
+
+    expect(RabbitMQDeadLetters::canAccess())->toBeTrue();
 });
 
 test('the dead-letter page keeps RabbitMQ records available when the optional failed provider fails', function () {

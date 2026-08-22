@@ -11,6 +11,7 @@ use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Diagnostics\QueueProbeJob;
 use Lettermint\RabbitMQ\Exceptions\PublishException;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
+use Lettermint\RabbitMQ\Support\ExceptionReporter;
 use PhpAmqpLib\Message\AMQPMessage;
 use Throwable;
 
@@ -137,7 +138,7 @@ final class TestEventCommand extends Command
                 try {
                     $topology->queue_delete($queueName);
                 } catch (Throwable $exception) {
-                    report($exception);
+                    ExceptionReporter::report($exception);
                 }
             }
         }

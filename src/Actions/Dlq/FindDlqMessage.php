@@ -50,7 +50,8 @@ final class FindDlqMessage
                 break;
             }
 
-            $payload = json_decode($message->getBody(), true);
+            $decoded = json_decode($message->getBody(), true);
+            $payload = is_array($decoded) ? $decoded : [];
             $messageId = $payload['uuid'] ?? $payload['id'] ?? null;
             $propertyId = $message->has('message_id') ? $message->get('message_id') : null;
 

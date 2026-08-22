@@ -19,6 +19,7 @@ use Lettermint\RabbitMQ\Events\MessagePublished;
 use Lettermint\RabbitMQ\Events\MessagePublishFailed;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
 use Lettermint\RabbitMQ\Exceptions\PublishException;
+use Lettermint\RabbitMQ\Support\ExceptionReporter;
 use Lettermint\RabbitMQ\Topology\QueueDefinition;
 use Lettermint\RabbitMQ\Topology\TopologyRegistry;
 use PhpAmqpLib\Channel\AMQPChannel;
@@ -396,7 +397,7 @@ final class RabbitMQQueue extends Queue implements QueueContract
             try {
                 $this->channelManager->recoverConnection($this->brokerConnection);
             } catch (Throwable $recoveryException) {
-                $this->reportSafely($recoveryException);
+                ExceptionReporter::report($recoveryException);
             }
 
             $this->failPublish(
@@ -429,7 +430,7 @@ final class RabbitMQQueue extends Queue implements QueueContract
             messageId: $messageId,
             exception: $exception,
         ));
-        $this->reportSafely($exception);
+        ExceptionReporter::report($exception);
 
         throw $exception;
     }
@@ -439,16 +440,7 @@ final class RabbitMQQueue extends Queue implements QueueContract
         try {
             $this->events->dispatch($event);
         } catch (Throwable $exception) {
-            $this->reportSafely($exception);
-        }
-    }
-
-    private function reportSafely(Throwable $exception): void
-    {
-        try {
-            report($exception);
-        } catch (Throwable) {
-            // Monitoring must not replace the publisher result.
+            ExceptionReporter::report($exception);
         }
     }
 

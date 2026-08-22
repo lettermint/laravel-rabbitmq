@@ -31,7 +31,8 @@ final readonly class DlqMessageData
 
     public static function fromAmqpMessage(AMQPMessage $message): self
     {
-        $payload = json_decode($message->getBody(), true) ?? [];
+        $decoded = json_decode($message->getBody(), true);
+        $payload = is_array($decoded) ? $decoded : [];
 
         $headerTable = $message->has('application_headers')
             ? $message->get('application_headers')
@@ -46,13 +47,20 @@ final readonly class DlqMessageData
         $reason = is_array($xDeath) ? (string) ($xDeath['reason'] ?? 'unknown') : 'unknown';
 
         $exception = null;
-        if (isset($payload['exception'])) {
+        if (isset($payload['exception']) && is_array($payload['exception'])) {
             $exception = $payload['exception'];
         }
 
+        $id = $payload['uuid'] ?? $payload['id'] ?? null;
+        $id = is_string($id) || is_numeric($id)
+            ? (string) $id
+            : ($message->has('message_id') ? (string) $message->get('message_id') : 'unknown');
+        $jobClass = $payload['displayName'] ?? $payload['job'] ?? 'Unknown';
+        $jobClass = is_string($jobClass) ? $jobClass : 'Unknown';
+
         return new self(
-            id: (string) ($payload['uuid'] ?? $payload['id'] ?? ($message->has('message_id') ? $message->get('message_id') : 'unknown')),
-            jobClass: $payload['displayName'] ?? $payload['job'] ?? 'Unknown',
+            id: $id,
+            jobClass: $jobClass,
             attempts: $attempts,
             failedAt: $failedAt,
             reason: $reason,

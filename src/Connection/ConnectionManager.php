@@ -9,6 +9,7 @@ use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\Log;
 use Lettermint\RabbitMQ\Events\ConnectionRecovered;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
+use Lettermint\RabbitMQ\Support\ExceptionReporter;
 use PhpAmqpLib\Connection\AbstractConnection;
 use PhpAmqpLib\Connection\AMQPConnectionConfig;
 use PhpAmqpLib\Connection\AMQPConnectionFactory;
@@ -132,7 +133,7 @@ class ConnectionManager
                 try {
                     $this->events?->dispatch(new ConnectionRecovered($name, $attempt, $duration));
                 } catch (\Throwable $exception) {
-                    report($exception);
+                    ExceptionReporter::report($exception);
                 }
 
                 Log::notice('RabbitMQ connection recovered', [
@@ -160,7 +161,7 @@ class ConnectionManager
             "RabbitMQ connection recovery exhausted after {$maximumAttempts} attempts for [{$name}].",
             previous: $lastException,
         );
-        report($exception);
+        ExceptionReporter::report($exception);
 
         throw $exception;
     }

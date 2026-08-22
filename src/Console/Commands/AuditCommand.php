@@ -6,6 +6,7 @@ namespace Lettermint\RabbitMQ\Console\Commands;
 
 use Illuminate\Console\Command;
 use Lettermint\RabbitMQ\Exceptions\TopologyException;
+use Lettermint\RabbitMQ\Support\ExceptionReporter;
 use Lettermint\RabbitMQ\Topology\TopologyManager;
 
 final class AuditCommand extends Command
@@ -37,7 +38,7 @@ final class AuditCommand extends Command
         }
 
         $exception = new TopologyException('The RabbitMQ runtime topology audit failed.');
-        report($exception);
+        ExceptionReporter::report($exception);
 
         return $this->option('strict') ? self::FAILURE : self::SUCCESS;
     }

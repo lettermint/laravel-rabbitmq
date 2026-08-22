@@ -231,16 +231,21 @@ Inspection and ID search consume and requeue messages. This operation can change
 Register the optional plugin on a Filament panel:
 
 ```php
+use Illuminate\Support\Facades\Gate;
 use Lettermint\RabbitMQ\Filament\RabbitMQPlugin;
+
+Gate::define('viewRabbitMQDeadLetters', function ($user): bool {
+    return $user->isRabbitMQOperator();
+});
 
 return $panel->plugins([
     RabbitMQPlugin::make(),
 ]);
 ```
 
-The page can inspect, retry, forget, retry in bulk, and forget in bulk. It writes an operator audit log for changes. RabbitMQ remains the canonical dead-letter store. If Laravel has a failed-job provider, the page can read exception details from it and remove those optional details after a retry or forget action. The page does not require Redis or a new database migration.
+The page denies access unless the current user passes the `viewRabbitMQDeadLetters` Laravel Gate ability. Set `rabbitmq.filament.gate` if the application uses another ability name.
 
-Protect the Filament panel with the application authorization rules. Dead-letter payloads can contain sensitive application data.
+The page can inspect, retry, forget, retry in bulk, and forget in bulk. It writes an operator audit log for changes. RabbitMQ remains the canonical dead-letter store. If Laravel has a failed-job provider, the page can read exception details from it and remove those optional details after a retry or forget action. The page does not require Redis or a new database migration. Dead-letter payloads can contain sensitive application data.
 
 ## Diagnostics and monitoring
 

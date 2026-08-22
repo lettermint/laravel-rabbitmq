@@ -13,6 +13,7 @@ use Lettermint\RabbitMQ\Enums\TopologyEntityType;
 use Lettermint\RabbitMQ\Exceptions\TopologyException;
 use Lettermint\RabbitMQ\Exceptions\UnknownBindingException;
 use Lettermint\RabbitMQ\Exceptions\UnknownQueueException;
+use Lettermint\RabbitMQ\Support\ExceptionReporter;
 
 final class TopologyRegistry
 {
@@ -101,7 +102,7 @@ final class TopologyRegistry
         $exception = new UnknownQueueException($logicalName, $this->logicalQueueNames());
 
         if ($this->isStrict()) {
-            report($exception);
+            ExceptionReporter::report($exception);
             throw $exception;
         }
 
@@ -148,7 +149,7 @@ final class TopologyRegistry
         }
 
         $exception = new UnknownBindingException($logicalQueue, $routingKey);
-        report($exception);
+        ExceptionReporter::report($exception);
 
         throw $exception;
     }

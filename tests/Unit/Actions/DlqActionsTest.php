@@ -206,6 +206,50 @@ test('an age-based purge keeps a message when its age is unknown', function () {
         ->and($result->skippedCount)->toBe(1);
 });
 
+test('an age-based purge uses a RabbitMQ x-death table before the publish timestamp', function () {
+    $dlq = mockAMQPChannel();
+    $channels = Mockery::mock(ChannelManager::class);
+    $channels->shouldReceive('channel')->once()->with('dlq-purge', 'broker')->andReturn($dlq);
+    $events = Mockery::mock(Dispatcher::class);
+    [, $purge] = makeDlqActions($channels, $events);
+    $message = dlqActionMessage([
+        'x-death' => [new AMQPTable(['time' => Carbon::now()->timestamp])],
+    ]);
+    $dlq->shouldReceive('basic_get')
+        ->twice()
+        ->with('test.dlq:default', false)
+        ->andReturn($message, null);
+    $dlq->shouldReceive('basic_reject')->once()->with(42, true);
+    $dlq->shouldNotReceive('basic_ack');
+
+    $result = $purge('default', olderThan: Carbon::now()->subDay());
+
+    expect($result->purgedCount)->toBe(0)
+        ->and($result->skippedCount)->toBe(1);
+});
+
+test('inspection keeps a malformed scalar JSON message visible', function () {
+    $dlq = mockAMQPChannel();
+    $channels = Mockery::mock(ChannelManager::class);
+    $channels->shouldReceive('channel')->once()->with('dlq-inspect', 'broker')->andReturn($dlq);
+    $events = Mockery::mock(Dispatcher::class);
+    [, , $inspect] = makeDlqActions($channels, $events);
+    $message = new AMQPMessage('"invalid-job-shape"', ['message_id' => 'malformed-1']);
+    $message->setDeliveryInfo(43, true, 'test.dlx', 'default');
+    $dlq->shouldReceive('basic_get')
+        ->twice()
+        ->with('test.dlq:default', false)
+        ->andReturn($message, null);
+    $dlq->shouldReceive('basic_reject')->once()->with(43, true);
+
+    $result = $inspect('default');
+
+    expect($result->messages)->toHaveCount(1)
+        ->and($result->messages[0]->id)->toBe('malformed-1')
+        ->and($result->messages[0]->jobClass)->toBe('Unknown')
+        ->and($result->messages[0]->payload)->toBe([]);
+});
+
 test('inspection uses the queue connection broker', function () {
     $dlq = mockAMQPChannel();
     $channels = Mockery::mock(ChannelManager::class);
