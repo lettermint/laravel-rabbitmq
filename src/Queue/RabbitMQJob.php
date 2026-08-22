@@ -10,6 +10,7 @@ use Illuminate\Queue\Jobs\Job;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\Log;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
+use Lettermint\RabbitMQ\Exceptions\PublishException;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Message\AMQPMessage;
 use PhpAmqpLib\Wire\AMQPTable;
@@ -22,6 +23,8 @@ use PhpAmqpLib\Wire\AMQPTable;
  */
 class RabbitMQJob extends Job implements JobContract
 {
+    public const ATTEMPT_HEADER = 'x-lettermint-attempt';
+
     /**
      * The RabbitMQ message.
      */
@@ -68,109 +71,88 @@ class RabbitMQJob extends Job implements JobContract
     /**
      * Release the job back into the queue.
      *
-     * Rejects the message without requeue - the Dead Letter Queue (DLQ)
-     * configuration handles retry logic. Note: The $delay parameter is
-     * passed to parent::release() for Laravel compatibility but is not
-     * directly used; retry delays are controlled by the DLQ/ConsumesQueue
-     * retryDelays configuration.
+     * Publishes the next intentional attempt before it acknowledges this
+     * delivery. This order prevents message loss. An acknowledgment failure can
+     * cause a duplicate message, which is part of at-least-once delivery.
      *
-     * @param  int  $delay  Delay hint (not directly used, see DLQ configuration)
+     * @param  int  $delay  Delay in seconds
      *
-     * @throws ConnectionException When message rejection fails
+     * @throws ConnectionException When acknowledgment fails
+     * @throws PublishException When the replacement message cannot be published
      */
     public function release($delay = 0): void
     {
         parent::release($delay);
 
-        try {
-            // Reject without requeue - let DLQ handle retry with configured delay
-            $this->rabbitmq->reject($this->message, $this->channel, false);
-        } catch (ConnectionException $e) {
-            Log::error('Failed to release/reject RabbitMQ message', [
-                'queue' => $this->queueName,
-                'job_id' => $this->getJobId(),
-                'job_name' => $this->getName(),
-                'delivery_tag' => $this->message->getDeliveryTag(),
-                'error' => $e->getMessage(),
-            ]);
-
-            throw $e;
-        }
+        $this->republish($this->decoded(), (int) $delay);
     }
 
     /**
      * Release the job with exception information stored in the payload.
      *
      * This method stores exception details in the message payload before
-     * releasing, making them visible in DLQ inspection tools. Uses a
-     * transactional ack+republish pattern since we can't modify the
-     * original message body during rejection.
+     * releasing, making them visible in DLQ inspection tools. The publish and
+     * acknowledgment use different AMQP channels, so they cannot be atomic.
+     * The package publishes first. This can cause a duplicate after an uncertain
+     * acknowledgment, but it does not silently discard the job.
      *
-     * @param  int  $delay  Delay hint (not directly used, see DLQ configuration)
+     * @param  int  $delay  Delay in seconds
      *
-     * @throws ConnectionException When release fails
+     * @throws ConnectionException When acknowledgment fails
+     * @throws PublishException When the replacement message cannot be published
      */
     public function releaseWithException(int $delay, \Throwable $exception): void
     {
         parent::release($delay);
 
+        $payload = $this->decoded();
+        $payload['exception'] = [
+            'class' => get_class($exception),
+            'message' => $exception->getMessage(),
+            'code' => $exception->getCode(),
+            'file' => $exception->getFile(),
+            'line' => $exception->getLine(),
+            'trace' => array_slice($exception->getTrace(), 0, 5),
+        ];
+
+        $this->republish($payload, $delay);
+    }
+
+    /**
+     * Publish the next application attempt and then acknowledge this delivery.
+     *
+     * @param  array<string, mixed>  $payload
+     */
+    protected function republish(array $payload, int $delay): void
+    {
+        $properties = $this->message->get_properties();
+        $headers = $this->getHeaders();
+
+        // Broker delivery count is only crash-loop protection. An intentional
+        // Laravel release uses its own counter and starts a new broker delivery
+        // sequence. RabbitMQ owns x-delivery-count and must set it itself.
+        unset($headers['x-delivery-count']);
+        $headers[self::ATTEMPT_HEADER] = $this->attempts() + 1;
+        $properties['application_headers'] = new AMQPTable($headers);
+
         try {
-            // Build modified payload with exception info
-            $payload = $this->decoded();
-            $payload['exception'] = [
-                'class' => get_class($exception),
-                'message' => $exception->getMessage(),
-                'code' => $exception->getCode(),
-                'file' => $exception->getFile(),
-                'line' => $exception->getLine(),
-                'trace' => array_slice($exception->getTrace(), 0, 5),
-            ];
+            $this->rabbitmq->pushRaw(
+                json_encode($payload, JSON_THROW_ON_ERROR),
+                $this->queueName,
+                [
+                    'delay' => max(0, $delay),
+                    'properties' => $properties,
+                ],
+            );
 
-            // Use transaction for atomic ack+republish
-            $this->channel->tx_select();
-
-            try {
-                // Republish with exception info to the same queue
-                // This will go through normal retry/DLQ flow
-                $this->rabbitmq->pushRaw(
-                    json_encode($payload, JSON_THROW_ON_ERROR),
-                    $this->queueName
-                );
-
-                // Acknowledge original message
-                $this->rabbitmq->ack($this->message, $this->channel);
-
-                $this->channel->tx_commit();
-
-                Log::debug('Job released with exception info', [
-                    'queue' => $this->queueName,
-                    'job_id' => $this->getJobId(),
-                    'job_name' => $this->getName(),
-                    'exception' => $exception->getMessage(),
-                ]);
-            } catch (\Throwable $txException) {
-                // Rollback transaction
-                try {
-                    $this->channel->tx_rollback();
-                } catch (\Throwable $rollbackException) {
-                    // Channel may be in bad state
-                }
-
-                // Fall back to normal rejection (without exception info)
-                Log::warning('Failed to release with exception info, falling back to reject', [
-                    'queue' => $this->queueName,
-                    'job_id' => $this->getJobId(),
-                    'error' => $txException->getMessage(),
-                ]);
-
-                $this->rabbitmq->reject($this->message, $this->channel, false);
-            }
-        } catch (ConnectionException $e) {
-            Log::error('Failed to release RabbitMQ message with exception', [
+            $this->rabbitmq->ack($this->message, $this->channel);
+        } catch (\Throwable $e) {
+            Log::critical('Failed to release RabbitMQ message; original delivery remains unacknowledged', [
                 'queue' => $this->queueName,
                 'job_id' => $this->getJobId(),
                 'job_name' => $this->getName(),
                 'delivery_tag' => $this->message->getDeliveryTag(),
+                'attempt' => $this->attempts(),
                 'error' => $e->getMessage(),
             ]);
 
@@ -210,34 +192,35 @@ class RabbitMQJob extends Job implements JobContract
     /**
      * Get the number of times the job has been attempted.
      *
-     * Checks payload first (for replayed DLQ messages), then falls back
-     * to x-death headers. This is necessary because x-death headers are
-     * lost when messages are replayed via pushRaw().
+     * Intentional Laravel releases use the package header. Broker delivery
+     * counters do not increase application attempts because they can increase
+     * after a worker crash, a lost connection, or an uncertain acknowledgment.
+     * Payload attempts remain as a compatibility fallback for old DLQ replays.
      */
     public function attempts(): int
     {
         $payload = $this->decoded();
 
-        // Check payload first - this is set when replaying from DLQ
-        if (isset($payload['attempts']) && is_int($payload['attempts'])) {
+        $headers = $this->getHeaders();
+        $attempt = $headers[self::ATTEMPT_HEADER] ?? null;
+
+        if (is_int($attempt) && $attempt > 0) {
+            return $attempt;
+        }
+
+        if (isset($payload['attempts']) && is_int($payload['attempts']) && $payload['attempts'] > 0) {
             return $payload['attempts'];
         }
 
-        // Fall back to x-death header (native RabbitMQ retry tracking)
-        $headers = $this->getHeaders();
-
-        if (isset($headers['x-death']) && is_array($headers['x-death'])) {
-            $totalCount = 0;
-            foreach ($headers['x-death'] as $death) {
-                // php-amqplib may return AMQPTable for nested structures
-                $deathData = $death instanceof AMQPTable ? $death->getNativeData() : $death;
-                $totalCount += (int) ($deathData['count'] ?? 0);
-            }
-
-            return $totalCount + 1;
-        }
-
         return 1;
+    }
+
+    /**
+     * Get the RabbitMQ delivery count for crash-loop diagnostics.
+     */
+    public function brokerDeliveryCount(): int
+    {
+        return max(0, (int) ($this->getHeaders()['x-delivery-count'] ?? 0));
     }
 
     /**

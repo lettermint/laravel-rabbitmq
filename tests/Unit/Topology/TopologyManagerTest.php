@@ -8,6 +8,7 @@ use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Discovery\AttributeScanner;
 use Lettermint\RabbitMQ\Enums\ExchangeType;
 use Lettermint\RabbitMQ\Topology\TopologyManager;
+use PhpAmqpLib\Wire\AMQPTable;
 
 beforeEach(function () {
     $this->mockChannel = mockAMQPChannel();
@@ -194,6 +195,58 @@ test('auto-creates DLQ queue', function () {
 
     expect($result['queues'])->toContain('dlq:emails:outbound');
     expect($result['bindings'])->toContain('emails.dlq -> dlq:emails:outbound [emails.outbound]');
+});
+
+test('declares the DLX exchange for a queue whose DLX derives from its bindings', function () {
+    // No matching Exchange attribute, so the exchange loop does not create the
+    // DLX. declareDlqQueue must declare 'orders.dlq' itself, otherwise the
+    // queue's x-dead-letter-exchange (and x-delivery-limit parking) would target
+    // an undeclared exchange and messages would be dropped.
+    $queueAttr = new ConsumesQueue(
+        queue: 'orders:process',
+        bindings: ['orders' => 'process.*'],
+        quorum: true,
+        deliveryLimit: 3,
+    );
+
+    $this->scanner->shouldReceive('getTopology')->andReturn([
+        'exchanges' => [],
+        'queues' => ['orders:process' => ['attribute' => $queueAttr, 'class' => 'TestJob', 'allBindings' => $queueAttr->bindings]],
+    ]);
+
+    // The DLX exchange must be declared BEFORE the DLQ queue is declared and
+    // bound to it — ordered() guards that sequence, not just its presence.
+    $this->mockChannel->shouldReceive('exchange_declare')
+        ->withArgs(fn ($name, $type) => $name === 'orders.dlq' && $type === 'direct')
+        ->once()
+        ->ordered();
+
+    $this->mockChannel->shouldReceive('queue_declare')
+        ->withArgs(function ($name, $passive, $durable, $exclusive, $autoDelete, $nowait, $arguments): bool {
+            expect($arguments)->toBeInstanceOf(AMQPTable::class)
+                ->and($arguments->getNativeData())->not->toHaveKey('x-message-ttl');
+
+            return $name === 'dlq:orders:process';
+        })
+        ->once()
+        ->ordered()
+        ->andReturn(['dlq:orders:process', 0, 0]);
+
+    $this->mockChannel->shouldReceive('queue_bind')
+        ->withArgs(fn ($queue, $exchange) => $queue === 'dlq:orders:process' && $exchange === 'orders.dlq')
+        ->once()
+        ->ordered();
+
+    $manager = new TopologyManager(
+        $this->channelManager,
+        $this->scanner,
+        $this->config
+    );
+
+    $manager->declare(dryRun: false);
+
+    // Expectations verified on teardown by Mockery.
+    expect(true)->toBeTrue();
 });
 
 test('purges queue', function () {

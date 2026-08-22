@@ -49,13 +49,16 @@ use Lettermint\RabbitMQ\Enums\RetryStrategy;
  *     maxPriority: 10,
  * )]
  *
- * // Single active consumption with one unacknowledged delivery
+ * // Single active consumption with one unacknowledged delivery.
+ * // deliveryLimit protects against repeated broker redelivery after crashes.
+ * // Redelivery can change message order. Jobs must be idempotent.
  * #[ConsumesQueue(
  *     queue: 'ordered:events',
  *     bindings: ['events' => '#'],
  *     quorum: true,
  *     prefetch: 1,
  *     singleActiveConsumer: true,
+ *     deliveryLimit: 5,
  * )]
  * ```
  */
@@ -102,6 +105,7 @@ final class ConsumesQueue
      * @param  int  $prefetch  Consumer prefetch count / QoS (default: 10)
      * @param  int  $timeout  Job timeout in seconds (default: 30)
      * @param  bool  $singleActiveConsumer  Elect one active consumer for the queue while other consumers wait for failover (default: false). This prevents concurrent consumption but does not guarantee strict ordering during redelivery. Compatible with quorum queues. Requires RabbitMQ 3.8+.
+     * @param  int|null  $deliveryLimit  Quorum queue crash-loop limit (`x-delivery-limit`). RabbitMQ dead-letters a message after this number of broker deliveries. It does not set the Laravel attempt count. This setting requires a dead-letter exchange. Queue arguments are immutable. A change can require a controlled queue replacement. (default: null = broker default)
      *
      * @throws InvalidArgumentException When validation fails
      */
@@ -120,6 +124,7 @@ final class ConsumesQueue
         public int $prefetch = 10,
         public int $timeout = 30,
         public bool $singleActiveConsumer = false,
+        public ?int $deliveryLimit = null,
     ) {
         // Validate queue name
         if (trim($this->queue) === '') {
@@ -160,6 +165,31 @@ final class ConsumesQueue
         if ($this->retryAttempts < 0) {
             throw new InvalidArgumentException(
                 "retryAttempts cannot be negative, got {$this->retryAttempts}"
+            );
+        }
+
+        // A quorum delivery limit must be a positive count.
+        if ($this->deliveryLimit !== null && $this->deliveryLimit < 1) {
+            throw new InvalidArgumentException(
+                "deliveryLimit must be at least 1, got {$this->deliveryLimit}"
+            );
+        }
+
+        // Only quorum queues support a delivery limit.
+        if ($this->deliveryLimit !== null && ! $this->quorum) {
+            throw new InvalidArgumentException(
+                'deliveryLimit (x-delivery-limit) is only supported on quorum queues. '.
+                'Either set quorum: true, or remove deliveryLimit.'
+            );
+        }
+
+        // A delivery limit needs a parking destination. RabbitMQ discards the
+        // message when the limit is exceeded and no dead-letter exchange exists.
+        if ($this->deliveryLimit !== null && $this->getDlqExchangeName() === null) {
+            throw new InvalidArgumentException(
+                'deliveryLimit requires a dead-letter exchange so messages that exceed the '.
+                'limit are parked rather than dropped. Provide a binding (to derive the DLQ '.
+                'exchange) or set dlqExchange explicitly.'
             );
         }
 
@@ -310,6 +340,12 @@ final class ConsumesQueue
         // queue raises PRECONDITION_FAILED until the queue is recreated.
         if ($this->singleActiveConsumer) {
             $arguments['x-single-active-consumer'] = true;
+        }
+
+        // This broker counter limits crash redeliveries. Intentional application
+        // retries use the package attempt header. Queue arguments are immutable.
+        if ($this->deliveryLimit !== null && $this->quorum) {
+            $arguments['x-delivery-limit'] = $this->deliveryLimit;
         }
 
         if ($this->maxPriority !== null) {

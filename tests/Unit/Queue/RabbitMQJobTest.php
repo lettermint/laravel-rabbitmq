@@ -6,8 +6,10 @@ use Illuminate\Container\Container;
 use Illuminate\Support\Facades\Log;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Discovery\AttributeScanner;
+use Lettermint\RabbitMQ\Exceptions\PublishException;
 use Lettermint\RabbitMQ\Queue\RabbitMQJob;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
+use PhpAmqpLib\Wire\AMQPTable;
 
 beforeEach(function () {
     $this->container = new Container;
@@ -102,9 +104,10 @@ test('returns 1 for first delivery', function () {
     expect($job->attempts())->toBe(1);
 });
 
-test('calculates attempts from x-death header', function () {
+test('does not use RabbitMQ delivery metadata as Laravel attempts', function () {
     $message = mockAMQPMessage([
         'headers' => [
+            'x-delivery-count' => 9,
             'x-death' => [
                 ['queue' => 'original-queue', 'count' => 2, 'reason' => 'rejected'],
                 ['queue' => 'retry-queue', 'count' => 1, 'reason' => 'expired'],
@@ -121,8 +124,142 @@ test('calculates attempts from x-death header', function () {
         'test-queue'
     );
 
-    // 2 + 1 from x-death + 1 current = 4
-    expect($job->attempts())->toBe(4);
+    expect($job->attempts())->toBe(1)
+        ->and($job->brokerDeliveryCount())->toBe(9);
+});
+
+test('reads Laravel attempts from the package header', function () {
+    $message = mockAMQPMessage([
+        'headers' => [RabbitMQJob::ATTEMPT_HEADER => 3, 'x-delivery-count' => 8],
+    ]);
+
+    $job = new RabbitMQJob(
+        $this->container,
+        $this->rabbitmq,
+        $this->mockChannel,
+        $message,
+        'rabbitmq',
+        'test-queue'
+    );
+
+    expect($job->attempts())->toBe(3);
+});
+
+test('ignores an invalid package attempt header', function () {
+    $message = mockAMQPMessage([
+        'headers' => [RabbitMQJob::ATTEMPT_HEADER => 0],
+    ]);
+
+    $job = new RabbitMQJob(
+        $this->container,
+        $this->rabbitmq,
+        $this->mockChannel,
+        $message,
+        'rabbitmq',
+        'test-queue'
+    );
+
+    expect($job->attempts())->toBe(1);
+});
+
+test('uses legacy payload attempts when the package header is absent', function () {
+    $message = mockAMQPMessage([
+        'body' => createFailedJobPayload('App\\Jobs\\Thing', 'test-queue', attemptCount: 7),
+        'headers' => ['x-delivery-count' => 2],
+    ]);
+
+    $job = new RabbitMQJob(
+        $this->container,
+        $this->rabbitmq,
+        $this->mockChannel,
+        $message,
+        'rabbitmq',
+        'test-queue'
+    );
+
+    expect($job->attempts())->toBe(7);
+});
+
+test('release publishes the next attempt before it acknowledges the original message', function () {
+    $message = mockAMQPMessage([
+        'deliveryTag' => 42,
+        'messageId' => 'message-123',
+        'correlationId' => 'correlation-456',
+        'timestamp' => 123456789,
+        'priority' => 7,
+        'headers' => [
+            'x-custom' => 'keep-me',
+            'x-delivery-count' => 4,
+        ],
+    ]);
+
+    $rabbitmq = Mockery::mock(RabbitMQQueue::class);
+    $rabbitmq->shouldReceive('pushRaw')
+        ->once()
+        ->ordered()
+        ->withArgs(function (string $payload, string $queue, array $options): bool {
+            $properties = $options['properties'];
+            $headers = $properties['application_headers'];
+
+            expect(json_decode($payload, true)['uuid'])->toBe('test-uuid')
+                ->and($queue)->toBe('test-queue')
+                ->and($options['delay'])->toBe(15)
+                ->and($properties['message_id'])->toBe('message-123')
+                ->and($properties['correlation_id'])->toBe('correlation-456')
+                ->and($properties['timestamp'])->toBe(123456789)
+                ->and($properties['priority'])->toBe(7)
+                ->and($headers)->toBeInstanceOf(AMQPTable::class)
+                ->and($headers->getNativeData()['x-custom'])->toBe('keep-me')
+                ->and($headers->getNativeData()[RabbitMQJob::ATTEMPT_HEADER])->toBe(2)
+                ->and($headers->getNativeData())->not->toHaveKey('x-delivery-count');
+
+            return true;
+        })
+        ->andReturn('test-uuid');
+    $rabbitmq->shouldReceive('ack')
+        ->once()
+        ->ordered()
+        ->with($message, $this->mockChannel);
+
+    $job = new RabbitMQJob(
+        $this->container,
+        $rabbitmq,
+        $this->mockChannel,
+        $message,
+        'rabbitmq',
+        'test-queue'
+    );
+
+    $job->release(15);
+
+    expect($job->isReleased())->toBeTrue();
+});
+
+test('release leaves the original unacknowledged when publish fails', function () {
+    Log::spy();
+
+    $message = mockAMQPMessage(['deliveryTag' => 42]);
+    $rabbitmq = Mockery::mock(RabbitMQQueue::class);
+    $rabbitmq->shouldReceive('pushRaw')
+        ->once()
+        ->andThrow(new PublishException('publish failed'));
+    $rabbitmq->shouldNotReceive('ack');
+    $rabbitmq->shouldNotReceive('reject');
+
+    $job = new RabbitMQJob(
+        $this->container,
+        $rabbitmq,
+        $this->mockChannel,
+        $message,
+        'rabbitmq',
+        'test-queue'
+    );
+
+    expect(fn () => $job->release(0))
+        ->toThrow(PublishException::class, 'publish failed');
+
+    Log::shouldHaveReceived('critical')
+        ->withArgs(fn (string $message): bool => str_contains($message, 'remains unacknowledged'));
 });
 
 test('decodes payload correctly', function () {

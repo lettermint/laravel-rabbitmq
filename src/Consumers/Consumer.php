@@ -316,7 +316,8 @@ class Consumer
         if ($this->tries > 0 && $job->attempts() >= $this->tries) {
             $this->failJob($job, $e);
         } else {
-            // Release the job with exception info for DLQ inspection
+            // Intentional retries use a package attempt header. RabbitMQ
+            // delivery count is reserved for crash-loop protection.
             $job->releaseWithException(0, $e);
         }
     }
