@@ -9,6 +9,7 @@ use Lettermint\RabbitMQ\Contracts\HasPriority;
 use Lettermint\RabbitMQ\Discovery\AttributeScanner;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
 use Lettermint\RabbitMQ\Tests\Fixtures\Jobs\PriorityJob;
+use Lettermint\RabbitMQ\Tests\Fixtures\Jobs\RoutedJob;
 use Lettermint\RabbitMQ\Tests\Fixtures\Jobs\SimpleJob;
 
 beforeEach(function () {
@@ -151,6 +152,140 @@ test('uses attribute exchange when available', function () {
 
     expect($exchange)->toBe('emails');
     expect($routingKey)->toBe('outbound.*');
+});
+
+test('injects the job routing key into the payload for HasRoutingKey jobs', function () {
+    $queue = new RabbitMQQueue(
+        $this->channelManager,
+        $this->scanner,
+        $this->config
+    );
+    $queue->setContainer(new Container);
+
+    $reflection = new ReflectionClass($queue);
+    $method = $reflection->getMethod('createPayloadArray');
+    $method->setAccessible(true);
+
+    $payload = $method->invoke($queue, new RoutedJob('events.shard.9'), 'events:shard', '');
+
+    expect($payload['routingKey'])->toBe('events.shard.9');
+
+    // A plain job carries no routingKey field
+    $plain = $method->invoke($queue, new SimpleJob, 'emails:outbound', '');
+    expect($plain)->not->toHaveKey('routingKey');
+});
+
+test('rejects invalid per-message routing keys', function (string $routingKey, string $message) {
+    $queue = new RabbitMQQueue(
+        $this->channelManager,
+        $this->scanner,
+        $this->config
+    );
+    $queue->setContainer(new Container);
+
+    $reflection = new ReflectionClass($queue);
+    $method = $reflection->getMethod('createPayloadArray');
+    $method->setAccessible(true);
+
+    expect(fn () => $method->invoke($queue, new RoutedJob($routingKey), 'events:shard', ''))
+        ->toThrow(InvalidArgumentException::class, $message);
+})->with([
+    'empty' => ['', 'cannot be empty'],
+    'whitespace' => ['   ', 'cannot be empty'],
+    'star wildcard' => ['events.*', 'cannot contain topic wildcards'],
+    'hash wildcard' => ['events.#', 'cannot contain topic wildcards'],
+    'control character' => ["events.\nnext", 'cannot contain control characters'],
+    'more than 255 bytes' => [str_repeat('a', 256), 'cannot exceed 255 bytes'],
+]);
+
+test('rejects an invalid routing key stored in a raw payload', function () {
+    $attribute = new ConsumesQueue(
+        queue: 'emails:outbound',
+        bindings: ['emails' => 'outbound.*']
+    );
+
+    $this->scanner->shouldReceive('getQueueForJob')
+        ->with(SimpleJob::class, Mockery::any())
+        ->andReturn($attribute);
+
+    $queue = new RabbitMQQueue(
+        $this->channelManager,
+        $this->scanner,
+        $this->config
+    );
+
+    $payload = json_encode([
+        'uuid' => 'test-uuid',
+        'displayName' => SimpleJob::class,
+        'routingKey' => 'events.#',
+    ]);
+
+    $reflection = new ReflectionClass($queue);
+    $method = $reflection->getMethod('getExchangeAndRoutingKey');
+    $method->setAccessible(true);
+
+    expect(fn () => $method->invoke($queue, 'emails:outbound', $payload))
+        ->toThrow(InvalidArgumentException::class, 'cannot contain topic wildcards');
+});
+
+test('honors a per-message routing key over the attribute binding, keeping the attribute exchange', function () {
+    $attribute = new ConsumesQueue(
+        queue: 'emails:outbound',
+        bindings: ['emails' => 'outbound.*']
+    );
+
+    $this->scanner->shouldReceive('getQueueForJob')
+        ->with(SimpleJob::class, Mockery::any())
+        ->andReturn($attribute);
+
+    $queue = new RabbitMQQueue(
+        $this->channelManager,
+        $this->scanner,
+        $this->config
+    );
+
+    // A HasRoutingKey job injects `routingKey` into the payload (see createPayloadArray).
+    $payload = json_encode([
+        'uuid' => 'test-uuid',
+        'displayName' => SimpleJob::class,
+        'routingKey' => 'events.shard.7',
+    ]);
+
+    $reflection = new ReflectionClass($queue);
+    $method = $reflection->getMethod('getExchangeAndRoutingKey');
+    $method->setAccessible(true);
+
+    [$exchange, $routingKey] = $method->invoke($queue, 'emails:outbound', $payload);
+
+    expect($exchange)->toBe('emails');       // exchange still resolved from the attribute
+    expect($routingKey)->toBe('events.shard.7'); // routing key overridden per message
+});
+
+test('honors a per-message routing key even on the fallback path', function () {
+    $this->scanner->shouldReceive('getQueueForJob')
+        ->andReturn(null);
+    $this->scanner->shouldReceive('getQueues')
+        ->andReturn(collect([]));
+
+    $queue = new RabbitMQQueue(
+        $this->channelManager,
+        $this->scanner,
+        $this->config
+    );
+
+    $payload = json_encode([
+        'uuid' => 'test-uuid',
+        'displayName' => 'SomeJob',
+        'routingKey' => 'events.shard.3',
+    ]);
+
+    $reflection = new ReflectionClass($queue);
+    $method = $reflection->getMethod('getExchangeAndRoutingKey');
+    $method->setAccessible(true);
+
+    [$exchange, $routingKey] = $method->invoke($queue, 'some:queue', $payload);
+
+    expect($routingKey)->toBe('events.shard.3'); // dynamic key wins over 'fallback.some.queue'
 });
 
 test('uses fallback routing when no attribute', function () {
