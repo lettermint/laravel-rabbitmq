@@ -9,10 +9,23 @@ use Illuminate\Queue\Worker;
 use Illuminate\Queue\WorkerOptions;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
 use Lettermint\RabbitMQ\Exceptions\PublishException;
+use Lettermint\RabbitMQ\Queue\RabbitMQJob;
 use Throwable;
 
 final class RabbitMQWorker extends Worker
 {
+    /**
+     * Preserve the exception before Laravel releases the job.
+     */
+    protected function raiseExceptionOccurredJobEvent($connectionName, $job, Throwable $e)
+    {
+        if ($job instanceof RabbitMQJob) {
+            $job->recordReleaseException($e);
+        }
+
+        parent::raiseExceptionOccurredJobEvent($connectionName, $job, $e);
+    }
+
     /**
      * Process one RabbitMQ delivery with Laravel worker behavior.
      */
