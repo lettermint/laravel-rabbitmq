@@ -114,6 +114,36 @@ test('declares exchanges before queue bindings', function () {
     $this->manager->declare();
 });
 
+test('does not bind a queue to the default exchange', function () {
+    $config = topologyManagerConfig();
+    $config['topology']['queues'] = [
+        'default' => [
+            'bindings' => [],
+            'default_exchange' => true,
+            'dead_letter' => false,
+        ],
+    ];
+    $manager = new TopologyManager(
+        $this->channelManager,
+        testTopologyRegistry($config),
+        $config,
+    );
+    $this->channel->shouldNotReceive('queue_bind')->with('staging.default', '', 'staging.default');
+
+    $result = $manager->declare();
+
+    expect($result['bindings'])->toContain(' -> staging.default [staging.default]');
+});
+
+test('declaration does not delete or unbind broker topology', function () {
+    $this->channel->shouldNotReceive('queue_delete');
+    $this->channel->shouldNotReceive('exchange_delete');
+    $this->channel->shouldNotReceive('queue_unbind');
+    $this->channel->shouldNotReceive('exchange_unbind');
+
+    $this->manager->declare();
+});
+
 test('declares exchange bindings after both exchanges exist', function () {
     $config = topologyManagerConfig([
         'topology' => [

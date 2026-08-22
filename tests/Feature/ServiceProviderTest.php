@@ -6,6 +6,7 @@ use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Connection\ConnectionManager;
 use Lettermint\RabbitMQ\Consumers\Consumer;
 use Lettermint\RabbitMQ\Discovery\AttributeScanner;
+use Lettermint\RabbitMQ\Discovery\AttributeTopologyCache;
 use Lettermint\RabbitMQ\Monitoring\HealthCheck;
 use Lettermint\RabbitMQ\Monitoring\QueueMetrics;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
@@ -34,6 +35,14 @@ describe('RabbitMQServiceProvider', function () {
             $instance2 = app(AttributeScanner::class);
 
             expect($instance1)->toBeInstanceOf(AttributeScanner::class);
+            expect($instance1)->toBe($instance2);
+        });
+
+        it('registers AttributeTopologyCache as singleton', function () {
+            $instance1 = app(AttributeTopologyCache::class);
+            $instance2 = app(AttributeTopologyCache::class);
+
+            expect($instance1)->toBeInstanceOf(AttributeTopologyCache::class);
             expect($instance1)->toBe($instance2);
         });
 

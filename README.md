@@ -134,9 +134,20 @@ Use `rabbitmq:topology --format=json` as normalized input for CI checks.
 
 ### Attribute compatibility
 
-The `#[Exchange]` and `#[ConsumesQueue]` attributes remain available for applications that do not use an explicit registry. Attribute discovery runs only in console processes. It does not scan application files during a normal web request.
+The `#[Exchange]` and `#[ConsumesQueue]` attributes remain available. Compile them during the application build:
 
-Strict mode requires an explicit queue registry. Use the explicit registry for deployments that must reject every unknown queue.
+```bash
+php artisan rabbitmq:cache
+php artisan rabbitmq:cache --check
+```
+
+The cache contains logical topology. The package applies the physical prefix when it loads the cache. The same application image can therefore use a different prefix in each environment. An explicit `topology.queues` configuration takes priority over the attribute cache.
+
+Web requests load the compiled cache and do not scan application files. Console commands scan attributes when no compiled cache or explicit queue registry exists.
+
+Strict mode accepts an explicit registry or a compiled attribute cache. In non-strict mode, an unknown queue uses the RabbitMQ default exchange. The package emits an `UnknownQueueFallbackUsed` event and a structured `rabbitmq.queue.fallback_used` warning. Mandatory publishing and publisher confirms still make a missing physical queue visible as a publish failure.
+
+`rabbitmq:cache` and `rabbitmq:declare` are additive. They do not delete a queue, exchange, or binding that is no longer present in the application. Remove broker topology only through a separate, controlled operation.
 
 ## Dispatch and routing
 

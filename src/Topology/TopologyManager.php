@@ -87,7 +87,7 @@ final class TopologyManager
                 foreach ($routingKeys as $routingKey) {
                     $result['bindings'][] = "{$exchange} -> {$definition->physicalName} [{$routingKey}]";
 
-                    if ($channel instanceof AMQPChannel) {
+                    if ($channel instanceof AMQPChannel && $exchange !== '') {
                         $channel->queue_bind($definition->physicalName, $exchange, $routingKey);
                     }
                 }

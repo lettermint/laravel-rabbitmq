@@ -63,8 +63,8 @@ return [
     |--------------------------------------------------------------------------
     |
     | Use logical names as keys. The physical prefix is added to every queue
-    | and exchange. An empty queue list keeps attribute discovery available for
-    | existing applications. Strict mode requires an explicit queue list.
+    | and exchange. An empty queue list keeps attribute discovery available.
+    | A compiled attribute cache is loaded as explicit topology at runtime.
     |
     */
 
@@ -78,8 +78,9 @@ return [
     | Attribute Discovery
     |--------------------------------------------------------------------------
     |
-    | Attribute discovery runs only for console commands. It does not scan
-    | application files during a normal web request.
+    | Use rabbitmq:cache during the build to compile the attributes. Web
+    | requests load this cache and do not scan application files. The cache
+    | contains logical names. The physical prefix is applied after it is loaded.
     |
     */
 

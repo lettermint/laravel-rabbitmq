@@ -4,12 +4,14 @@ declare(strict_types=1);
 
 namespace Lettermint\RabbitMQ\Topology;
 
+use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Support\Arr;
 use InvalidArgumentException;
 use Lettermint\RabbitMQ\Attributes\ConsumesQueue;
 use Lettermint\RabbitMQ\Attributes\Exchange;
 use Lettermint\RabbitMQ\Discovery\AttributeScanner;
 use Lettermint\RabbitMQ\Enums\TopologyEntityType;
+use Lettermint\RabbitMQ\Events\UnknownQueueFallbackUsed;
 use Lettermint\RabbitMQ\Exceptions\TopologyException;
 use Lettermint\RabbitMQ\Exceptions\UnknownBindingException;
 use Lettermint\RabbitMQ\Exceptions\UnknownQueueException;
@@ -23,12 +25,16 @@ final class TopologyRegistry
     /** @var array<string, array{name: string, type: string, durable: bool, auto_delete: bool, internal: bool, arguments: array<string, mixed>, bind_to: string|null, bind_routing_key: string}>|null */
     private ?array $exchanges = null;
 
+    /** @var array<string, QueueDefinition> */
+    private array $fallbackQueues = [];
+
     /**
      * @param  array<string, mixed>  $config
      */
     public function __construct(
         private readonly AttributeScanner $scanner,
         private readonly array $config,
+        private readonly ?Dispatcher $events = null,
     ) {}
 
     public function isStrict(): bool
@@ -106,12 +112,16 @@ final class TopologyRegistry
             throw $exception;
         }
 
+        if (isset($this->fallbackQueues[$logicalName])) {
+            return $this->fallbackQueues[$logicalName];
+        }
+
         $physicalName = $this->physicalName($logicalName);
         $deadLetterQueue = $this->physicalName($this->deadLetterQueuePrefix().$logicalName);
         $this->assertValidName($physicalName, 'physical queue');
         $this->assertValidName($deadLetterQueue, 'physical queue');
 
-        return new QueueDefinition(
+        $definition = new QueueDefinition(
             logicalName: $logicalName,
             physicalName: $physicalName,
             bindings: ['' => [$physicalName]],
@@ -128,6 +138,16 @@ final class TopologyRegistry
             deadLetterQueue: $deadLetterQueue,
             deadLetterRoutingKey: $logicalName,
         );
+
+        $this->fallbackQueues[$logicalName] = $definition;
+
+        try {
+            $this->events?->dispatch(new UnknownQueueFallbackUsed($logicalName, $physicalName));
+        } catch (\Throwable $exception) {
+            ExceptionReporter::report($exception);
+        }
+
+        return $definition;
     }
 
     public function physicalQueue(string $logicalName): string
@@ -163,6 +183,7 @@ final class TopologyRegistry
     {
         $this->queues = null;
         $this->exchanges = null;
+        $this->fallbackQueues = [];
     }
 
     /** @return array<string, QueueDefinition> */
@@ -253,7 +274,7 @@ final class TopologyRegistry
                 overflow: $overflow,
                 deadLetterEnabled: $deadLetterEnabled,
                 deadLetterExchange: $deadLetterExchange,
-                deadLetterQueue: $this->physicalName($this->deadLetterQueuePrefix().$logicalName),
+                deadLetterQueue: $this->physicalName((string) ($settings['dead_letter_queue'] ?? $this->deadLetterQueuePrefix().$logicalName)),
                 deadLetterRoutingKey: $deadLetterRoutingKey,
             );
         }
@@ -270,6 +291,14 @@ final class TopologyRegistry
     private function normalizeExplicitBindings(string $logicalName, array $settings): array
     {
         $configuredBindings = $settings['bindings'] ?? null;
+
+        if (($settings['default_exchange'] ?? false) === true) {
+            if (is_array($configuredBindings) && $configuredBindings !== []) {
+                throw new TopologyException("Queue [{$logicalName}] cannot combine default_exchange with bindings.");
+            }
+
+            return ['' => [$this->physicalName($logicalName)]];
+        }
 
         if ($configuredBindings === null) {
             $exchange = (string) ($settings['exchange'] ?? 'jobs');
