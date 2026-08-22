@@ -34,6 +34,9 @@ use Throwable;
 
 final class RabbitMQQueue extends Queue implements QueueContract
 {
+    /** @var array<string, mixed> */
+    protected $config;
+
     protected string $default;
 
     protected string $brokerConnection;
