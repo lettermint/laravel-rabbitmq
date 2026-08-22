@@ -393,7 +393,7 @@ final class RabbitMQQueue extends Queue implements QueueContract
             try {
                 $this->channelManager->recoverConnection($this->brokerConnection);
             } catch (Throwable $recoveryException) {
-                report($recoveryException);
+                $this->reportSafely($recoveryException);
             }
 
             $this->failPublish(
@@ -426,7 +426,7 @@ final class RabbitMQQueue extends Queue implements QueueContract
             messageId: $messageId,
             exception: $exception,
         ));
-        report($exception);
+        $this->reportSafely($exception);
 
         throw $exception;
     }
@@ -436,7 +436,16 @@ final class RabbitMQQueue extends Queue implements QueueContract
         try {
             $this->events->dispatch($event);
         } catch (Throwable $exception) {
+            $this->reportSafely($exception);
+        }
+    }
+
+    private function reportSafely(Throwable $exception): void
+    {
+        try {
             report($exception);
+        } catch (Throwable) {
+            // Monitoring must not replace the publisher result.
         }
     }
 
