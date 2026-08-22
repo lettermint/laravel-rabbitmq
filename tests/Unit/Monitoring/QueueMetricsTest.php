@@ -17,7 +17,7 @@ beforeEach(function () {
 
 test('getQueueStats indicates not connected on error', function () {
     $this->channelManager->shouldReceive('topologyChannel')
-        ->andThrow(new \Exception('Channel failed'));
+        ->andThrow(new Exception('Channel failed'));
 
     $metrics = new QueueMetrics($this->channelManager);
 
@@ -32,7 +32,7 @@ test('getQueueStats logs warning on error', function () {
     Log::spy();
 
     $this->channelManager->shouldReceive('topologyChannel')
-        ->andThrow(new \Exception('Channel failed'));
+        ->andThrow(new Exception('Channel failed'));
 
     $metrics = new QueueMetrics($this->channelManager);
     $metrics->getQueueStats('test-queue');

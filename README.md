@@ -257,6 +257,36 @@ class UrgentTaskJob implements ShouldQueue, HasPriority
 UrgentTaskJob::dispatch($taskId, priority: 10);
 ```
 
+**Single active consumption** for an ordered workload:
+
+```php
+#[ConsumesQueue(
+    queue: 'ordered-events',
+    bindings: ['events' => '#'],
+    quorum: true,
+    prefetch: 1,                 // one unacked message at a time
+    singleActiveConsumer: true,  // one consumer processes; others stand by
+)]
+class OrderedEventJob implements ShouldQueue
+{
+    // ...
+}
+```
+
+RabbitMQ normally distributes deliveries across connected consumers.
+`singleActiveConsumer: true` elects one active consumer per queue. Other
+consumers remain available for failover. Combine it with `prefetch: 1` to
+limit the active consumer to one unacknowledged delivery.
+
+This setting prevents concurrent consumption from the queue. It does not
+guarantee strict end-to-end FIFO ordering. A rejected or redelivered message
+can be delivered in a different order after a failure. It is compatible with
+quorum queues and requires RabbitMQ 3.8 or later.
+
+> **Note:** queue arguments are immutable after declaration. Use a new queue
+> name or perform a controlled queue replacement when you enable this setting
+> on an existing deployment. The setting defaults to `false`.
+
 **Delayed/scheduled messages:**
 
 ```php

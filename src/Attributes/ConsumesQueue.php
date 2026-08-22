@@ -48,6 +48,15 @@ use Lettermint\RabbitMQ\Enums\RetryStrategy;
  *     quorum: false,
  *     maxPriority: 10,
  * )]
+ *
+ * // Single active consumption with one unacknowledged delivery
+ * #[ConsumesQueue(
+ *     queue: 'ordered:events',
+ *     bindings: ['events' => '#'],
+ *     quorum: true,
+ *     prefetch: 1,
+ *     singleActiveConsumer: true,
+ * )]
  * ```
  */
 #[Attribute(Attribute::TARGET_CLASS | Attribute::IS_REPEATABLE)]
@@ -92,6 +101,7 @@ final class ConsumesQueue
      * @param  array<int>  $retryDelays  Delay between retries in seconds [60, 300, 900]
      * @param  int  $prefetch  Consumer prefetch count / QoS (default: 10)
      * @param  int  $timeout  Job timeout in seconds (default: 30)
+     * @param  bool  $singleActiveConsumer  Elect one active consumer for the queue while other consumers wait for failover (default: false). This prevents concurrent consumption but does not guarantee strict ordering during redelivery. Compatible with quorum queues. Requires RabbitMQ 3.8+.
      *
      * @throws InvalidArgumentException When validation fails
      */
@@ -109,6 +119,7 @@ final class ConsumesQueue
         public array $retryDelays = [60, 300, 900],
         public int $prefetch = 10,
         public int $timeout = 30,
+        public bool $singleActiveConsumer = false,
     ) {
         // Validate queue name
         if (trim($this->queue) === '') {
@@ -291,6 +302,14 @@ final class ConsumesQueue
 
         if ($this->quorum) {
             $arguments['x-queue-type'] = 'quorum';
+        }
+
+        // Opt-in only. Emitted solely when explicitly enabled so the arguments
+        // table stays byte-identical for existing queues — RabbitMQ freezes queue
+        // arguments at declaration time, so adding this to an already-declared
+        // queue raises PRECONDITION_FAILED until the queue is recreated.
+        if ($this->singleActiveConsumer) {
+            $arguments['x-single-active-consumer'] = true;
         }
 
         if ($this->maxPriority !== null) {

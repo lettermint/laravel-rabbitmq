@@ -244,6 +244,29 @@ describe('ConsumesQueue attribute', function () {
             expect($args)->not->toHaveKey('x-queue-type');
         });
 
+        it('includes single active consumer argument when enabled', function () {
+            $attr = new ConsumesQueue(queue: 'test', singleActiveConsumer: true);
+            $args = $attr->getQueueArguments();
+
+            expect($args)->toHaveKey('x-single-active-consumer');
+            expect($args['x-single-active-consumer'])->toBeTrue();
+        });
+
+        it('omits single active consumer argument by default', function () {
+            $attr = new ConsumesQueue(queue: 'test');
+            $args = $attr->getQueueArguments();
+
+            expect($args)->not->toHaveKey('x-single-active-consumer');
+        });
+
+        it('supports single active consumer alongside quorum queues', function () {
+            $attr = new ConsumesQueue(queue: 'test', quorum: true, singleActiveConsumer: true);
+            $args = $attr->getQueueArguments();
+
+            expect($args['x-queue-type'])->toBe('quorum');
+            expect($args['x-single-active-consumer'])->toBeTrue();
+        });
+
         it('includes maxPriority argument', function () {
             $attr = new ConsumesQueue(queue: 'test', quorum: false, maxPriority: 10);
             $args = $attr->getQueueArguments();
