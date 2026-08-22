@@ -49,7 +49,7 @@ use Lettermint\RabbitMQ\Enums\RetryStrategy;
  *     maxPriority: 10,
  * )]
  *
- * // Strict FIFO ordering (single active consumer + prefetch 1)
+ * // Single active consumption with one unacknowledged delivery
  * #[ConsumesQueue(
  *     queue: 'ordered:events',
  *     bindings: ['events' => '#'],
@@ -101,7 +101,7 @@ final class ConsumesQueue
      * @param  array<int>  $retryDelays  Delay between retries in seconds [60, 300, 900]
      * @param  int  $prefetch  Consumer prefetch count / QoS (default: 10)
      * @param  int  $timeout  Job timeout in seconds (default: 30)
-     * @param  bool  $singleActiveConsumer  Elect a single active consumer for the queue; other consumers stay on standby and take over on failover (default: false). Enables strict FIFO ordering even when multiple workers connect. Compatible with quorum queues. Requires RabbitMQ 3.8+.
+     * @param  bool  $singleActiveConsumer  Elect one active consumer for the queue while other consumers wait for failover (default: false). This prevents concurrent consumption but does not guarantee strict ordering during redelivery. Compatible with quorum queues. Requires RabbitMQ 3.8+.
      *
      * @throws InvalidArgumentException When validation fails
      */

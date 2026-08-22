@@ -257,7 +257,7 @@ class UrgentTaskJob implements ShouldQueue, HasPriority
 UrgentTaskJob::dispatch($taskId, priority: 10);
 ```
 
-**Strict FIFO ordering** with a single active consumer:
+**Single active consumption** for an ordered workload:
 
 ```php
 #[ConsumesQueue(
@@ -273,18 +273,19 @@ class OrderedEventJob implements ShouldQueue
 }
 ```
 
-RabbitMQ round-robins a queue across all connected consumers by default, so
-running more than one worker breaks ordering. `singleActiveConsumer: true`
-elects a single active consumer per queue — additional workers connect as
-hot standbys and automatically take over on failover — which preserves
-publish order even if a second worker is (accidentally) started. Combine it
-with `prefetch: 1` for strict, one-at-a-time FIFO. It is compatible with
-quorum queues and requires RabbitMQ 3.8+.
+RabbitMQ normally distributes deliveries across connected consumers.
+`singleActiveConsumer: true` elects one active consumer per queue. Other
+consumers remain available for failover. Combine it with `prefetch: 1` to
+limit the active consumer to one unacknowledged delivery.
 
-> **Note:** queue arguments are immutable once a queue is declared. Enabling
-> this on a queue that already exists raises `PRECONDITION_FAILED` until the
-> queue is deleted and re-declared. The setting is opt-in and defaults to
-> `false`, so existing deployments are unaffected until you enable it.
+This setting prevents concurrent consumption from the queue. It does not
+guarantee strict end-to-end FIFO ordering. A rejected or redelivered message
+can be delivered in a different order after a failure. It is compatible with
+quorum queues and requires RabbitMQ 3.8 or later.
+
+> **Note:** queue arguments are immutable after declaration. Use a new queue
+> name or perform a controlled queue replacement when you enable this setting
+> on an existing deployment. The setting defaults to `false`.
 
 **Delayed/scheduled messages:**
 

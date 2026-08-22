@@ -10,8 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 * `ConsumesQueue`: opt-in `singleActiveConsumer` flag that declares the queue
-  with `x-single-active-consumer`, electing a single active consumer (with
-  standby failover) for strict FIFO ordering across multiple workers.
+  with `x-single-active-consumer`, electing one active consumer with standby
+  failover. This limits concurrent consumption but does not guarantee strict
+  end-to-end FIFO ordering during redelivery or failure recovery.
   Defaults to `false`; the queue-arguments table is unchanged when not set, so
   existing queues are unaffected. Compatible with quorum queues.
 
