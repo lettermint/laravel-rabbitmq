@@ -22,7 +22,7 @@ use Lettermint\RabbitMQ\Consumers\Consumer;
 class ConsumeCommand extends Command
 {
     protected $signature = 'rabbitmq:consume
-        {queue : The queue to consume from}
+        {queue* : The queue(s) to consume from}
         {--connection=rabbitmq : The queue connection to use}
         {--prefetch=10 : Number of messages to prefetch}
         {--timeout=60 : Seconds to wait for a message}
@@ -36,7 +36,7 @@ class ConsumeCommand extends Command
         {--stop-when-empty : Stop when the queue is empty}
         {--quiet-exit : Exit quietly without error when stopped}';
 
-    protected $description = 'Consume messages from a RabbitMQ queue';
+    protected $description = 'Consume messages from one or more RabbitMQ queues';
 
     /**
      * Job start times keyed by job ID for accurate timing.
@@ -47,16 +47,17 @@ class ConsumeCommand extends Command
 
     public function handle(Consumer $consumer, ExceptionHandler $handler): int
     {
-        $queue = $this->argument('queue');
+        /** @var list<string> $queues */
+        $queues = $this->argument('queue');
 
-        $this->components->info("Starting consumer for queue: {$queue}");
+        $this->components->info('Starting consumer for queue(s): '.implode(', ', $queues));
 
         // Register event listeners for output
         $this->listenForEvents();
 
         try {
             $consumer
-                ->setQueue($queue)
+                ->setQueues($queues)
                 ->setConnection($this->option('connection'))
                 ->setPrefetch((int) $this->option('prefetch'))
                 ->setTimeout((int) $this->option('timeout'))

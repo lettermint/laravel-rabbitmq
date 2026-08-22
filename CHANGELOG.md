@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   binding key. The exchange is still resolved from the attribute. The package
   validates the key and stores it in the payload so a release or replay keeps
   the same route. Jobs without the contract are unchanged.
+* `rabbitmq:consume` now accepts multiple queue names, so a single worker
+  process can consume from several queues (`rabbitmq:consume orders payments`).
+  The worker registers one consumer per queue on a single channel. RabbitMQ
+  applies `--prefetch` to each consumer. A single queue argument behaves as it
+  did before. Redelivery does not have an ordering guarantee.
 
 ## 1.0.0 - 2026-01-02
 

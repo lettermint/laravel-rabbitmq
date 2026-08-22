@@ -13,6 +13,7 @@ use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Queue\Events\Looping;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Log;
+use InvalidArgumentException;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Discovery\AttributeScanner;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
@@ -24,6 +25,7 @@ use PhpAmqpLib\Connection\Heartbeat\PCNTLHeartbeatSender;
 use PhpAmqpLib\Exception\AMQPChannelClosedException;
 use PhpAmqpLib\Exception\AMQPConnectionClosedException;
 use PhpAmqpLib\Exception\AMQPIOException;
+use PhpAmqpLib\Exception\AMQPProtocolChannelException;
 use PhpAmqpLib\Exception\AMQPRuntimeException;
 use PhpAmqpLib\Exception\AMQPTimeoutException;
 use PhpAmqpLib\Message\AMQPMessage;
@@ -67,7 +69,12 @@ use Throwable;
  */
 class Consumer
 {
-    protected string $queue = 'default';
+    /**
+     * The queues to consume from.
+     *
+     * @var list<string>
+     */
+    protected array $queues = ['default'];
 
     protected string $connection = 'rabbitmq';
 
@@ -117,9 +124,11 @@ class Consumer
     protected ?AMQPChannel $channel = null;
 
     /**
-     * Consumer tag for cancelling consumption.
+     * Consumer tags for cancelling consumption, keyed by queue name.
+     *
+     * @var array<string, string>
      */
-    protected string $consumerTag = '';
+    protected array $consumerTags = [];
 
     public function __construct(
         protected ChannelManager $channelManager,
@@ -142,23 +151,35 @@ class Consumer
     {
         $this->startTime = Carbon::now();
         $this->jobsProcessed = 0;
+        $this->shouldQuit = false;
+        $this->consumerTags = [];
 
         try {
-            $this->channel = $this->channelManager->consumeChannel();
+            $this->channel = $this->channelManager->consumeChannel($this->connection);
             $this->channel->basic_qos(0, $this->prefetch, false);
-        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPRuntimeException $e) {
+        } catch (AMQPIOException|AMQPChannelClosedException|AMQPConnectionClosedException|AMQPProtocolChannelException|AMQPRuntimeException $e) {
+            $this->channel = null;
+            $this->channelManager->closeChannel('consume', $this->connection);
+
             Log::error('RabbitMQ consumer failed to start', [
-                'queue' => $this->queue,
+                'queues' => $this->queues,
                 'error' => $e->getMessage(),
             ]);
 
             throw new ConnectionException(
-                "Consumer failed to initialize for queue '{$this->queue}': {$e->getMessage()}",
+                "Consumer failed to initialize for queue(s) '{$this->queueLabel()}': {$e->getMessage()}",
                 previous: $e
             );
         }
 
-        $connection = $this->channelManager->getConnection();
+        try {
+            $connection = $this->channelManager->getConnection($this->connection);
+        } catch (Throwable $e) {
+            $this->channel = null;
+            $this->channelManager->closeChannel('consume', $this->connection);
+
+            throw $e;
+        }
 
         // Register heartbeat sender BEFORE consuming
         // Note: PCNTLHeartbeatSender uses SIGALRM which may conflict with Laravel's
@@ -171,13 +192,13 @@ class Consumer
                 $this->heartbeatSender->register();
 
                 Log::debug('RabbitMQ heartbeat sender registered', [
-                    'queue' => $this->queue,
+                    'queues' => $this->queues,
                     'heartbeat_interval' => $connection->getHeartbeat(),
                 ]);
             } catch (Throwable $e) {
                 // Registration can fail if signal handlers conflict or pcntl is misconfigured
                 Log::warning('RabbitMQ heartbeat sender registration failed - long-running jobs may cause connection drops', [
-                    'queue' => $this->queue,
+                    'queues' => $this->queues,
                     'heartbeat_interval' => $connection->getHeartbeat(),
                     'error' => $e->getMessage(),
                 ]);
@@ -190,22 +211,26 @@ class Consumer
         $this->registerSignalHandlers();
 
         try {
-            // Register consumer callback (push-based)
-            $this->consumerTag = $this->channel->basic_consume(
-                $this->queue,
-                '',              // consumer tag (auto-generated)
-                false,           // no_local
-                false,           // no_ack (we ack manually)
-                false,           // exclusive
-                false,           // nowait
-                function (AMQPMessage $message): void {
-                    $this->handleMessage($message);
-                }
-            );
+            // Register one callback per queue on one channel. RabbitMQ applies
+            // non-global QoS to each consumer. The closure keeps the source
+            // queue name for job events, logging, and dead-letter handling.
+            foreach ($this->queues as $queue) {
+                $this->consumerTags[$queue] = $this->channel->basic_consume(
+                    $queue,
+                    '',              // consumer tag (auto-generated)
+                    false,           // no_local
+                    false,           // no_ack (we ack manually)
+                    false,           // exclusive
+                    false,           // nowait
+                    function (AMQPMessage $message) use ($queue): void {
+                        $this->handleMessage($message, $queue);
+                    }
+                );
+            }
 
             Log::info('RabbitMQ consumer started', [
-                'queue' => $this->queue,
-                'consumer_tag' => $this->consumerTag,
+                'queues' => $this->queues,
+                'consumer_tags' => $this->consumerTags,
                 'prefetch' => $this->prefetch,
             ]);
 
@@ -217,7 +242,7 @@ class Consumer
                 }
 
                 // Fire the looping event
-                $this->events->dispatch(new Looping($this->connection, $this->queue));
+                $this->events->dispatch(new Looping($this->connection, $this->queueLabel()));
 
                 try {
                     // wait() processes heartbeats while waiting for messages
@@ -231,15 +256,15 @@ class Consumer
                     }
                 }
             }
-        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPRuntimeException $e) {
+        } catch (AMQPIOException|AMQPChannelClosedException|AMQPConnectionClosedException|AMQPProtocolChannelException|AMQPRuntimeException $e) {
             Log::error('RabbitMQ consumer connection lost', [
-                'queue' => $this->queue,
+                'queues' => $this->queues,
                 'jobs_processed' => $this->jobsProcessed,
                 'error' => $e->getMessage(),
             ]);
 
             throw new ConnectionException(
-                "Consumer lost connection to queue '{$this->queue}': {$e->getMessage()}",
+                "Consumer lost connection to queue(s) '{$this->queueLabel()}': {$e->getMessage()}",
                 previous: $e
             );
         } finally {
@@ -250,7 +275,7 @@ class Consumer
     /**
      * Handle an incoming message.
      */
-    protected function handleMessage(AMQPMessage $message): void
+    protected function handleMessage(AMQPMessage $message, string $queue): void
     {
         $job = new RabbitMQJob(
             container: app(),
@@ -258,7 +283,7 @@ class Consumer
             channel: $message->getChannel(),
             message: $message,
             connectionName: $this->connection,
-            queueName: $this->queue
+            queueName: $queue
         );
 
         $this->processJob($job);
@@ -336,7 +361,7 @@ class Consumer
             $this->rabbitmq->reject($job->getMessage(), $job->getChannel(), false);
         } catch (ConnectionException $rejectException) {
             Log::critical('Failed to reject job after failure - message state undefined', [
-                'queue' => $this->queue,
+                'queue' => $job->getQueue(),
                 'job_id' => $job->getJobId(),
                 'job_name' => $job->getName(),
                 'original_error' => $e->getMessage(),
@@ -365,7 +390,7 @@ class Consumer
         // Check if pcntl extension is available
         if (! extension_loaded('pcntl')) {
             Log::warning('RabbitMQ heartbeat sender not available: pcntl extension not loaded', [
-                'queue' => $this->queue,
+                'queues' => $this->queues,
             ]);
 
             return false;
@@ -390,25 +415,31 @@ class Consumer
             $this->heartbeatSender = null;
 
             Log::debug('RabbitMQ heartbeat sender unregistered', [
-                'queue' => $this->queue,
+                'queues' => $this->queues,
             ]);
         }
 
-        // Cancel consumer
-        if ($this->channel !== null && $this->channel->is_open() && $this->consumerTag !== '') {
-            try {
-                $this->channel->basic_cancel($this->consumerTag);
-            } catch (AMQPIOException|AMQPChannelClosedException $e) {
-                Log::debug('Consumer cancel during cleanup (expected)', [
-                    'queue' => $this->queue,
-                    'consumer_tag' => $this->consumerTag,
-                    'error' => $e->getMessage(),
-                ]);
+        // Cancel every registered consumer
+        if ($this->channel !== null && $this->channel->is_open()) {
+            foreach ($this->consumerTags as $queue => $consumerTag) {
+                try {
+                    $this->channel->basic_cancel($consumerTag);
+                } catch (AMQPIOException|AMQPChannelClosedException $e) {
+                    Log::debug('Consumer cancel during cleanup (expected)', [
+                        'queue' => $queue,
+                        'consumer_tag' => $consumerTag,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
             }
         }
 
+        $this->consumerTags = [];
+        $this->channel = null;
+        $this->channelManager->closeChannel('consume', $this->connection);
+
         Log::info('RabbitMQ consumer stopped', [
-            'queue' => $this->queue,
+            'queues' => $this->queues,
             'jobs_processed' => $this->jobsProcessed,
             'runtime_seconds' => $this->startTime?->diffInSeconds(Carbon::now()),
         ]);
@@ -480,11 +511,49 @@ class Consumer
         }
     }
 
+    /**
+     * Human-readable label for the consumed queue(s), used in logs and events.
+     */
+    protected function queueLabel(): string
+    {
+        return implode(', ', $this->queues);
+    }
+
     // Fluent setters
 
     public function setQueue(string $queue): self
     {
-        $this->queue = $queue;
+        return $this->setQueues([$queue]);
+    }
+
+    /**
+     * Set the queues to consume from.
+     *
+     * @param  array<array-key, mixed>  $queues
+     *
+     * @throws InvalidArgumentException
+     */
+    public function setQueues(array $queues): self
+    {
+        if ($queues === []) {
+            throw new InvalidArgumentException('At least one RabbitMQ queue is required');
+        }
+
+        $normalized = [];
+
+        foreach ($queues as $queue) {
+            if (! is_string($queue) || trim($queue) === '') {
+                throw new InvalidArgumentException('RabbitMQ queue names must be non-empty strings');
+            }
+
+            $normalized[] = trim($queue);
+        }
+
+        if (count(array_unique($normalized)) !== count($normalized)) {
+            throw new InvalidArgumentException('RabbitMQ queue names must be unique');
+        }
+
+        $this->queues = $normalized;
 
         return $this;
     }
@@ -498,6 +567,10 @@ class Consumer
 
     public function setPrefetch(int $prefetch): self
     {
+        if ($prefetch < 1) {
+            throw new InvalidArgumentException('RabbitMQ prefetch must be at least 1');
+        }
+
         $this->prefetch = $prefetch;
 
         return $this;
@@ -505,6 +578,10 @@ class Consumer
 
     public function setTimeout(int $timeout): self
     {
+        if ($timeout < 1) {
+            throw new InvalidArgumentException('RabbitMQ wait timeout must be at least 1 second');
+        }
+
         $this->timeout = $timeout;
 
         return $this;
