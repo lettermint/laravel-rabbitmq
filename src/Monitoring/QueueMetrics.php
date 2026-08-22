@@ -6,6 +6,7 @@ namespace Lettermint\RabbitMQ\Monitoring;
 
 use Illuminate\Support\Facades\Log;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
+use Lettermint\RabbitMQ\Topology\TopologyRegistry;
 use PhpAmqpLib\Exception\AMQPProtocolChannelException;
 
 /**
@@ -18,6 +19,8 @@ class QueueMetrics
 {
     public function __construct(
         protected ChannelManager $channelManager,
+        protected TopologyRegistry $registry,
+        protected array $config,
     ) {}
 
     /**
@@ -31,8 +34,16 @@ class QueueMetrics
      */
     public function getQueueStats(string $queueName): array
     {
+        return $this->getPhysicalQueueStats($this->registry->physicalQueue($queueName));
+    }
+
+    /**
+     * @return array{messages: int|null, consumers: int|null, rate: float|null, connected: bool, notice: string|null, error: string|null}
+     */
+    public function getPhysicalQueueStats(string $queueName): array
+    {
         try {
-            $channel = $this->channelManager->topologyChannel();
+            $channel = $this->channelManager->topologyChannel($this->brokerConnection());
 
             // Passive declare returns [queue_name, message_count, consumer_count]
             [$name, $messageCount, $consumerCount] = $channel->queue_declare(
@@ -54,7 +65,7 @@ class QueueMetrics
         } catch (AMQPProtocolChannelException $e) {
             // Queue doesn't exist (404) or other protocol error
             // Channel is now closed by RabbitMQ - invalidate it
-            $this->channelManager->closeChannel('topology');
+            $this->channelManager->closeChannel('topology', $this->brokerConnection());
 
             Log::warning('Failed to get queue stats: queue may not exist', [
                 'queue' => $queueName,
@@ -112,5 +123,10 @@ class QueueMetrics
     public function hasStatistics(): bool
     {
         return true;
+    }
+
+    protected function brokerConnection(): string
+    {
+        return (string) ($this->config['connection'] ?? $this->config['default'] ?? 'default');
     }
 }

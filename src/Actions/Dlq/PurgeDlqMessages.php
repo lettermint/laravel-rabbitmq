@@ -10,6 +10,7 @@ use Lettermint\RabbitMQ\Actions\Dlq\Results\DlqPurgeResult;
 use Lettermint\RabbitMQ\Actions\Dlq\Results\DlqQueueConfig;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Exceptions\DlqOperationException;
+use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Message\AMQPMessage;
 
@@ -24,6 +25,7 @@ final class PurgeDlqMessages
         private ChannelManager $channelManager,
         private ResolveDlqQueue $resolveDlqQueue,
         private FindDlqMessage $findDlqMessage,
+        private RabbitMQQueue $rabbitmq,
     ) {}
 
     /**
@@ -38,7 +40,10 @@ final class PurgeDlqMessages
         bool $dryRun = false,
     ): DlqPurgeResult {
         $config = ($this->resolveDlqQueue)($queueName);
-        $channel = $this->channelManager->channel('dlq-purge');
+        $channel = $this->channelManager->channel(
+            'dlq-purge',
+            $this->rabbitmq->getBrokerConnectionName(),
+        );
 
         if ($messageId !== null) {
             return $this->purgeById($channel, $config, $messageId, $dryRun);
@@ -115,7 +120,7 @@ final class PurgeDlqMessages
             if ($olderThan !== null) {
                 $messageTime = $this->getMessageTime($message);
 
-                if ($messageTime !== null && $messageTime->isAfter($olderThan)) {
+                if ($messageTime === null || $messageTime->isAfter($olderThan)) {
                     $toSkip[] = $message;
 
                     continue;

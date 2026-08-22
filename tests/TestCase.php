@@ -92,39 +92,20 @@ abstract class TestCase extends OrchestraTestCase
             ],
             'queue' => [
                 'default' => 'default',
-                'exchange' => '',
-                'durable' => true,
-                'quorum' => true,
-                'auto_delete' => false,
-            ],
-            'exchange' => [
-                'type' => 'topic',
-                'durable' => true,
-                'auto_delete' => false,
             ],
             'dead_letter' => [
                 'enabled' => true,
                 'exchange_suffix' => '.dlq',
                 'queue_prefix' => 'dlq:',
-                'default_ttl' => 604800000,
-                'retry' => [
-                    'enabled' => true,
-                    'max_attempts' => 3,
-                    'strategy' => 'exponential',
-                    'delays' => [60, 300, 900, 3600],
-                ],
             ],
-            'delayed' => [
-                'enabled' => true,
-                'exchange' => 'delayed',
-                'type' => 'x-delayed-message',
-                'max_delay' => 86400000,
+            'retry' => [
+                'maximum_delay' => 86400,
+                'delay_queue_cleanup_grace' => 86400000,
             ],
             'consumer' => [
                 'prefetch_count' => 10,
-                'prefetch_size' => 0,
                 'timeout' => 30,
-                'auto_ack' => false,
+                'heartbeat_sender' => false,
             ],
             'publisher' => [
                 'confirm' => true,
@@ -134,10 +115,6 @@ abstract class TestCase extends OrchestraTestCase
                 'health_check' => [
                     'enabled' => true,
                     'interval' => 30,
-                ],
-                'metrics' => [
-                    'enabled' => true,
-                    'driver' => 'prometheus',
                 ],
             ],
             'logging' => [

@@ -12,19 +12,20 @@ use Lettermint\RabbitMQ\Enums\RetryStrategy;
 /**
  * Defines queue configuration for a Laravel job class.
  *
- * This is the primary attribute for declaring RabbitMQ queue topology. Apply it
- * to your Laravel job classes to define:
+ * This attribute is available for applications that use class discovery instead
+ * of the explicit topology registry. Apply it to Laravel job classes to define:
  * - Queue name and settings
  * - Exchange bindings
  * - Dead letter queue configuration
- * - Consumer settings (prefetch, timeout)
- * - Retry strategies
  *
- * The package will automatically:
+ * The topology command can:
  * - Create the queue with specified settings
  * - Create bindings to exchanges
  * - Create DLQ exchange and queue
- * - Configure retry behavior
+ *
+ * Laravel job and worker settings control attempts, backoff, and timeouts. The
+ * legacy retry, prefetch, and timeout fields remain for API compatibility. The
+ * native consumer does not read those fields.
  *
  * @example
  * ```php
@@ -33,12 +34,7 @@ use Lettermint\RabbitMQ\Enums\RetryStrategy;
  *     queue: 'email:outbound:transactional',
  *     bindings: ['emails.outbound' => 'transactional.*'],
  *     quorum: true,
- *     messageTtl: 86400000, // 24 hours
- *     retryAttempts: 3,
- *     retryStrategy: RetryStrategy::Exponential,
- *     retryDelays: [60, 300, 900],
- *     prefetch: 25,
- *     timeout: 120,
+ *     messageTtl: 86400000,
  * )]
  *
  * // Classic queue with priorities (when ordering matters more than HA)
@@ -99,11 +95,11 @@ final class ConsumesQueue
      * @param  int|null  $maxLength  Maximum queue length (messages rejected/dead-lettered when exceeded)
      * @param  OverflowBehavior|string  $overflow  Overflow behavior when maxLength exceeded
      * @param  string|null  $dlqExchange  Custom DLQ exchange (null = auto-derive from binding domain)
-     * @param  int  $retryAttempts  Maximum retry attempts before permanent DLQ (default: 3)
-     * @param  RetryStrategy|string  $retryStrategy  Retry strategy for failed jobs
-     * @param  array<int>  $retryDelays  Delay between retries in seconds [60, 300, 900]
-     * @param  int  $prefetch  Consumer prefetch count / QoS (default: 10)
-     * @param  int  $timeout  Job timeout in seconds (default: 30)
+     * @param  int  $retryAttempts  Legacy compatibility field. Laravel job and worker settings control attempts.
+     * @param  RetryStrategy|string  $retryStrategy  Legacy compatibility field. Laravel job and worker settings control backoff.
+     * @param  array<int>  $retryDelays  Legacy compatibility field. Laravel job and worker settings control backoff.
+     * @param  int  $prefetch  Legacy compatibility field. The consumer command controls prefetch.
+     * @param  int  $timeout  Legacy compatibility field. The consumer command and Laravel job control timeouts.
      * @param  bool  $singleActiveConsumer  Elect one active consumer for the queue while other consumers wait for failover (default: false). This prevents concurrent consumption but does not guarantee strict ordering during redelivery. Compatible with quorum queues. Requires RabbitMQ 3.8+.
      * @param  int|null  $deliveryLimit  Quorum queue crash-loop limit (`x-delivery-limit`). RabbitMQ dead-letters a message after this number of broker deliveries. It does not set the Laravel attempt count. This setting requires a dead-letter exchange. Queue arguments are immutable. A change can require a controlled queue replacement. (default: null = broker default)
      *
@@ -332,10 +328,11 @@ final class ConsumesQueue
 
         if ($this->quorum) {
             $arguments['x-queue-type'] = 'quorum';
+            $arguments['x-overflow'] = 'reject-publish';
         }
 
         // Opt-in only. Emitted solely when explicitly enabled so the arguments
-        // table stays byte-identical for existing queues — RabbitMQ freezes queue
+        // table stays byte-identical for existing queues. RabbitMQ freezes queue
         // arguments at declaration time, so adding this to an already-declared
         // queue raises PRECONDITION_FAILED until the queue is recreated.
         if ($this->singleActiveConsumer) {
@@ -358,7 +355,9 @@ final class ConsumesQueue
 
         if ($this->maxLength !== null) {
             $arguments['x-max-length'] = $this->maxLength;
-            $arguments['x-overflow'] = $this->overflowEnum->value;
+            $arguments['x-overflow'] = $this->quorum
+                ? OverflowBehavior::RejectPublish->value
+                : $this->overflowEnum->value;
         }
 
         // Dead letter configuration
@@ -366,6 +365,10 @@ final class ConsumesQueue
         if ($dlqExchange !== null) {
             $arguments['x-dead-letter-exchange'] = $dlqExchange;
             $arguments['x-dead-letter-routing-key'] = $this->getDlqRoutingKey();
+
+            if ($this->quorum) {
+                $arguments['x-dead-letter-strategy'] = 'at-least-once';
+            }
         }
 
         return $arguments;

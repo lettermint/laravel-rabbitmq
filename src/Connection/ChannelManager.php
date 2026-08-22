@@ -28,6 +28,12 @@ class ChannelManager
      */
     protected array $channels = [];
 
+    /** @var array<string, array{connection: string, purpose: string}> */
+    protected array $channelMetadata = [];
+
+    /** @var array<int, true> */
+    protected array $publisherConfirmChannels = [];
+
     public function __construct(
         protected ConnectionManager $connectionManager,
     ) {}
@@ -44,8 +50,16 @@ class ChannelManager
     {
         $key = $this->getChannelKey($purpose, $connection);
 
-        if (! isset($this->channels[$key]) || ! $this->channels[$key]->is_open()) {
+        if (isset($this->channels[$key]) && ! $this->channels[$key]->is_open()) {
+            $this->closeChannel($purpose, $connection);
+        }
+
+        if (! isset($this->channels[$key])) {
             $this->channels[$key] = $this->createChannel($connection);
+            $this->channelMetadata[$key] = [
+                'connection' => $connection ?? $this->connectionManager->getDefaultConnection(),
+                'purpose' => $purpose,
+            ];
         }
 
         return $this->channels[$key];
@@ -73,14 +87,30 @@ class ChannelManager
     /**
      * Get a channel specifically for publishing.
      *
-     * Note: Publisher confirms are configured at publish time in RabbitMQQueue,
-     * not during channel creation.
+     * Publisher confirms are enabled once for each publish channel.
      *
      * @throws ConnectionException
      */
     public function publishChannel(?string $connection = null): AMQPChannel
     {
-        return $this->channel('publish', $connection);
+        $channel = $this->channel('publish', $connection);
+        $channelId = spl_object_id($channel);
+
+        if (! isset($this->publisherConfirmChannels[$channelId])) {
+            try {
+                $channel->confirm_select();
+                $this->publisherConfirmChannels[$channelId] = true;
+            } catch (\Throwable $exception) {
+                $this->closeChannel('publish', $connection);
+
+                throw new ConnectionException(
+                    'Failed to enable RabbitMQ publisher confirmations: '.$exception->getMessage(),
+                    previous: $exception,
+                );
+            }
+        }
+
+        return $channel;
     }
 
     /**
@@ -111,6 +141,8 @@ class ChannelManager
         $key = $this->getChannelKey($purpose, $connection);
 
         if (isset($this->channels[$key])) {
+            unset($this->publisherConfirmChannels[spl_object_id($this->channels[$key])]);
+
             try {
                 if ($this->channels[$key]->is_open()) {
                     $this->channels[$key]->close();
@@ -123,6 +155,7 @@ class ChannelManager
             }
 
             unset($this->channels[$key]);
+            unset($this->channelMetadata[$key]);
         }
     }
 
@@ -132,9 +165,38 @@ class ChannelManager
     public function closeAll(): void
     {
         foreach (array_keys($this->channels) as $key) {
-            [$connection, $purpose] = explode(':', $key, 2);
-            $this->closeChannel($purpose, $connection);
+            $metadata = $this->channelMetadata[$key] ?? null;
+
+            if ($metadata === null) {
+                unset($this->channels[$key]);
+
+                continue;
+            }
+
+            $this->closeChannel($metadata['purpose'], $metadata['connection']);
         }
+    }
+
+    public function closeConnectionChannels(?string $connection = null): void
+    {
+        $connection ??= $this->connectionManager->getDefaultConnection();
+
+        foreach (array_keys($this->channels) as $key) {
+            $metadata = $this->channelMetadata[$key] ?? null;
+
+            if ($metadata === null || $metadata['connection'] !== $connection) {
+                continue;
+            }
+
+            $this->closeChannel($metadata['purpose'], $connection);
+        }
+    }
+
+    public function recoverConnection(?string $connection = null, ?int $maximumAttempts = null): AbstractConnection
+    {
+        $this->closeConnectionChannels($connection);
+
+        return $this->connectionManager->recover($connection, $maximumAttempts);
     }
 
     /**
@@ -144,7 +206,7 @@ class ChannelManager
     {
         $connection ??= $this->connectionManager->getDefaultConnection();
 
-        return "{$connection}:{$purpose}";
+        return hash('sha256', $connection."\0".$purpose);
     }
 
     /**

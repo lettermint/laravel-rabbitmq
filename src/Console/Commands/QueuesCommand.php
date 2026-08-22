@@ -5,8 +5,8 @@ declare(strict_types=1);
 namespace Lettermint\RabbitMQ\Console\Commands;
 
 use Illuminate\Console\Command;
-use Lettermint\RabbitMQ\Discovery\AttributeScanner;
 use Lettermint\RabbitMQ\Monitoring\QueueMetrics;
+use Lettermint\RabbitMQ\Topology\TopologyRegistry;
 
 /**
  * Artisan command to list RabbitMQ queues with statistics.
@@ -20,9 +20,9 @@ class QueuesCommand extends Command
 
     protected $description = 'List all RabbitMQ queues with statistics';
 
-    public function handle(AttributeScanner $scanner, QueueMetrics $metrics): int
+    public function handle(TopologyRegistry $registry, QueueMetrics $metrics): int
     {
-        $topology = $scanner->getTopology();
+        $topology = $registry->queues();
         $includeDlq = (bool) $this->option('include-dlq');
 
         if ($this->option('watch')) {
@@ -48,7 +48,7 @@ class QueuesCommand extends Command
         }
 
         $this->table(
-            ['Queue', 'Messages', 'Consumers', 'Rate/sec', 'Job Class'],
+            ['Queue', 'Messages', 'Consumers', 'Type'],
             $rows
         );
 
@@ -91,7 +91,7 @@ class QueuesCommand extends Command
 
             $rows = $this->buildQueueRows($topology, $metrics, $includeDlq);
             $this->table(
-                ['Queue', 'Messages', 'Consumers', 'Rate/sec', 'Job Class'],
+                ['Queue', 'Messages', 'Consumers', 'Type'],
                 $rows
             );
 
@@ -123,21 +123,20 @@ class QueuesCommand extends Command
     {
         $rows = [];
 
-        foreach ($topology['queues'] as $queueName => $queueData) {
+        foreach ($topology as $queueName => $definition) {
             $stats = $metrics->getQueueStats($queueName);
 
             $rows[] = [
                 $queueName,
                 $this->formatStat($stats['messages']),
                 $this->formatStat($stats['consumers']),
-                $this->formatRate($stats['rate']),
-                class_basename($queueData['class']),
+                $definition->quorum ? 'quorum' : 'classic',
             ];
 
             // Include DLQ queue
-            if ($includeDlq) {
-                $dlqName = $queueData['attribute']->getDlqQueueName();
-                $dlqStats = $metrics->getQueueStats($dlqName);
+            if ($includeDlq && $definition->deadLetterEnabled) {
+                $dlqName = $definition->deadLetterQueue;
+                $dlqStats = $metrics->getPhysicalQueueStats($dlqName);
 
                 // Highlight DLQ messages in red if non-zero
                 $dlqMessages = $dlqStats['messages'];
@@ -149,7 +148,6 @@ class QueuesCommand extends Command
                     "<fg=gray>{$dlqName}</>",
                     $dlqMessageDisplay,
                     $this->formatStat($dlqStats['consumers'], 'gray'),
-                    $this->formatRate($dlqStats['rate'], 'gray'),
                     '<fg=gray>DLQ</>',
                 ];
             }
@@ -168,20 +166,6 @@ class QueuesCommand extends Command
         }
 
         $formatted = number_format($value);
-
-        return $color ? "<fg={$color}>{$formatted}</>" : $formatted;
-    }
-
-    /**
-     * Format a rate value for display, handling null (unavailable) values.
-     */
-    protected function formatRate(?float $value, ?string $color = null): string
-    {
-        if ($value === null) {
-            return $color ? "<fg={$color}>-</>" : '-';
-        }
-
-        $formatted = number_format($value, 1);
 
         return $color ? "<fg={$color}>{$formatted}</>" : $formatted;
     }

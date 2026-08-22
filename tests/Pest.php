@@ -2,9 +2,14 @@
 
 declare(strict_types=1);
 
+use Illuminate\Contracts\Events\Dispatcher;
+use Lettermint\RabbitMQ\Connection\ChannelManager;
+use Lettermint\RabbitMQ\Discovery\AttributeScanner;
+use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
 use Lettermint\RabbitMQ\Tests\Fixtures\Payloads\PayloadFactory;
 use Lettermint\RabbitMQ\Tests\Mocks\AMQPMocks;
 use Lettermint\RabbitMQ\Tests\TestCase;
+use Lettermint\RabbitMQ\Topology\TopologyRegistry;
 use Mockery\MockInterface;
 
 /*
@@ -13,7 +18,7 @@ use Mockery\MockInterface;
 |--------------------------------------------------------------------------
 */
 
-uses(TestCase::class)->in('Feature', 'Unit');
+uses(TestCase::class)->in('Feature', 'Unit', 'Integration');
 
 /*
 |--------------------------------------------------------------------------
@@ -102,4 +107,46 @@ function createXDeathHeader(string $queue, int $count = 1, string $reason = 'rej
             'routing-keys' => [$queue],
         ],
     ];
+}
+
+/**
+ * Create a registry for tests. An empty topology permits fallback queues.
+ *
+ * @param  array<string, mixed>  $config
+ */
+function testTopologyRegistry(array $config = []): TopologyRegistry
+{
+    return new TopologyRegistry(new AttributeScanner, $config);
+}
+
+/**
+ * Create a queue connection with the required publisher safety controls.
+ *
+ * @param  array<string, mixed>  $config
+ */
+function testRabbitMQQueue(ChannelManager $channelManager, array $config = [], ?TopologyRegistry $registry = null): RabbitMQQueue
+{
+    $config = array_replace_recursive([
+        'queue' => ['default' => 'default'],
+        'connection' => 'default',
+        'publisher' => [
+            'confirm' => true,
+            'mandatory' => true,
+            'confirm_timeout' => 5.0,
+        ],
+        'retry' => [
+            'maximum_delay' => 86400,
+            'delay_queue_cleanup_grace' => 86400000,
+        ],
+    ], $config);
+
+    $events = Mockery::mock(Dispatcher::class);
+    $events->shouldReceive('dispatch')->andReturnNull()->byDefault();
+
+    return new RabbitMQQueue(
+        $channelManager,
+        $registry ?? testTopologyRegistry($config),
+        $events,
+        $config,
+    );
 }

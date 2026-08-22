@@ -37,19 +37,13 @@ enum ExchangeType: string
     case Fanout = 'fanout';
 
     /**
-     * Headers exchange - routes based on message headers.
-     *
-     * Use for: Complex routing logic not expressible as routing keys.
-     * Less common, higher overhead than topic/direct.
+     * Kept for source compatibility. The topology registry rejects this type.
      */
     case Headers = 'headers';
 
     /**
-     * Delayed message exchange (requires plugin).
-     *
-     * Holds messages for specified delay before routing.
-     * Use for: Scheduled jobs, retry delays.
-     * Requires: rabbitmq_delayed_message_exchange plugin.
+     * Kept for source compatibility. The topology registry rejects this type.
+     * Delayed releases use classic TTL queues.
      */
     case DelayedMessage = 'x-delayed-message';
 }

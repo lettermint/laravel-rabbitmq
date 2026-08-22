@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace Lettermint\RabbitMQ\Actions\Dlq\Results;
 
 use Illuminate\Support\Carbon;
+use Lettermint\RabbitMQ\Queue\RabbitMQJob;
 use PhpAmqpLib\Message\AMQPMessage;
+use PhpAmqpLib\Wire\AMQPTable;
 
 /**
  * Data extracted from a DLQ message for display or processing.
@@ -31,15 +33,17 @@ final readonly class DlqMessageData
     {
         $payload = json_decode($message->getBody(), true) ?? [];
 
-        $headers = $message->has('application_headers')
-            ? $message->get('application_headers')->getNativeData()
-            : [];
+        $headerTable = $message->has('application_headers')
+            ? $message->get('application_headers')
+            : null;
+        $headers = $headerTable instanceof AMQPTable ? $headerTable->getNativeData() : [];
 
         $xDeath = $headers['x-death'][0] ?? null;
+        $xDeath = $xDeath instanceof AMQPTable ? $xDeath->getNativeData() : $xDeath;
 
-        $attempts = $payload['attempts'] ?? $xDeath['count'] ?? 1;
-        $failedAt = self::extractFailedAt($xDeath);
-        $reason = $xDeath['reason'] ?? 'unknown';
+        $attempts = (int) ($headers[RabbitMQJob::ATTEMPT_HEADER] ?? $payload['attempts'] ?? 1);
+        $failedAt = self::extractFailedAt(is_array($xDeath) ? $xDeath : null);
+        $reason = is_array($xDeath) ? (string) ($xDeath['reason'] ?? 'unknown') : 'unknown';
 
         $exception = null;
         if (isset($payload['exception'])) {
@@ -47,7 +51,7 @@ final readonly class DlqMessageData
         }
 
         return new self(
-            id: $payload['uuid'] ?? $payload['id'] ?? 'unknown',
+            id: (string) ($payload['uuid'] ?? $payload['id'] ?? ($message->has('message_id') ? $message->get('message_id') : 'unknown')),
             jobClass: $payload['displayName'] ?? $payload['job'] ?? 'Unknown',
             attempts: $attempts,
             failedAt: $failedAt,

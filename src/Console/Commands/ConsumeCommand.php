@@ -12,6 +12,7 @@ use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Queue\Worker;
 use Illuminate\Support\Facades\Event;
 use Lettermint\RabbitMQ\Consumers\Consumer;
+use Throwable;
 
 /**
  * Artisan command to consume messages from a RabbitMQ queue.
@@ -24,13 +25,15 @@ class ConsumeCommand extends Command
     protected $signature = 'rabbitmq:consume
         {queue* : The queue(s) to consume from}
         {--connection=rabbitmq : The queue connection to use}
-        {--prefetch=10 : Number of messages to prefetch}
-        {--timeout=60 : Seconds to wait for a message}
+        {--prefetch=1 : Number of messages to prefetch}
+        {--timeout=60 : Maximum seconds for one job}
+        {--wait=1 : Seconds to wait for a broker delivery}
         {--max-jobs=0 : Maximum jobs to process before stopping (0 = unlimited)}
         {--max-time=0 : Maximum seconds to run before stopping (0 = unlimited)}
         {--max-memory=128 : Maximum memory in MB before stopping}
         {--sleep=3 : Seconds to sleep when no jobs available}
         {--tries=3 : Number of times to attempt a job before failing}
+        {--backoff=0 : Retry delay in seconds, or a comma-separated list}
         {--rest=0 : Seconds to rest between jobs}
         {--force : Force the worker to run even in maintenance mode}
         {--stop-when-empty : Stop when the queue is empty}
@@ -61,17 +64,20 @@ class ConsumeCommand extends Command
                 ->setConnection($this->option('connection'))
                 ->setPrefetch((int) $this->option('prefetch'))
                 ->setTimeout((int) $this->option('timeout'))
+                ->setWaitTimeout((float) $this->option('wait'))
                 ->setMaxJobs((int) $this->option('max-jobs'))
                 ->setMaxTime((int) $this->option('max-time'))
                 ->setMaxMemory((int) $this->option('max-memory'))
                 ->setSleep((int) $this->option('sleep'))
                 ->setTries((int) $this->option('tries'))
+                ->setBackoff($this->parseBackoff((string) $this->option('backoff')))
                 ->setRest((int) $this->option('rest'))
+                ->setForce((bool) $this->option('force'))
                 ->setStopWhenEmpty((bool) $this->option('stop-when-empty'))
                 ->consume();
 
             return self::SUCCESS;
-        } catch (\Exception $e) {
+        } catch (Throwable $e) {
             $handler->report($e);
 
             $this->components->error("Consumer error: {$e->getMessage()}");
@@ -90,7 +96,8 @@ class ConsumeCommand extends Command
     protected function listenForEvents(): void
     {
         Event::listen(JobProcessing::class, function (JobProcessing $event) {
-            $this->jobStartTimes[$event->job->getJobId()] = microtime(true);
+            $jobId = $event->job->getJobId();
+            $this->jobStartTimes[$jobId] = microtime(true);
             $this->line("Processing: {$event->job->resolveName()}");
         });
 
@@ -99,7 +106,7 @@ class ConsumeCommand extends Command
             $duration = $this->formatDuration($jobId);
             unset($this->jobStartTimes[$jobId]);
 
-            $this->line("  <fg=green>✓</> Done in {$duration}");
+            $this->line("  <fg=green>DONE</> in {$duration}");
         });
 
         Event::listen(JobFailed::class, function (JobFailed $event) {
@@ -107,10 +114,19 @@ class ConsumeCommand extends Command
             $duration = $this->formatDuration($jobId);
             unset($this->jobStartTimes[$jobId]);
 
-            $this->line("  <fg=red>✗</> Failed in {$duration}");
+            $this->line("  <fg=red>FAILED</> in {$duration}");
 
             if ($this->getOutput()->isVerbose()) {
                 $this->line("    <fg=red>Error:</> {$event->exception->getMessage()}");
+            }
+
+            if ($this->laravel->bound('queue.failer')) {
+                $this->laravel['queue.failer']->log(
+                    $event->connectionName,
+                    $event->job->getQueue(),
+                    $event->job->getRawBody(),
+                    $event->exception,
+                );
             }
         });
     }
@@ -132,5 +148,13 @@ class ConsumeCommand extends Command
         return $ms >= 1000
             ? sprintf('%.2fs', $seconds)
             : sprintf('%.2fms', $ms);
+    }
+
+    protected function parseBackoff(string $backoff): int|array
+    {
+        $values = array_map('trim', explode(',', $backoff));
+        $values = array_map(fn (string $value): int => max(0, (int) $value), $values);
+
+        return count($values) === 1 ? $values[0] : $values;
     }
 }

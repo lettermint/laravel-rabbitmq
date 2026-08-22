@@ -16,11 +16,9 @@ use Lettermint\RabbitMQ\Topology\TopologyManager;
 class DeclareCommand extends Command
 {
     protected $signature = 'rabbitmq:declare
-        {--dry-run : Show what would be declared without making changes}
-        {--exchange= : Declare only a specific exchange}
-        {--queue= : Declare only a specific queue}';
+        {--dry-run : Show what would be declared without making changes}';
 
-    protected $description = 'Declare RabbitMQ topology (exchanges, queues, bindings) from attributes';
+    protected $description = 'Declare the registered RabbitMQ exchanges, queues, and bindings';
 
     public function handle(TopologyManager $topologyManager): int
     {
@@ -30,7 +28,7 @@ class DeclareCommand extends Command
             $this->components->info('Dry run mode - no changes will be made');
         }
 
-        $this->components->info('Scanning for RabbitMQ topology attributes...');
+        $this->components->info('Reading the RabbitMQ topology');
 
         try {
             $result = $topologyManager->declare($dryRun);
@@ -45,7 +43,7 @@ class DeclareCommand extends Command
             if ($dryRun) {
                 $this->components->info('Dry run complete. Run without --dry-run to apply changes.');
             } else {
-                $this->components->success('Topology declared successfully!');
+                $this->components->success('Topology declared successfully');
             }
 
             return self::SUCCESS;

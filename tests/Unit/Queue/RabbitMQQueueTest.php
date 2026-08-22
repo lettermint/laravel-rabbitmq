@@ -3,385 +3,329 @@
 declare(strict_types=1);
 
 use Illuminate\Container\Container;
-use Lettermint\RabbitMQ\Attributes\ConsumesQueue;
+use Illuminate\Contracts\Events\Dispatcher;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Contracts\HasPriority;
-use Lettermint\RabbitMQ\Discovery\AttributeScanner;
+use Lettermint\RabbitMQ\Events\MessagePublished;
+use Lettermint\RabbitMQ\Events\MessagePublishFailed;
+use Lettermint\RabbitMQ\Exceptions\ConnectionException;
+use Lettermint\RabbitMQ\Exceptions\PublishException;
+use Lettermint\RabbitMQ\Exceptions\UnknownBindingException;
+use Lettermint\RabbitMQ\Exceptions\UnknownQueueException;
+use Lettermint\RabbitMQ\Queue\RabbitMQJob;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
 use Lettermint\RabbitMQ\Tests\Fixtures\Jobs\PriorityJob;
 use Lettermint\RabbitMQ\Tests\Fixtures\Jobs\RoutedJob;
 use Lettermint\RabbitMQ\Tests\Fixtures\Jobs\SimpleJob;
+use PhpAmqpLib\Exception\AMQPIOException;
+use PhpAmqpLib\Exception\AMQPTimeoutException;
+use PhpAmqpLib\Message\AMQPMessage;
+use PhpAmqpLib\Wire\AMQPTable;
+
+/** @param array<string, mixed> $overrides */
+function queueTestConfig(array $overrides = []): array
+{
+    return array_replace_recursive([
+        'queue' => ['default' => 'default'],
+        'connection' => 'broker',
+        'physical_prefix' => 'test.',
+        'strict_topology' => true,
+        'dead_letter' => ['enabled' => false],
+        'publisher' => [
+            'confirm' => true,
+            'mandatory' => true,
+            'confirm_timeout' => 2.0,
+        ],
+        'retry' => [
+            'maximum_delay' => 3600,
+            'delay_queue_cleanup_grace' => 60000,
+        ],
+        'topology' => [
+            'exchanges' => [
+                'jobs' => ['type' => 'topic'],
+                'dlx' => ['type' => 'direct'],
+            ],
+            'queues' => [
+                'default' => [
+                    'bindings' => ['jobs' => ['default']],
+                    'dead_letter' => false,
+                ],
+                'events:shard' => [
+                    'bindings' => ['jobs' => ['events.shard.*']],
+                    'dead_letter' => false,
+                ],
+                'test-queue' => [
+                    'bindings' => ['jobs' => ['test-queue']],
+                    'dead_letter' => false,
+                ],
+            ],
+        ],
+    ], $overrides);
+}
 
 beforeEach(function () {
-    $this->mockChannel = mockAMQPChannel();
-
+    $this->channel = mockAMQPChannel();
     $this->channelManager = Mockery::mock(ChannelManager::class);
-    $this->channelManager->shouldReceive('publishChannel')
-        ->andReturn($this->mockChannel)
-        ->byDefault();
-    $this->channelManager->shouldReceive('consumeChannel')
-        ->andReturn($this->mockChannel)
-        ->byDefault();
-    $this->channelManager->shouldReceive('topologyChannel')
-        ->andReturn($this->mockChannel)
-        ->byDefault();
+    $this->channelManager->shouldReceive('publishChannel')->with('broker')->andReturn($this->channel)->byDefault();
+    $this->channelManager->shouldReceive('consumeChannel')->with('broker')->andReturn($this->channel)->byDefault();
+    $this->channelManager->shouldReceive('topologyChannel')->with('broker')->andReturn($this->channel)->byDefault();
+    $this->channelManager->shouldReceive('closeChannel')->andReturnNull()->byDefault();
 
-    $this->scanner = Mockery::mock(AttributeScanner::class);
-    $this->scanner->shouldReceive('getQueueForJob')
-        ->andReturn(null)
-        ->byDefault();
-    $this->scanner->shouldReceive('getQueues')
-        ->andReturn(collect([]))
-        ->byDefault();
-
-    $this->config = [
-        'queue' => ['default' => 'default'],
-        'publisher_confirms' => false,
-    ];
+    $this->config = queueTestConfig();
+    $this->registry = testTopologyRegistry($this->config);
+    $this->queue = testRabbitMQQueue($this->channelManager, $this->config, $this->registry);
+    $this->queue->setContainer(new Container);
+    $this->queue->setConnectionName('rabbitmq-native');
 });
 
-test('uses default queue from config', function () {
-    $queue = new RabbitMQQueue(
-        $this->channelManager,
-        $this->scanner,
-        ['queue' => ['default' => 'my-default']]
-    );
+test('requires publisher confirmations and mandatory routing', function (array $publisher) {
+    $config = queueTestConfig(['publisher' => $publisher]);
 
-    expect($queue->getQueue(null))->toBe('my-default');
-});
-
-test('falls back to "default" when not configured', function () {
-    $queue = new RabbitMQQueue(
-        $this->channelManager,
-        $this->scanner,
-        []
-    );
-
-    expect($queue->getQueue(null))->toBe('default');
-});
-
-test('returns provided queue name', function () {
-    $queue = new RabbitMQQueue(
-        $this->channelManager,
-        $this->scanner,
-        $this->config
-    );
-
-    expect($queue->getQueue('custom-queue'))->toBe('custom-queue');
-});
-
-test('returns default when null provided', function () {
-    $queue = new RabbitMQQueue(
-        $this->channelManager,
-        $this->scanner,
-        $this->config
-    );
-
-    expect($queue->getQueue(null))->toBe('default');
-});
-
-test('returns job when message available', function () {
-    $message = mockAMQPMessage([
-        'body' => json_encode([
-            'uuid' => 'test-uuid',
-            'displayName' => 'TestJob',
-            'job' => 'TestJob@handle',
-            'data' => [],
-        ]),
-    ]);
-
-    // Set up channel to return message from basic_get
-    $this->mockChannel->shouldReceive('basic_get')
-        ->once()
-        ->andReturn($message);
-
-    $queue = new RabbitMQQueue(
-        $this->channelManager,
-        $this->scanner,
-        $this->config
-    );
-    $queue->setContainer(new Container);
-    $queue->setConnectionName('rabbitmq');
-
-    $job = $queue->pop('test-queue');
-
-    expect($job)->not->toBeNull();
-    expect($job->getQueue())->toBe('test-queue');
-});
-
-test('extracts priority from HasPriority job', function () {
-    $priorityJob = new PriorityJob(priority: 8);
-
-    expect($priorityJob)->toBeInstanceOf(HasPriority::class);
-    expect($priorityJob->getPriority())->toBe(8);
-});
-
-test('returns null priority for non-priority jobs', function () {
-    $simpleJob = new SimpleJob;
-
-    expect($simpleJob)->not->toBeInstanceOf(HasPriority::class);
-});
-
-test('uses attribute exchange when available', function () {
-    $attribute = new ConsumesQueue(
-        queue: 'emails:outbound',
-        bindings: ['emails' => 'outbound.*']
-    );
-
-    $this->scanner->shouldReceive('getQueueForJob')
-        ->with(SimpleJob::class, Mockery::any())
-        ->andReturn($attribute);
-
-    $queue = new RabbitMQQueue(
-        $this->channelManager,
-        $this->scanner,
-        $this->config
-    );
-
-    $payload = json_encode([
-        'uuid' => 'test-uuid',
-        'displayName' => SimpleJob::class,
-    ]);
-
-    // Access the protected method via reflection for testing
-    $reflection = new ReflectionClass($queue);
-    $method = $reflection->getMethod('getExchangeAndRoutingKey');
-    $method->setAccessible(true);
-
-    [$exchange, $routingKey] = $method->invoke($queue, 'emails:outbound', $payload);
-
-    expect($exchange)->toBe('emails');
-    expect($routingKey)->toBe('outbound.*');
-});
-
-test('injects the job routing key into the payload for HasRoutingKey jobs', function () {
-    $queue = new RabbitMQQueue(
-        $this->channelManager,
-        $this->scanner,
-        $this->config
-    );
-    $queue->setContainer(new Container);
-
-    $reflection = new ReflectionClass($queue);
-    $method = $reflection->getMethod('createPayloadArray');
-    $method->setAccessible(true);
-
-    $payload = $method->invoke($queue, new RoutedJob('events.shard.9'), 'events:shard', '');
-
-    expect($payload['routingKey'])->toBe('events.shard.9');
-
-    // A plain job carries no routingKey field
-    $plain = $method->invoke($queue, new SimpleJob, 'emails:outbound', '');
-    expect($plain)->not->toHaveKey('routingKey');
-});
-
-test('rejects invalid per-message routing keys', function (string $routingKey, string $message) {
-    $queue = new RabbitMQQueue(
-        $this->channelManager,
-        $this->scanner,
-        $this->config
-    );
-    $queue->setContainer(new Container);
-
-    $reflection = new ReflectionClass($queue);
-    $method = $reflection->getMethod('createPayloadArray');
-    $method->setAccessible(true);
-
-    expect(fn () => $method->invoke($queue, new RoutedJob($routingKey), 'events:shard', ''))
-        ->toThrow(InvalidArgumentException::class, $message);
+    expect(fn () => testRabbitMQQueue($this->channelManager, $config, testTopologyRegistry($config)))
+        ->toThrow(InvalidArgumentException::class, 'requires publisher confirmations and mandatory routing');
 })->with([
-    'empty' => ['', 'cannot be empty'],
-    'whitespace' => ['   ', 'cannot be empty'],
-    'star wildcard' => ['events.*', 'cannot contain topic wildcards'],
-    'hash wildcard' => ['events.#', 'cannot contain topic wildcards'],
-    'control character' => ["events.\nnext", 'cannot contain control characters'],
-    'more than 255 bytes' => [str_repeat('a', 256), 'cannot exceed 255 bytes'],
+    'confirmations disabled' => [['confirm' => false, 'mandatory' => true]],
+    'mandatory routing disabled' => [['confirm' => true, 'mandatory' => false]],
 ]);
 
-test('rejects an invalid routing key stored in a raw payload', function () {
-    $attribute = new ConsumesQueue(
-        queue: 'emails:outbound',
-        bindings: ['emails' => 'outbound.*']
-    );
+test('uses logical names and a physical prefix', function () {
+    expect($this->queue->getQueue(null))->toBe('default')
+        ->and($this->queue->physicalQueue('default'))->toBe('test.default')
+        ->and($this->queue->getBrokerConnectionName())->toBe('broker');
+});
 
-    $this->scanner->shouldReceive('getQueueForJob')
-        ->with(SimpleJob::class, Mockery::any())
-        ->andReturn($attribute);
+test('rejects an unknown queue in strict mode', function () {
+    expect(fn () => $this->queue->getQueue('missing'))
+        ->toThrow(UnknownQueueException::class, 'missing');
+});
 
-    $queue = new RabbitMQQueue(
-        $this->channelManager,
-        $this->scanner,
-        $this->config
-    );
+test('publishes with mandatory routing and waits for confirmation', function () {
+    $this->channel->shouldReceive('basic_publish')
+        ->once()
+        ->withArgs(function (AMQPMessage $message, string $exchange, string $routingKey, bool $mandatory): bool {
+            return $message->getBody() === '{"uuid":"job-1"}'
+                && $message->get('message_id') === 'job-1'
+                && $exchange === 'test.jobs'
+                && $routingKey === 'default'
+                && $mandatory;
+        });
+    $this->channel->shouldReceive('wait_for_pending_acks_returns')->once()->with(2.0);
 
+    expect($this->queue->pushRaw('{"uuid":"job-1"}', 'default'))->toBe('job-1');
+});
+
+test('reuses the publisher channel for multiple confirmed publishes', function () {
+    $this->channel->shouldReceive('basic_publish')->twice();
+    $this->channel->shouldReceive('wait_for_pending_acks_returns')->twice();
+
+    $this->queue->pushRaw('{"uuid":"job-1"}', 'default');
+    $this->queue->pushRaw('{"uuid":"job-2"}', 'default');
+});
+
+test('fails a returned unroutable publish and emits a failure event', function () {
+    $events = Mockery::mock(Dispatcher::class);
+    $events->shouldReceive('dispatch')->once()->with(Mockery::type(MessagePublishFailed::class));
+    $queue = new RabbitMQQueue($this->channelManager, $this->registry, $events, $this->config);
+
+    $this->channel->shouldReceive('set_return_listener')
+        ->once()
+        ->withArgs(function (callable $listener): bool {
+            $listener(312, 'NO_ROUTE', 'test.jobs', 'default');
+
+            return true;
+        });
+
+    expect(fn () => $queue->pushRaw('{"uuid":"job-1"}', 'default'))
+        ->toThrow(PublishException::class, 'unroutable');
+});
+
+test('fails a negative publisher confirmation', function () {
+    $this->channel->shouldReceive('set_nack_handler')
+        ->once()
+        ->withArgs(function (callable $handler): bool {
+            $handler(mockAMQPMessage());
+
+            return true;
+        });
+
+    expect(fn () => $this->queue->pushRaw('{"uuid":"job-1"}', 'default'))
+        ->toThrow(PublishException::class, 'negatively confirmed');
+});
+
+test('fails an uncertain confirmation timeout and closes the publish channel', function () {
+    $this->channel->shouldReceive('wait_for_pending_acks_returns')
+        ->once()
+        ->andThrow(new AMQPTimeoutException('timeout'));
+    $this->channelManager->shouldReceive('closeChannel')->once()->with('publish', 'broker');
+
+    expect(fn () => $this->queue->pushRaw('{"uuid":"job-1"}', 'default'))
+        ->toThrow(PublishException::class, 'result is uncertain');
+});
+
+test('emits a success event only after the publish is confirmed', function () {
+    $events = Mockery::mock(Dispatcher::class);
+    $events->shouldReceive('dispatch')->once()->with(Mockery::type(MessagePublished::class));
+    $queue = new RabbitMQQueue($this->channelManager, $this->registry, $events, $this->config);
+
+    $queue->pushRaw('{"uuid":"job-1"}', 'default');
+});
+
+test('does not turn a confirmed publish into a failure when an event listener fails', function () {
+    $events = Mockery::mock(Dispatcher::class);
+    $events->shouldReceive('dispatch')->once()->andThrow(new RuntimeException('listener failed'));
+    $queue = new RabbitMQQueue($this->channelManager, $this->registry, $events, $this->config);
+
+    expect($queue->pushRaw('{"uuid":"job-1"}', 'default'))->toBe('job-1');
+});
+
+test('accepts only a registered dynamic routing key', function () {
     $payload = json_encode([
-        'uuid' => 'test-uuid',
-        'displayName' => SimpleJob::class,
-        'routingKey' => 'events.#',
+        'uuid' => 'job-1',
+        'routingKey' => 'events.shard.9',
     ]);
 
-    $reflection = new ReflectionClass($queue);
-    $method = $reflection->getMethod('getExchangeAndRoutingKey');
-    $method->setAccessible(true);
+    $this->channel->shouldReceive('basic_publish')
+        ->once()
+        ->withArgs(fn (AMQPMessage $message, string $exchange, string $routingKey): bool => $exchange === 'test.jobs'
+            && $routingKey === 'events.shard.9');
 
-    expect(fn () => $method->invoke($queue, 'emails:outbound', $payload))
-        ->toThrow(InvalidArgumentException::class, 'cannot contain topic wildcards');
+    $this->queue->pushRaw($payload, 'events:shard');
 });
 
-test('honors a per-message routing key over the attribute binding, keeping the attribute exchange', function () {
-    $attribute = new ConsumesQueue(
-        queue: 'emails:outbound',
-        bindings: ['emails' => 'outbound.*']
-    );
+test('rejects invalid or unbound dynamic routing keys', function (string $routingKey, string $exception) {
+    $payload = json_encode(['uuid' => 'job-1', 'routingKey' => $routingKey]);
 
-    $this->scanner->shouldReceive('getQueueForJob')
-        ->with(SimpleJob::class, Mockery::any())
-        ->andReturn($attribute);
+    expect(fn () => $this->queue->pushRaw($payload, 'events:shard'))
+        ->toThrow($exception);
+})->with([
+    'empty' => ['', InvalidArgumentException::class],
+    'wildcard' => ['events.#', InvalidArgumentException::class],
+    'unknown binding' => ['other.route', UnknownBindingException::class],
+]);
 
-    $queue = new RabbitMQQueue(
-        $this->channelManager,
-        $this->scanner,
-        $this->config
-    );
+test('adds a HasRoutingKey value to the Laravel payload', function () {
+    $reflection = new ReflectionClass($this->queue);
+    $method = $reflection->getMethod('createPayloadArray');
 
-    // A HasRoutingKey job injects `routingKey` into the payload (see createPayloadArray).
-    $payload = json_encode([
-        'uuid' => 'test-uuid',
-        'displayName' => SimpleJob::class,
-        'routingKey' => 'events.shard.7',
+    $payload = $method->invoke($this->queue, new RoutedJob('events.shard.9'), 'events:shard', '');
+
+    expect($payload['routingKey'])->toBe('events.shard.9');
+});
+
+test('uses a durable classic TTL queue for a delayed publish', function () {
+    $this->channel->shouldReceive('queue_declare')
+        ->once()
+        ->withArgs(function (string $queue, bool $passive, bool $durable, bool $exclusive, bool $autoDelete, bool $nowait, AMQPTable $arguments): bool {
+            $values = $arguments->getNativeData();
+
+            return str_starts_with($queue, 'test.delay:default:15000:')
+                && ! $passive
+                && $durable
+                && ! $exclusive
+                && ! $autoDelete
+                && ! $nowait
+                && $values['x-queue-type'] === 'classic'
+                && $values['x-message-ttl'] === 15000
+                && $values['x-expires'] === 75000
+                && $values['x-dead-letter-exchange'] === 'test.jobs'
+                && $values['x-dead-letter-routing-key'] === 'default';
+        });
+    $this->channel->shouldReceive('basic_publish')
+        ->once()
+        ->withArgs(fn (AMQPMessage $message, string $exchange, string $routingKey): bool => $exchange === ''
+            && str_starts_with($routingKey, 'test.delay:default:15000:'));
+
+    $this->queue->pushRaw('{"uuid":"job-1"}', 'default', ['delay' => 15]);
+});
+
+test('rejects a delay above the configured maximum', function () {
+    expect(fn () => $this->queue->pushRaw('{"uuid":"job-1"}', 'default', ['delay' => 3601]))
+        ->toThrow(InvalidArgumentException::class, 'exceeds the configured maximum');
+});
+
+test('reports a delayed publish setup failure as a publish failure', function () {
+    $events = Mockery::mock(Dispatcher::class);
+    $events->shouldReceive('dispatch')->once()->with(Mockery::type(MessagePublishFailed::class));
+    $queue = new RabbitMQQueue($this->channelManager, $this->registry, $events, $this->config);
+    $this->channel->shouldReceive('queue_declare')->once()->andThrow(new AMQPIOException('declare failed'));
+    $this->channelManager->shouldReceive('closeChannel')->once()->with('topology', 'broker');
+
+    expect(fn () => $queue->pushRaw('{"uuid":"job-1"}', 'default', ['delay' => 15]))
+        ->toThrow(PublishException::class, 'delayed publish setup failed');
+});
+
+test('preserves supplied AMQP properties', function () {
+    $this->channel->shouldReceive('basic_publish')
+        ->once()
+        ->withArgs(function (AMQPMessage $message): bool {
+            $headers = $message->get('application_headers');
+
+            return $message->get('message_id') === 'message-1'
+                && $message->get('correlation_id') === 'correlation-1'
+                && $message->get('timestamp') === 1234
+                && $message->get('priority') === 7
+                && $headers instanceof AMQPTable
+                && $headers->getNativeData()['trace'] === 'keep';
+        });
+
+    $this->queue->pushRaw('{"uuid":"job-1"}', 'default', [
+        'properties' => [
+            'message_id' => 'message-1',
+            'correlation_id' => 'correlation-1',
+            'timestamp' => 1234,
+            'priority' => 7,
+            'application_headers' => new AMQPTable(['trace' => 'keep']),
+        ],
     ]);
-
-    $reflection = new ReflectionClass($queue);
-    $method = $reflection->getMethod('getExchangeAndRoutingKey');
-    $method->setAccessible(true);
-
-    [$exchange, $routingKey] = $method->invoke($queue, 'emails:outbound', $payload);
-
-    expect($exchange)->toBe('emails');       // exchange still resolved from the attribute
-    expect($routingKey)->toBe('events.shard.7'); // routing key overridden per message
 });
 
-test('honors a per-message routing key even on the fallback path', function () {
-    $this->scanner->shouldReceive('getQueueForJob')
-        ->andReturn(null);
-    $this->scanner->shouldReceive('getQueues')
-        ->andReturn(collect([]));
+test('returns a Laravel job from the physical queue', function () {
+    $message = mockAMQPMessage();
+    $this->channel->shouldReceive('basic_get')->once()->with('test.test-queue', false)->andReturn($message);
 
-    $queue = new RabbitMQQueue(
-        $this->channelManager,
-        $this->scanner,
-        $this->config
-    );
+    $job = $this->queue->pop('test-queue');
 
-    $payload = json_encode([
-        'uuid' => 'test-uuid',
-        'displayName' => 'SomeJob',
-        'routingKey' => 'events.shard.3',
-    ]);
-
-    $reflection = new ReflectionClass($queue);
-    $method = $reflection->getMethod('getExchangeAndRoutingKey');
-    $method->setAccessible(true);
-
-    [$exchange, $routingKey] = $method->invoke($queue, 'some:queue', $payload);
-
-    expect($routingKey)->toBe('events.shard.3'); // dynamic key wins over 'fallback.some.queue'
+    expect($job)->toBeInstanceOf(RabbitMQJob::class)
+        ->and($job?->getQueue())->toBe('test-queue');
 });
 
-test('uses fallback routing when no attribute', function () {
-    $this->scanner->shouldReceive('getQueueForJob')
-        ->andReturn(null);
-    $this->scanner->shouldReceive('getQueues')
-        ->andReturn(collect([]));
+test('reports ready jobs through the Laravel queue size contract', function () {
+    $this->channel->shouldReceive('queue_declare')
+        ->twice()
+        ->with('test.default', true, false, false, false)
+        ->andReturn(['test.default', 12, 3]);
 
-    $queue = new RabbitMQQueue(
-        $this->channelManager,
-        $this->scanner,
-        $this->config
-    );
-
-    $payload = json_encode([
-        'uuid' => 'test-uuid',
-        'displayName' => 'SomeJob',
-    ]);
-
-    $reflection = new ReflectionClass($queue);
-    $method = $reflection->getMethod('getExchangeAndRoutingKey');
-    $method->setAccessible(true);
-
-    [$exchange, $routingKey] = $method->invoke($queue, 'some:queue', $payload);
-
-    expect($exchange)->toBe('');
-    expect($routingKey)->toBe('fallback.some.queue');
+    expect($this->queue->size('default'))->toBe(12)
+        ->and($this->queue->pendingSize('default'))->toBe(12)
+        ->and($this->queue->delayedSize('default'))->toBe(0)
+        ->and($this->queue->reservedSize('default'))->toBe(0)
+        ->and($this->queue->creationTimeOfOldestPendingJob('default'))->toBeNull();
 });
 
-test('returns empty array for empty batch', function () {
-    $queue = new RabbitMQQueue(
-        $this->channelManager,
-        $this->scanner,
-        $this->config
-    );
+test('does not report a missing broker queue as empty', function () {
+    $this->channel->shouldReceive('queue_declare')->once()->andThrow(new AMQPIOException('queue missing'));
 
-    $result = $queue->pushBatch([]);
-
-    expect($result)->toBeEmpty();
+    expect(fn () => $this->queue->size('default'))
+        ->toThrow(ConnectionException::class, 'Failed to read');
 });
 
-test('acknowledges message', function () {
+test('publishes an empty batch without broker work', function () {
+    $this->channel->shouldNotReceive('basic_publish');
+
+    expect($this->queue->pushBatch([]))->toBe([]);
+});
+
+test('acknowledges and rejects deliveries', function () {
     $message = mockAMQPMessage(['deliveryTag' => 42]);
-    $channel = mockAMQPChannel();
-    $channel->shouldReceive('basic_ack')->with(42)->once();
+    $this->channel->shouldReceive('basic_ack')->once()->with(42);
+    $this->channel->shouldReceive('basic_reject')->once()->with(42, false);
 
-    $queue = new RabbitMQQueue(
-        $this->channelManager,
-        $this->scanner,
-        $this->config
-    );
-
-    $queue->ack($message, $channel);
-
-    // Assertion is in mock expectation
-    expect(true)->toBeTrue();
+    $this->queue->ack($message, $this->channel);
+    $this->queue->reject($message, $this->channel);
 });
 
-test('rejects message without requeue', function () {
-    $message = mockAMQPMessage(['deliveryTag' => 42]);
-    $channel = mockAMQPChannel();
-    $channel->shouldReceive('basic_reject')->with(42, false)->once();
-
-    $queue = new RabbitMQQueue(
-        $this->channelManager,
-        $this->scanner,
-        $this->config
-    );
-
-    $queue->reject($message, $channel, false);
-
-    expect(true)->toBeTrue();
-});
-
-test('rejects message with requeue', function () {
-    $message = mockAMQPMessage(['deliveryTag' => 42]);
-    $channel = mockAMQPChannel();
-    $channel->shouldReceive('basic_reject')->with(42, true)->once();
-
-    $queue = new RabbitMQQueue(
-        $this->channelManager,
-        $this->scanner,
-        $this->config
-    );
-
-    $queue->reject($message, $channel, true);
-
-    expect(true)->toBeTrue();
-});
-
-test('provides access to channel manager', function () {
-    $queue = new RabbitMQQueue(
-        $this->channelManager,
-        $this->scanner,
-        $this->config
-    );
-
-    expect($queue->getChannelManager())->toBe($this->channelManager);
+test('reads priority from jobs that provide it', function () {
+    expect(new PriorityJob(priority: 8))->toBeInstanceOf(HasPriority::class)
+        ->and((new PriorityJob(priority: 8))->getPriority())->toBe(8)
+        ->and(new SimpleJob)->not->toBeInstanceOf(HasPriority::class);
 });

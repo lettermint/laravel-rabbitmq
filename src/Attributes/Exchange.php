@@ -18,8 +18,9 @@ use Lettermint\RabbitMQ\Enums\ExchangeType;
  * - Topic: Routes based on routing key patterns (*.word.#)
  * - Direct: Routes based on exact routing key match
  * - Fanout: Broadcasts to all bound queues (ignores routing key)
- * - Headers: Routes based on message headers
- * - DelayedMessage: Delays message delivery (requires plugin)
+ *
+ * The topology registry supports direct, topic, and fanout exchanges. Delayed
+ * releases use classic TTL queues and do not require a broker plug-in.
  *
  * @example
  * ```php
@@ -51,7 +52,7 @@ final class Exchange
      * @param  bool  $internal  Only accessible via exchange-to-exchange bindings (default: false)
      * @param  string|null  $bindTo  Parent exchange name for exchange-to-exchange binding
      * @param  string  $bindRoutingKey  Routing key pattern for parent exchange binding
-     * @param  array<string, mixed>  $arguments  Additional exchange arguments (e.g., x-delayed-type)
+     * @param  array<string, mixed>  $arguments  Additional exchange arguments
      *
      * @throws InvalidArgumentException When validation fails
      */

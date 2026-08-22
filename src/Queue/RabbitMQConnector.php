@@ -4,10 +4,11 @@ declare(strict_types=1);
 
 namespace Lettermint\RabbitMQ\Queue;
 
+use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Contracts\Queue\Queue;
 use Illuminate\Queue\Connectors\ConnectorInterface;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
-use Lettermint\RabbitMQ\Discovery\AttributeScanner;
+use Lettermint\RabbitMQ\Topology\TopologyRegistry;
 
 /**
  * Laravel Queue Connector for RabbitMQ.
@@ -19,7 +20,9 @@ class RabbitMQConnector implements ConnectorInterface
 {
     public function __construct(
         protected ChannelManager $channelManager,
-        protected AttributeScanner $scanner,
+        protected TopologyRegistry $registry,
+        protected Dispatcher $events,
+        protected array $config,
     ) {}
 
     /**
@@ -31,8 +34,9 @@ class RabbitMQConnector implements ConnectorInterface
     {
         return new RabbitMQQueue(
             channelManager: $this->channelManager,
-            scanner: $this->scanner,
-            config: $config,
+            registry: $this->registry,
+            events: $this->events,
+            config: array_replace_recursive($this->config, $config),
         );
     }
 }

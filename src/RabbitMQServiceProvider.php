@@ -7,25 +7,32 @@ namespace Lettermint\RabbitMQ;
 use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Queue\QueueManager;
+use Illuminate\Support\Facades\Facade;
 use Illuminate\Support\ServiceProvider;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Connection\ConnectionManager;
+use Lettermint\RabbitMQ\Console\Commands\AuditCommand;
 use Lettermint\RabbitMQ\Console\Commands\ConsumeCommand;
 use Lettermint\RabbitMQ\Console\Commands\DeclareCommand;
 use Lettermint\RabbitMQ\Console\Commands\DlqInspectCommand;
 use Lettermint\RabbitMQ\Console\Commands\DlqPurgeCommand;
 use Lettermint\RabbitMQ\Console\Commands\HealthCommand;
+use Lettermint\RabbitMQ\Console\Commands\ProbeQueuesCommand;
 use Lettermint\RabbitMQ\Console\Commands\PurgeCommand;
 use Lettermint\RabbitMQ\Console\Commands\QueuesCommand;
 use Lettermint\RabbitMQ\Console\Commands\ReplayDlqCommand;
+use Lettermint\RabbitMQ\Console\Commands\TestEventCommand;
 use Lettermint\RabbitMQ\Console\Commands\TopologyCommand;
 use Lettermint\RabbitMQ\Consumers\Consumer;
+use Lettermint\RabbitMQ\Consumers\RabbitMQWorker;
 use Lettermint\RabbitMQ\Discovery\AttributeScanner;
 use Lettermint\RabbitMQ\Monitoring\HealthCheck;
+use Lettermint\RabbitMQ\Monitoring\QueueLifecycleSubscriber;
 use Lettermint\RabbitMQ\Monitoring\QueueMetrics;
 use Lettermint\RabbitMQ\Queue\RabbitMQConnector;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
 use Lettermint\RabbitMQ\Topology\TopologyManager;
+use Lettermint\RabbitMQ\Topology\TopologyRegistry;
 
 class RabbitMQServiceProvider extends ServiceProvider
 {
@@ -39,6 +46,7 @@ class RabbitMQServiceProvider extends ServiceProvider
         $this->registerConnectionManager();
         $this->registerChannelManager();
         $this->registerAttributeScanner();
+        $this->registerTopologyRegistry();
         $this->registerTopologyManager();
         $this->registerQueueComponents();
         $this->registerConsumer();
@@ -50,10 +58,12 @@ class RabbitMQServiceProvider extends ServiceProvider
      */
     public function boot(): void
     {
+        $this->loadViewsFrom(__DIR__.'/../resources/views', 'rabbitmq');
+        $this->app[Dispatcher::class]->subscribe(QueueLifecycleSubscriber::class);
         $this->publishConfig();
         $this->registerCommands();
         $this->registerQueueConnector();
-        $this->scanTopology();
+        $this->scanTopologyForConsole();
     }
 
     /**
@@ -63,6 +73,17 @@ class RabbitMQServiceProvider extends ServiceProvider
     {
         $this->app->singleton(ConnectionManager::class, function ($app) {
             return new ConnectionManager(
+                config: $app['config']['rabbitmq'] ?? [],
+                events: $app[Dispatcher::class],
+            );
+        });
+    }
+
+    protected function registerTopologyRegistry(): void
+    {
+        $this->app->singleton(TopologyRegistry::class, function ($app) {
+            return new TopologyRegistry(
+                scanner: $app[AttributeScanner::class],
                 config: $app['config']['rabbitmq'] ?? [],
             );
         });
@@ -98,7 +119,7 @@ class RabbitMQServiceProvider extends ServiceProvider
         $this->app->singleton(TopologyManager::class, function ($app) {
             return new TopologyManager(
                 channelManager: $app[ChannelManager::class],
-                scanner: $app[AttributeScanner::class],
+                registry: $app[TopologyRegistry::class],
                 config: $app['config']['rabbitmq'] ?? [],
             );
         });
@@ -112,7 +133,8 @@ class RabbitMQServiceProvider extends ServiceProvider
         $this->app->singleton(RabbitMQQueue::class, function ($app) {
             return new RabbitMQQueue(
                 channelManager: $app[ChannelManager::class],
-                scanner: $app[AttributeScanner::class],
+                registry: $app[TopologyRegistry::class],
+                events: $app[Dispatcher::class],
                 config: $app['config']['rabbitmq'] ?? [],
             );
         });
@@ -123,13 +145,51 @@ class RabbitMQServiceProvider extends ServiceProvider
      */
     protected function registerConsumer(): void
     {
+        $this->app->singleton(RabbitMQWorker::class, function ($app) {
+            $resetScope = function () use ($app): void {
+                if (method_exists($app['log'], 'flushSharedContext')) {
+                    $app['log']->flushSharedContext();
+                }
+
+                if (method_exists($app['log'], 'withoutContext')) {
+                    $app['log']->withoutContext();
+                }
+
+                if ($app->bound('db') && method_exists($app['db'], 'getConnections')) {
+                    foreach ($app['db']->getConnections() as $connection) {
+                        $connection->resetTotalQueryDuration();
+                        $connection->allowQueryDurationHandlersToRunAgain();
+                    }
+                }
+
+                $app->forgetScopedInstances();
+                Facade::clearResolvedInstances();
+
+                if (function_exists('memory_reset_peak_usage')) {
+                    memory_reset_peak_usage();
+                }
+            };
+
+            $worker = new RabbitMQWorker(
+                $app['queue'],
+                $app['events'],
+                $app[ExceptionHandler::class],
+                fn () => $app->isDownForMaintenance(),
+                $resetScope,
+            );
+
+            if ($app->bound('cache')) {
+                $worker->setCache($app['cache']->driver());
+            }
+
+            return $worker;
+        });
+
         $this->app->singleton(Consumer::class, function ($app) {
             return new Consumer(
                 channelManager: $app[ChannelManager::class],
-                scanner: $app[AttributeScanner::class],
-                rabbitmq: $app[RabbitMQQueue::class],
-                exceptions: $app[ExceptionHandler::class],
-                events: $app[Dispatcher::class],
+                queueManager: $app['queue'],
+                worker: $app[RabbitMQWorker::class],
             );
         });
     }
@@ -141,13 +201,17 @@ class RabbitMQServiceProvider extends ServiceProvider
     {
         $this->app->singleton(HealthCheck::class, function ($app) {
             return new HealthCheck(
-                connectionManager: $app[ConnectionManager::class],
+                channelManager: $app[ChannelManager::class],
+                registry: $app[TopologyRegistry::class],
+                config: $app['config']['rabbitmq'] ?? [],
             );
         });
 
         $this->app->singleton(QueueMetrics::class, function ($app) {
             return new QueueMetrics(
                 channelManager: $app[ChannelManager::class],
+                registry: $app[TopologyRegistry::class],
+                config: $app['config']['rabbitmq'] ?? [],
             );
         });
     }
@@ -172,13 +236,16 @@ class RabbitMQServiceProvider extends ServiceProvider
         if ($this->app->runningInConsole()) {
             $this->commands([
                 ConsumeCommand::class,
+                AuditCommand::class,
                 DeclareCommand::class,
                 DlqInspectCommand::class,
                 DlqPurgeCommand::class,
                 HealthCommand::class,
                 PurgeCommand::class,
+                ProbeQueuesCommand::class,
                 QueuesCommand::class,
                 ReplayDlqCommand::class,
+                TestEventCommand::class,
                 TopologyCommand::class,
             ]);
         }
@@ -190,10 +257,14 @@ class RabbitMQServiceProvider extends ServiceProvider
     protected function registerQueueConnector(): void
     {
         $this->app->afterResolving(QueueManager::class, function (QueueManager $manager) {
-            $manager->addConnector('rabbitmq', function () {
+            $driverName = (string) config('rabbitmq.driver_name', 'rabbitmq');
+
+            $manager->addConnector($driverName, function () {
                 return new RabbitMQConnector(
                     channelManager: $this->app[ChannelManager::class],
-                    scanner: $this->app[AttributeScanner::class],
+                    registry: $this->app[TopologyRegistry::class],
+                    events: $this->app[Dispatcher::class],
+                    config: $this->app['config']['rabbitmq'] ?? [],
                 );
             });
         });
@@ -202,8 +273,12 @@ class RabbitMQServiceProvider extends ServiceProvider
     /**
      * Scan for topology attributes.
      */
-    protected function scanTopology(): void
+    protected function scanTopologyForConsole(): void
     {
+        if (! $this->app->runningInConsole() || config('rabbitmq.topology.queues', []) !== []) {
+            return;
+        }
+
         $paths = config('rabbitmq.discovery.paths', [
             app_path('Jobs'),
             app_path('RabbitMQ'),
@@ -229,8 +304,10 @@ class RabbitMQServiceProvider extends ServiceProvider
             ChannelManager::class,
             AttributeScanner::class,
             TopologyManager::class,
+            TopologyRegistry::class,
             RabbitMQQueue::class,
             Consumer::class,
+            RabbitMQWorker::class,
             HealthCheck::class,
             QueueMetrics::class,
         ];

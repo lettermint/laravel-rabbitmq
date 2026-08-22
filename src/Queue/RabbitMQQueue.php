@@ -6,18 +6,21 @@ namespace Lettermint\RabbitMQ\Queue;
 
 use DateInterval;
 use DateTimeInterface;
+use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Contracts\Queue\Job;
 use Illuminate\Contracts\Queue\Queue as QueueContract;
 use Illuminate\Queue\Queue;
-use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use InvalidArgumentException;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Contracts\HasPriority;
 use Lettermint\RabbitMQ\Contracts\HasRoutingKey;
-use Lettermint\RabbitMQ\Discovery\AttributeScanner;
+use Lettermint\RabbitMQ\Events\MessagePublished;
+use Lettermint\RabbitMQ\Events\MessagePublishFailed;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
 use Lettermint\RabbitMQ\Exceptions\PublishException;
+use Lettermint\RabbitMQ\Topology\QueueDefinition;
+use Lettermint\RabbitMQ\Topology\TopologyRegistry;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Exception\AMQPChannelClosedException;
 use PhpAmqpLib\Exception\AMQPConnectionClosedException;
@@ -27,112 +30,113 @@ use PhpAmqpLib\Exception\AMQPRuntimeException;
 use PhpAmqpLib\Exception\AMQPTimeoutException;
 use PhpAmqpLib\Message\AMQPMessage;
 use PhpAmqpLib\Wire\AMQPTable;
+use Throwable;
 
-/**
- * RabbitMQ Queue implementation for Laravel.
- *
- * This class implements Laravel's Queue contract, allowing standard Laravel
- * dispatch patterns to work with RabbitMQ. Includes publisher confirms for
- * message durability and comprehensive error logging.
- */
-class RabbitMQQueue extends Queue implements QueueContract
+final class RabbitMQQueue extends Queue implements QueueContract
 {
-    /**
-     * The default queue name.
-     */
+    /** @var array<string, mixed> */
+    protected $config;
+
     protected string $default;
 
-    /**
-     * Publisher confirm timeout in seconds.
-     */
+    protected string $brokerConnection;
+
     protected float $confirmTimeout;
 
-    /**
-     * Whether to use publisher confirms.
-     */
-    protected bool $useConfirms;
+    protected int $maximumDelay;
 
-    /**
-     * The channel ID that has confirm mode enabled.
-     * Used to detect when the channel is replaced (reconnection).
-     */
-    protected ?int $confirmModeChannelId = null;
+    protected bool $mandatory;
+
+    protected bool $useConfirms;
 
     /**
      * @param  array<string, mixed>  $config
      */
     public function __construct(
         protected ChannelManager $channelManager,
-        protected AttributeScanner $scanner,
+        protected TopologyRegistry $registry,
+        protected Dispatcher $events,
         array $config,
     ) {
         $this->config = $config;
-
-        // Handle both config structures:
-        // - Laravel queue connection config: ['queue' => 'default', ...]
-        // - Package config (rabbitmq.php): ['queue' => ['default' => 'default', ...], ...]
         $queue = $config['queue'] ?? 'default';
-        $this->default = is_array($queue) ? ($queue['default'] ?? 'default') : $queue;
+        $this->default = is_array($queue) ? (string) ($queue['default'] ?? 'default') : (string) $queue;
+        $this->brokerConnection = (string) ($config['connection'] ?? $config['default'] ?? 'default');
+        $publisher = is_array($config['publisher'] ?? null) ? $config['publisher'] : [];
+        $this->confirmTimeout = (float) ($publisher['confirm_timeout'] ?? $config['confirm_timeout'] ?? 5.0);
+        $this->useConfirms = (bool) ($publisher['confirm'] ?? $config['publisher_confirms'] ?? true);
+        $this->mandatory = (bool) ($publisher['mandatory'] ?? $config['mandatory'] ?? true);
+        $this->maximumDelay = (int) ($config['retry']['maximum_delay'] ?? $config['maximum_delay'] ?? 86400);
 
-        $this->confirmTimeout = (float) ($config['confirm_timeout'] ?? 5.0);
-        $this->useConfirms = (bool) ($config['publisher_confirms'] ?? true);
+        if (! $this->useConfirms || ! $this->mandatory) {
+            throw new InvalidArgumentException(
+                'The Lettermint RabbitMQ driver requires publisher confirmations and mandatory routing.'
+            );
+        }
+
+        if ($this->confirmTimeout <= 0) {
+            throw new InvalidArgumentException('RabbitMQ publisher confirm_timeout must be greater than zero.');
+        }
     }
 
-    /**
-     * Get the size of the queue.
-     *
-     * php-amqplib's queue_declare returns [queue_name, message_count, consumer_count].
-     *
-     * @throws ConnectionException When unable to connect or access queue
-     */
     public function size($queue = null): int
     {
-        $queue = $this->getQueue($queue);
+        $logicalQueue = $this->getQueue($queue);
+        $physicalQueue = $this->physicalQueue($logicalQueue);
 
         try {
-            $channel = $this->channelManager->topologyChannel();
+            [, $messageCount] = $this->channelManager
+                ->topologyChannel($this->brokerConnection)
+                ->queue_declare($physicalQueue, true, false, false, false);
 
-            // queue_declare returns [queue_name, message_count, consumer_count]
-            // passive=true just checks if queue exists without modifying it
-            [$queueName, $messageCount, $consumerCount] = $channel->queue_declare(
-                $queue,
-                true,   // passive - just check, don't create
-                false,  // durable
-                false,  // exclusive
-                false   // auto_delete
-            );
-
-            return $messageCount;
-        } catch (AMQPProtocolChannelException $e) {
-            // Queue doesn't exist - channel is now closed by RabbitMQ
-            // Invalidate the topology channel so next call creates a fresh one
-            $this->channelManager->closeChannel('topology');
-
-            Log::debug('RabbitMQ queue does not exist', [
-                'queue' => $queue,
-                'error' => $e->getMessage(),
-            ]);
-
-            return 0;
-        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPRuntimeException $e) {
-            Log::error('RabbitMQ connection failed while getting queue size', [
-                'queue' => $queue,
-                'error' => $e->getMessage(),
-            ]);
+            return (int) $messageCount;
+        } catch (Throwable $exception) {
+            if ($exception instanceof AMQPProtocolChannelException) {
+                $this->channelManager->closeChannel('topology', $this->brokerConnection);
+            }
 
             throw new ConnectionException(
-                "Failed to connect to RabbitMQ while getting size of queue '{$queue}': {$e->getMessage()}",
-                previous: $e
+                "Failed to read RabbitMQ queue [{$logicalQueue}]: {$exception->getMessage()}",
+                previous: $exception,
             );
         }
     }
 
+    public function pendingSize($queue = null): int
+    {
+        return $this->size($queue);
+    }
+
     /**
-     * Push a new job onto the queue.
-     *
-     * @param  object|string  $job
-     * @param  mixed  $data
+     * AMQP 0-9-1 does not expose the number of messages in TTL delay queues.
      */
+    public function delayedSize($queue = null): int
+    {
+        $this->getQueue($queue);
+
+        return 0;
+    }
+
+    /**
+     * AMQP 0-9-1 queue declarations do not expose unacknowledged messages.
+     */
+    public function reservedSize($queue = null): int
+    {
+        $this->getQueue($queue);
+
+        return 0;
+    }
+
+    /**
+     * AMQP 0-9-1 cannot inspect the oldest message without consuming it.
+     */
+    public function creationTimeOfOldestPendingJob($queue = null): ?int
+    {
+        $this->getQueue($queue);
+
+        return null;
+    }
+
     public function push($job, $data = '', $queue = null): mixed
     {
         return $this->enqueueUsing(
@@ -142,46 +146,42 @@ class RabbitMQQueue extends Queue implements QueueContract
             null,
             fn ($payload, $queue) => $this->pushRaw($payload, $queue, [
                 'priority' => $this->getJobPriority($job),
-            ])
+            ]),
         );
     }
 
-    /**
-     * Push a raw payload onto the queue.
-     *
-     * @param  array<string, mixed>  $options
-     */
+    /** @param  array<string, mixed>  $options */
     public function pushRaw($payload, $queue = null, array $options = []): mixed
     {
-        $queue = $this->getQueue($queue);
-
-        [$exchange, $routingKey] = $this->getExchangeAndRoutingKey($queue, $payload);
-
+        $logicalQueue = $this->getQueue($queue);
+        $definition = $this->registry->queue($logicalQueue);
+        [$exchange, $routingKey] = $this->route($definition, (string) $payload);
         $delay = max(0, (int) ($options['delay'] ?? 0));
 
         if ($delay > 0) {
-            $exchange = (string) ($this->config['delayed_exchange'] ?? 'delayed');
+            $this->publishDelayed(
+                definition: $definition,
+                exchange: $exchange,
+                routingKey: $routingKey,
+                payload: (string) $payload,
+                delaySeconds: $delay,
+                priority: isset($options['priority']) ? (int) $options['priority'] : null,
+                properties: is_array($options['properties'] ?? null) ? $options['properties'] : [],
+            );
+        } else {
+            $this->publishMessage(
+                definition: $definition,
+                exchange: $exchange,
+                routingKey: $routingKey,
+                payload: (string) $payload,
+                priority: isset($options['priority']) ? (int) $options['priority'] : null,
+                properties: is_array($options['properties'] ?? null) ? $options['properties'] : [],
+            );
         }
 
-        $this->publishMessage(
-            exchange: $exchange,
-            routingKey: $routingKey,
-            payload: $payload,
-            priority: $options['priority'] ?? null,
-            delay: $delay > 0 ? $delay * 1000 : null,
-            properties: $options['properties'] ?? [],
-        );
-
-        return $this->getPayloadId($payload);
+        return $this->getPayloadId((string) $payload);
     }
 
-    /**
-     * Push a new job onto the queue after a delay.
-     *
-     * @param  DateInterval|DateTimeInterface|int  $delay
-     * @param  object|string  $job
-     * @param  mixed  $data
-     */
     public function later($delay, $job, $data = '', $queue = null): mixed
     {
         return $this->enqueueUsing(
@@ -191,268 +191,274 @@ class RabbitMQQueue extends Queue implements QueueContract
             $delay,
             fn ($payload, $queue, $delay) => $this->laterRaw($delay, $payload, $queue, [
                 'priority' => $this->getJobPriority($job),
-            ])
+            ]),
         );
     }
 
     /**
-     * Push a raw payload onto the queue after a delay.
-     *
      * @param  DateInterval|DateTimeInterface|int  $delay
      * @param  array<string, mixed>  $options
      */
     protected function laterRaw($delay, string $payload, ?string $queue = null, array $options = []): mixed
     {
-        $queue = $this->getQueue($queue);
-        $delay = $this->secondsUntil($delay);
-
-        [$exchange, $routingKey] = $this->getExchangeAndRoutingKey($queue, $payload);
-
-        // Use delayed exchange if available
-        $delayedExchange = $this->config['delayed_exchange'] ?? 'delayed';
-
-        $this->publishMessage(
-            exchange: $delayedExchange,
-            routingKey: $routingKey,
-            payload: $payload,
-            priority: $options['priority'] ?? null,
-            delay: (int) ($delay * 1000) // Convert to milliseconds
-        );
-
-        return $this->getPayloadId($payload);
+        return $this->pushRaw($payload, $queue, array_replace($options, [
+            'delay' => max(0, $this->secondsUntil($delay)),
+        ]));
     }
 
-    /**
-     * Pop the next job off of the queue.
-     *
-     * @throws ConnectionException When unable to connect or access queue
-     */
     public function pop($queue = null): ?Job
     {
-        $queue = $this->getQueue($queue);
+        $logicalQueue = $this->getQueue($queue);
+        $physicalQueue = $this->physicalQueue($logicalQueue);
 
         try {
-            $channel = $this->channelManager->consumeChannel();
+            $channel = $this->channelManager->consumeChannel($this->brokerConnection);
+            $message = $channel->basic_get($physicalQueue, false);
 
-            // basic_get returns AMQPMessage or null
-            $message = $channel->basic_get($queue, false);
-
-            if ($message instanceof AMQPMessage) {
-                return new RabbitMQJob(
-                    container: $this->container,
-                    rabbitmq: $this,
-                    channel: $channel,
-                    message: $message,
-                    connectionName: $this->connectionName,
-                    queueName: $queue
-                );
+            if (! $message instanceof AMQPMessage) {
+                return null;
             }
 
-            return null;
-        } catch (\Exception $e) {
-            Log::error('RabbitMQ error while popping job', [
-                'queue' => $queue,
-                'error' => $e->getMessage(),
-                'exception' => get_class($e),
-            ]);
-
+            return new RabbitMQJob(
+                container: $this->container,
+                rabbitmq: $this,
+                channel: $channel,
+                message: $message,
+                connectionName: $this->connectionName,
+                queueName: $logicalQueue,
+            );
+        } catch (Throwable $exception) {
             throw new ConnectionException(
-                "Failed to pop from queue '{$queue}': {$e->getMessage()}",
-                previous: $e
+                "Failed to pop RabbitMQ queue [{$logicalQueue}]: {$exception->getMessage()}",
+                previous: $exception,
             );
         }
     }
 
     /**
-     * Push a batch of jobs onto the queue.
+     * Publish jobs in order. A failure can occur after earlier jobs are confirmed.
      *
-     * Uses RabbitMQ transactions to ensure all-or-nothing semantics.
-     * Critical for operations where batch consistency is required.
-     *
-     * Note: Uses a separate 'batch' channel to avoid conflicts with publisher
-     * confirms on the regular publish channel. Mixing tx_select and confirm_select
-     * on the same channel is not supported by RabbitMQ.
-     *
-     * @param  array<object|string>  $jobs  Array of job instances or class names
-     * @return array<array{status: string, job: string, id?: string}>
-     *
-     * @throws PublishException When batch publish fails
+     * @param  array<object|string>  $jobs
+     * @return array<array{status: string, job: string, id: string}>
      */
     public function pushBatch(array $jobs, ?string $queue = null): array
     {
-        if (empty($jobs)) {
-            return [];
-        }
-
         $results = [];
-        $queue = $this->getQueue($queue);
 
-        try {
-            // Use dedicated batch channel to avoid tx/confirm mode conflict
-            $channel = $this->channelManager->channel('batch');
-            $channel->tx_select();
-
-            foreach ($jobs as $index => $job) {
-                try {
-                    $payload = $this->createPayload($job, $queue, '');
-                    [$exchange, $routingKey] = $this->getExchangeAndRoutingKey($queue, $payload);
-
-                    $this->publishMessageWithoutConfirm(
-                        $channel,
-                        $exchange,
-                        $routingKey,
-                        $payload,
-                        $this->getJobPriority($job)
-                    );
-
-                    $results[] = [
-                        'status' => 'queued',
-                        'job' => is_object($job) ? get_class($job) : $job,
-                        'id' => $this->getPayloadId($payload),
-                    ];
-                } catch (AMQPIOException|AMQPConnectionClosedException|AMQPChannelClosedException|AMQPProtocolChannelException $e) {
-                    $channel->tx_rollback();
-
-                    Log::error('Batch publish failed', [
-                        'queue' => $queue,
-                        'failed_at_index' => $index,
-                        'error' => $e->getMessage(),
-                        'exception_class' => get_class($e),
-                    ]);
-
-                    throw new PublishException(
-                        "Batch publish failed at job index {$index}: {$e->getMessage()}",
-                        exchange: $exchange ?? '',
-                        routingKey: $routingKey ?? '',
-                        previous: $e
-                    );
-                }
-            }
-
-            $channel->tx_commit();
-
-            Log::info('Batch published successfully', [
-                'queue' => $queue,
-                'job_count' => count($jobs),
-            ]);
-
-            return $results;
-        } catch (PublishException $e) {
-            throw $e;
-        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPChannelClosedException $e) {
-            Log::error('Batch publish transaction failed', [
-                'queue' => $queue,
-                'error' => $e->getMessage(),
-                'exception_class' => get_class($e),
-            ]);
-
-            throw new PublishException(
-                "Failed to publish batch: {$e->getMessage()}",
-                exchange: '',
-                routingKey: '',
-                previous: $e
-            );
+        foreach ($jobs as $job) {
+            $id = (string) $this->push($job, '', $queue);
+            $results[] = [
+                'status' => 'confirmed',
+                'job' => is_object($job) ? $job::class : $job,
+                'id' => $id,
+            ];
         }
+
+        return $results;
     }
 
     /**
-     * Publish a message to RabbitMQ with optional publisher confirms.
-     *
-     * @throws PublishException When publish fails or confirm times out
+     * @param  array<string, mixed>  $properties
      */
-    protected function publishMessage(
+    protected function publishDelayed(
+        QueueDefinition $definition,
         string $exchange,
         string $routingKey,
         string $payload,
-        ?int $priority = null,
-        ?int $delay = null,
-        array $properties = [],
+        int $delaySeconds,
+        ?int $priority,
+        array $properties,
     ): void {
+        if ($delaySeconds > $this->maximumDelay) {
+            throw new InvalidArgumentException(
+                "RabbitMQ delay [{$delaySeconds}] exceeds the configured maximum [{$this->maximumDelay}] seconds."
+            );
+        }
+
+        $delayMilliseconds = max(1, $delaySeconds * 1000);
+        $delayQueue = $this->delayQueueName($definition, $exchange, $routingKey, $delayMilliseconds);
+        $cleanupGrace = max(60000, (int) ($this->config['retry']['delay_queue_cleanup_grace'] ?? 86400000));
+        $arguments = new AMQPTable([
+            'x-queue-type' => 'classic',
+            'x-message-ttl' => $delayMilliseconds,
+            'x-expires' => $delayMilliseconds + $cleanupGrace,
+            'x-dead-letter-exchange' => $exchange,
+            'x-dead-letter-routing-key' => $routingKey,
+        ]);
+
         try {
-            $channel = $this->channelManager->publishChannel();
+            $this->channelManager
+                ->topologyChannel($this->brokerConnection)
+                ->queue_declare($delayQueue, false, true, false, false, false, $arguments);
+        } catch (Throwable $exception) {
+            $this->channelManager->closeChannel('topology', $this->brokerConnection);
 
-            // Enable publisher confirms if needed.
-            // Track by channel ID to detect when channel is replaced (reconnection).
-            $channelId = spl_object_id($channel);
-            if ($this->useConfirms && $this->confirmModeChannelId !== $channelId) {
-                $channel->confirm_select();
-                $this->confirmModeChannelId = $channelId;
-            }
-
-            $message = $this->buildMessage($payload, $priority, $delay, $properties);
-
-            $channel->basic_publish($message, $exchange, $routingKey);
-
-            if ($this->useConfirms) {
-                try {
-                    $channel->wait_for_pending_acks_returns($this->confirmTimeout);
-                } catch (AMQPTimeoutException $e) {
-                    // Timeout waiting for confirm - message was already published via basic_publish
-                    // but we don't know for sure if RabbitMQ received it. Log as warning since
-                    // the message may have been delivered, and let the caller decide whether to retry.
-                    Log::warning('RabbitMQ publisher confirm timed out - message may have been delivered', [
-                        'exchange' => $exchange,
-                        'routing_key' => $routingKey,
-                        'confirm_timeout' => $this->confirmTimeout,
-                    ]);
-
-                    // Don't throw - the message was published, we just couldn't confirm
-                    // Throwing here would cause duplicates if caller retries
-                }
-            }
-        } catch (PublishException $e) {
-            Log::error('RabbitMQ message publish failed', [
-                'exchange' => $exchange,
-                'routing_key' => $routingKey,
-                'error' => $e->getMessage(),
-            ]);
-
-            throw $e;
-        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPChannelClosedException|AMQPProtocolChannelException|AMQPRuntimeException $e) {
-            Log::error('RabbitMQ publish error', [
-                'exchange' => $exchange,
-                'routing_key' => $routingKey,
-                'error' => $e->getMessage(),
-                'exception_class' => get_class($e),
-            ]);
-
-            throw new PublishException(
-                "Failed to publish message: {$e->getMessage()}",
+            $this->failPublish(
+                definition: $definition,
                 exchange: $exchange,
                 routingKey: $routingKey,
-                previous: $e
+                messageId: (string) ($properties['message_id'] ?? $this->getPayloadId($payload)),
+                exception: new PublishException(
+                    "RabbitMQ delayed publish setup failed: {$exception->getMessage()}",
+                    exchange: $exchange,
+                    routingKey: $routingKey,
+                    previous: $exception,
+                ),
             );
         }
+
+        $this->publishMessage(
+            definition: $definition,
+            exchange: '',
+            routingKey: $delayQueue,
+            payload: $payload,
+            priority: $priority,
+            properties: $properties,
+        );
     }
 
     /**
-     * Publish a message without confirms (for batch transactions).
+     * @param  array<string, mixed>  $properties
      */
-    protected function publishMessageWithoutConfirm(
-        AMQPChannel $channel,
+    protected function publishMessage(
+        QueueDefinition $definition,
         string $exchange,
         string $routingKey,
         string $payload,
         ?int $priority = null,
+        array $properties = [],
     ): void {
-        $message = $this->buildMessage($payload, $priority, null);
+        $message = $this->buildMessage($payload, $priority, $properties);
+        $messageId = (string) $message->get('message_id');
+        $startedAt = microtime(true);
+        $returned = null;
+        $nacked = false;
 
-        $channel->basic_publish($message, $exchange, $routingKey);
+        try {
+            $channel = $this->channelManager->publishChannel($this->brokerConnection);
+
+            $channel->set_return_listener(
+                function (int $code, string $text, string $returnedExchange, string $returnedRoutingKey) use (&$returned): void {
+                    $returned = compact('code', 'text', 'returnedExchange', 'returnedRoutingKey');
+                },
+            );
+            $channel->set_nack_handler(function () use (&$nacked): void {
+                $nacked = true;
+            });
+
+            $channel->basic_publish($message, $exchange, $routingKey, $this->mandatory);
+            $channel->wait_for_pending_acks_returns($this->confirmTimeout);
+
+            if (is_array($returned)) {
+                throw new PublishException(
+                    "RabbitMQ returned an unroutable message: {$returned['code']} {$returned['text']}",
+                    exchange: $exchange,
+                    routingKey: $routingKey,
+                );
+            }
+
+            if ($nacked) {
+                throw new PublishException(
+                    'RabbitMQ negatively confirmed the published message.',
+                    exchange: $exchange,
+                    routingKey: $routingKey,
+                );
+            }
+
+            $this->dispatchEvent(new MessagePublished(
+                queue: $definition->logicalName,
+                physicalQueue: $definition->physicalName,
+                exchange: $exchange,
+                routingKey: $routingKey,
+                messageId: $messageId,
+                durationMilliseconds: (microtime(true) - $startedAt) * 1000,
+            ));
+        } catch (AMQPTimeoutException $exception) {
+            $this->channelManager->closeChannel('publish', $this->brokerConnection);
+
+            $this->failPublish(
+                definition: $definition,
+                exchange: $exchange,
+                routingKey: $routingKey,
+                messageId: $messageId,
+                exception: new PublishException(
+                    'RabbitMQ publisher confirmation timed out. The publish result is uncertain.',
+                    exchange: $exchange,
+                    routingKey: $routingKey,
+                    previous: $exception,
+                ),
+            );
+        } catch (PublishException $exception) {
+            $this->failPublish($definition, $exchange, $routingKey, $messageId, $exception);
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPChannelClosedException|AMQPProtocolChannelException|AMQPRuntimeException|ConnectionException $exception) {
+            $this->channelManager->closeChannel('publish', $this->brokerConnection);
+
+            try {
+                $this->channelManager->recoverConnection($this->brokerConnection);
+            } catch (Throwable $recoveryException) {
+                $this->reportSafely($recoveryException);
+            }
+
+            $this->failPublish(
+                definition: $definition,
+                exchange: $exchange,
+                routingKey: $routingKey,
+                messageId: $messageId,
+                exception: new PublishException(
+                    "RabbitMQ publish failed: {$exception->getMessage()}",
+                    exchange: $exchange,
+                    routingKey: $routingKey,
+                    previous: $exception,
+                ),
+            );
+        }
     }
 
-    /**
-     * Build an AMQPMessage with properties.
-     */
-    protected function buildMessage(
-        string $payload,
-        ?int $priority = null,
-        ?int $delay = null,
-        array $properties = [],
-    ): AMQPMessage {
+    protected function failPublish(
+        QueueDefinition $definition,
+        string $exchange,
+        string $routingKey,
+        string $messageId,
+        PublishException $exception,
+    ): never {
+        $this->dispatchEvent(new MessagePublishFailed(
+            queue: $definition->logicalName,
+            physicalQueue: $definition->physicalName,
+            exchange: $exchange,
+            routingKey: $routingKey,
+            messageId: $messageId,
+            exception: $exception,
+        ));
+        $this->reportSafely($exception);
+
+        throw $exception;
+    }
+
+    private function dispatchEvent(object $event): void
+    {
+        try {
+            $this->events->dispatch($event);
+        } catch (Throwable $exception) {
+            $this->reportSafely($exception);
+        }
+    }
+
+    private function reportSafely(Throwable $exception): void
+    {
+        try {
+            report($exception);
+        } catch (Throwable) {
+            // Monitoring must not replace the publisher result.
+        }
+    }
+
+    /** @param  array<string, mixed>  $properties */
+    protected function buildMessage(string $payload, ?int $priority = null, array $properties = []): AMQPMessage
+    {
         $properties = array_replace([
             'delivery_mode' => AMQPMessage::DELIVERY_MODE_PERSISTENT,
             'content_type' => 'application/json',
-            'message_id' => Str::uuid()->toString(),
+            'message_id' => $this->getPayloadId($payload),
             'timestamp' => time(),
         ], $properties);
 
@@ -460,145 +466,58 @@ class RabbitMQQueue extends Queue implements QueueContract
             $properties['priority'] = $priority;
         }
 
-        // Add delay header for delayed exchange plugin
-        if ($delay !== null && $delay > 0) {
-            $headers = $properties['application_headers'] ?? [];
-
-            if ($headers instanceof AMQPTable) {
-                $headers = $headers->getNativeData();
-            }
-
-            $headers['x-delay'] = $delay;
-            $properties['application_headers'] = new AMQPTable($headers);
-        }
-
         return new AMQPMessage($payload, $properties);
     }
 
-    /**
-     * Determine exchange and routing key for a queue.
-     *
-     * When a job class has multiple ConsumesQueue attributes (e.g., ProcessMessage
-     * can be dispatched to either transactional or broadcast queues), we match
-     * the attribute by the target queue name to get the correct exchange and
-     * routing key for that specific queue.
-     *
-     * For jobs WITHOUT a ConsumesQueue attribute (e.g., third-party packages),
-     * we use fallback routing:
-     * - Exchange: config('rabbitmq.queue.exchange') - your fallback exchange
-     * - Routing key: 'fallback.{queue_name}' (colons replaced with dots)
-     *
-     * To catch fallback messages, create a queue bound to your fallback exchange
-     * with routing key 'fallback.#' (wildcard catches all fallback routes).
-     *
-     * @return array{0: string, 1: string}
-     */
-    protected function getExchangeAndRoutingKey(string $queue, string $payload): array
+    /** @return array{0: string, 1: string} */
+    protected function route(QueueDefinition $definition, string $payload): array
     {
-        // Try to get ConsumesQueue attribute from the job class
         $data = json_decode($payload, true);
-        $jobClass = $data['displayName'] ?? $data['data']['commandName'] ?? null;
-
-        // Per-message routing key injected by a HasRoutingKey job (see createPayloadArray).
-        // Overrides the static binding routing key; the exchange is still resolved
-        // from the job's attribute. Survives retry: the re-published payload carries it.
-        $dynamicRoutingKey = is_array($data) && array_key_exists('routingKey', $data)
-            ? $this->validateRoutingKey((string) $data['routingKey'])
+        $dynamicRoutingKey = is_array($data) && isset($data['routingKey'])
+            ? $this->registry->validateRoutingKey($definition->logicalName, (string) $data['routingKey'])
             : null;
 
-        if ($jobClass !== null) {
-            // Pass queue name to match correct attribute when job has multiple
-            $attribute = $this->scanner->getQueueForJob($jobClass, $queue);
+        $routingKey = $dynamicRoutingKey ?? $definition->publishRoutingKey();
 
-            if ($attribute !== null) {
-                $exchange = $attribute->getPublishExchange();
-                $routingKey = $dynamicRoutingKey ?? $attribute->getPublishRoutingKey();
-
-                Log::debug('RabbitMQ routing from ConsumesQueue attribute', [
-                    'job_class' => $jobClass,
-                    'queue' => $queue,
-                    'exchange' => $exchange,
-                    'routing_key' => $routingKey,
-                ]);
-
-                return [
-                    $exchange ?? config('rabbitmq.queue.exchange', ''),
-                    $routingKey,
-                ];
-            }
-
-            // Attribute not found - log for debugging
-            Log::warning('RabbitMQ: ConsumesQueue attribute not found for job', [
-                'job_class' => $jobClass,
-                'queue' => $queue,
-                'scanner_queue_count' => $this->scanner->getQueues()->count(),
-                'scanner_classes' => $this->scanner->getQueues()->pluck('class')->unique()->values()->toArray(),
-            ]);
+        if ($definition->publishExchange() !== '') {
+            $routingKey = $this->registry->validateRoutingKey($definition->logicalName, $routingKey);
         }
 
-        // Fallback: use package config with 'fallback.' prefix for routing key
-        // Note: Use config('rabbitmq...') not $this->config which is the connection config
-        // The 'fallback.' prefix allows you to create a catch-all queue bound to 'fallback.#'
-        $exchange = config('rabbitmq.queue.exchange', '');
-        $routingKey = $dynamicRoutingKey ?? 'fallback.'.str_replace(':', '.', $queue);
-
-        Log::debug('RabbitMQ routing using fallback', [
-            'job_class' => $jobClass,
-            'queue' => $queue,
-            'exchange' => $exchange,
-            'routing_key' => $routingKey,
-        ]);
-
-        return [$exchange, $routingKey];
+        return [$definition->publishExchange(), $routingKey];
     }
 
-    /**
-     * Get the priority from a job if it implements HasPriority.
-     */
+    protected function delayQueueName(
+        QueueDefinition $definition,
+        string $exchange,
+        string $routingKey,
+        int $delayMilliseconds,
+    ): string {
+        $suffix = substr(hash('sha256', $exchange."\0".$routingKey), 0, 12);
+        $name = $this->registry->physicalName(
+            'delay:'.$definition->logicalName.':'.$delayMilliseconds.':'.$suffix
+        );
+
+        if (strlen($name) <= 255) {
+            return $name;
+        }
+
+        $shortName = $this->registry->physicalName(
+            'delay:'.substr(hash('sha256', $definition->logicalName), 0, 20).':'.$delayMilliseconds.':'.$suffix
+        );
+
+        if (strlen($shortName) > 255) {
+            throw new InvalidArgumentException('RabbitMQ physical_prefix is too long for delayed queue names.');
+        }
+
+        return $shortName;
+    }
+
     protected function getJobPriority(mixed $job): ?int
     {
-        if ($job instanceof HasPriority) {
-            return $job->getPriority();
-        }
-
-        return null;
+        return $job instanceof HasPriority ? $job->getPriority() : null;
     }
 
     /**
-     * Validate a concrete AMQP routing key.
-     *
-     * Dynamic routing keys select one route. Topic binding wildcards belong in
-     * topology declarations and must not be published as message routing keys.
-     *
-     * @throws InvalidArgumentException
-     */
-    protected function validateRoutingKey(string $routingKey): string
-    {
-        if (trim($routingKey) === '') {
-            throw new InvalidArgumentException('RabbitMQ routing key cannot be empty');
-        }
-
-        if (strlen($routingKey) > 255) {
-            throw new InvalidArgumentException('RabbitMQ routing key cannot exceed 255 bytes');
-        }
-
-        if (str_contains($routingKey, '*') || str_contains($routingKey, '#')) {
-            throw new InvalidArgumentException('RabbitMQ publish routing key cannot contain topic wildcards');
-        }
-
-        if (preg_match('/[\x00-\x1F\x7F]/', $routingKey) === 1) {
-            throw new InvalidArgumentException('RabbitMQ routing key cannot contain control characters');
-        }
-
-        return $routingKey;
-    }
-
-    /**
-     * Build the payload array, injecting a per-message routing key when the job
-     * implements HasRoutingKey. Stored in the payload so getExchangeAndRoutingKey
-     * can honor it without deserializing the job, and so a retried re-publish of
-     * the same payload keeps the original route.
-     *
      * @param  object|string  $job
      * @param  mixed  $data
      * @return array<string, mixed>
@@ -608,85 +527,67 @@ class RabbitMQQueue extends Queue implements QueueContract
         $payload = parent::createPayloadArray($job, $queue, $data);
 
         if ($job instanceof HasRoutingKey) {
-            $payload['routingKey'] = $this->validateRoutingKey($job->getRoutingKey());
+            $payload['routingKey'] = $this->registry->validateRoutingKey(
+                $this->getQueue($queue),
+                $job->getRoutingKey(),
+            );
         }
 
         return $payload;
     }
 
-    /**
-     * Get the ID from the payload.
-     */
     protected function getPayloadId(string $payload): string
     {
         $data = json_decode($payload, true);
 
-        return $data['uuid'] ?? Str::uuid()->toString();
+        return is_array($data) && isset($data['uuid'])
+            ? (string) $data['uuid']
+            : Str::uuid()->toString();
     }
 
-    /**
-     * Get the queue name, falling back to the default.
-     */
     public function getQueue(?string $queue): string
     {
-        return $queue ?? $this->default;
+        $queue ??= $this->default;
+        $this->registry->queue($queue);
+
+        return $queue;
     }
 
-    /**
-     * Get the underlying channel manager.
-     */
+    public function physicalQueue(string $queue): string
+    {
+        return $this->registry->physicalQueue($queue);
+    }
+
+    public function getBrokerConnectionName(): string
+    {
+        return $this->brokerConnection;
+    }
+
     public function getChannelManager(): ChannelManager
     {
         return $this->channelManager;
     }
 
-    /**
-     * Acknowledge a message.
-     *
-     * Critical operation - failures are logged for visibility.
-     *
-     * @throws ConnectionException When acknowledgment fails
-     */
     public function ack(AMQPMessage $message, AMQPChannel $channel): void
     {
         try {
             $channel->basic_ack($message->getDeliveryTag());
-        } catch (AMQPIOException|AMQPChannelClosedException $e) {
-            Log::error('Failed to acknowledge RabbitMQ message', [
-                'delivery_tag' => $message->getDeliveryTag(),
-                'message_id' => $message->get('message_id'),
-                'error' => $e->getMessage(),
-            ]);
-
+        } catch (AMQPIOException|AMQPChannelClosedException|AMQPConnectionClosedException|AMQPProtocolChannelException|AMQPRuntimeException $exception) {
             throw new ConnectionException(
-                "Failed to acknowledge message: {$e->getMessage()}",
-                previous: $e
+                "Failed to acknowledge RabbitMQ message: {$exception->getMessage()}",
+                previous: $exception,
             );
         }
     }
 
-    /**
-     * Reject a message (send to DLQ if configured).
-     *
-     * Critical operation - failures are logged for visibility.
-     *
-     * @throws ConnectionException When rejection fails
-     */
     public function reject(AMQPMessage $message, AMQPChannel $channel, bool $requeue = false): void
     {
         try {
             $channel->basic_reject($message->getDeliveryTag(), $requeue);
-        } catch (AMQPIOException|AMQPChannelClosedException $e) {
-            Log::error('Failed to reject RabbitMQ message', [
-                'delivery_tag' => $message->getDeliveryTag(),
-                'message_id' => $message->get('message_id'),
-                'requeue' => $requeue,
-                'error' => $e->getMessage(),
-            ]);
-
+        } catch (AMQPIOException|AMQPChannelClosedException|AMQPConnectionClosedException|AMQPProtocolChannelException|AMQPRuntimeException $exception) {
             throw new ConnectionException(
-                "Failed to reject message: {$e->getMessage()}",
-                previous: $e
+                "Failed to reject RabbitMQ message: {$exception->getMessage()}",
+                previous: $exception,
             );
         }
     }

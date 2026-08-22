@@ -9,11 +9,15 @@ use Illuminate\Contracts\Queue\Job as JobContract;
 use Illuminate\Queue\Jobs\Job;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\Log;
+use Lettermint\RabbitMQ\Events\JobDeadLettered;
+use Lettermint\RabbitMQ\Events\JobReleased;
+use Lettermint\RabbitMQ\Events\JobRetried;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
 use Lettermint\RabbitMQ\Exceptions\PublishException;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Message\AMQPMessage;
 use PhpAmqpLib\Wire\AMQPTable;
+use Throwable;
 
 /**
  * RabbitMQ Job wrapper for Laravel.
@@ -51,6 +55,8 @@ class RabbitMQJob extends Job implements JobContract
      * @var array<string, mixed>|null
      */
     protected ?array $decoded = null;
+
+    protected ?Throwable $failureException = null;
 
     public function __construct(
         Container $container,
@@ -101,7 +107,7 @@ class RabbitMQJob extends Job implements JobContract
      * @throws ConnectionException When acknowledgment fails
      * @throws PublishException When the replacement message cannot be published
      */
-    public function releaseWithException(int $delay, \Throwable $exception): void
+    public function releaseWithException(int $delay, Throwable $exception): void
     {
         parent::release($delay);
 
@@ -110,9 +116,6 @@ class RabbitMQJob extends Job implements JobContract
             'class' => get_class($exception),
             'message' => $exception->getMessage(),
             'code' => $exception->getCode(),
-            'file' => $exception->getFile(),
-            'line' => $exception->getLine(),
-            'trace' => array_slice($exception->getTrace(), 0, 5),
         ];
 
         $this->republish($payload, $delay);
@@ -146,7 +149,29 @@ class RabbitMQJob extends Job implements JobContract
             );
 
             $this->rabbitmq->ack($this->message, $this->channel);
-        } catch (\Throwable $e) {
+
+            $this->dispatchEvent(new JobReleased(
+                queue: $this->queueName,
+                jobId: $this->getJobId(),
+                jobName: $this->getName(),
+                attempt: $this->attempts() + 1,
+                delay: $delay,
+                messageTimestamp: $this->getTimestamp(),
+                redelivered: $this->message->isRedelivered(),
+                brokerDeliveryCount: $this->brokerDeliveryCount(),
+            ));
+
+            $this->dispatchEvent(new JobRetried(
+                queue: $this->queueName,
+                jobId: $this->getJobId(),
+                jobName: $this->getName(),
+                attempt: $this->attempts() + 1,
+                delay: $delay,
+                messageTimestamp: $this->getTimestamp(),
+                redelivered: $this->message->isRedelivered(),
+                brokerDeliveryCount: $this->brokerDeliveryCount(),
+            ));
+        } catch (Throwable $e) {
             Log::critical('Failed to release RabbitMQ message; original delivery remains unacknowledged', [
                 'queue' => $this->queueName,
                 'job_id' => $this->getJobId(),
@@ -161,31 +186,63 @@ class RabbitMQJob extends Job implements JobContract
     }
 
     /**
-     * Delete the job from the queue (acknowledge successful processing).
-     *
-     * CRITICAL: If acknowledgment fails after job completion, the message
-     * may be redelivered causing duplicate processing. We log at CRITICAL
-     * level but don't throw to avoid masking the original job success.
+     * Acknowledge a successful job or reject a final failure to the DLQ.
      */
     public function delete(): void
     {
         parent::delete();
 
         try {
+            if ($this->hasFailed()) {
+                $this->rabbitmq->reject($this->message, $this->channel, false);
+
+                $this->dispatchEvent(new JobDeadLettered(
+                    queue: $this->queueName,
+                    jobId: $this->getJobId(),
+                    jobName: $this->getName(),
+                    attempt: $this->attempts(),
+                    exception: $this->failureException ?? new \RuntimeException('RabbitMQ job failed'),
+                    messageTimestamp: $this->getTimestamp(),
+                    redelivered: $this->message->isRedelivered(),
+                    brokerDeliveryCount: $this->brokerDeliveryCount(),
+                ));
+
+                return;
+            }
+
             $this->rabbitmq->ack($this->message, $this->channel);
         } catch (ConnectionException $e) {
-            // CRITICAL: Job completed but ack failed - potential duplicate processing
-            Log::critical('Job completed but acknowledgment failed - potential duplicate processing', [
+            Log::critical('RabbitMQ final delivery action failed', [
                 'queue' => $this->queueName,
                 'job_id' => $this->getJobId(),
                 'job_name' => $this->getName(),
                 'delivery_tag' => $this->message->getDeliveryTag(),
+                'operation' => $this->hasFailed() ? 'dead_letter' : 'acknowledge',
                 'error' => $e->getMessage(),
             ]);
 
-            // Report to error tracking (Sentry, etc.) but don't throw
-            // because the job itself succeeded
-            report($e);
+            throw $e;
+        }
+    }
+
+    /**
+     * Fail the job and route the canonical message to its dead-letter queue.
+     */
+    public function fail($e = null): void
+    {
+        $this->failureException = $e instanceof Throwable
+            ? $e
+            : new \RuntimeException('RabbitMQ job failed');
+
+        parent::fail($e);
+    }
+
+    private function dispatchEvent(object $event): void
+    {
+        try {
+            event($event);
+        } catch (Throwable $exception) {
+            report($exception);
         }
     }
 
@@ -274,7 +331,6 @@ class RabbitMQJob extends Job implements JobContract
                     'delivery_tag' => $this->message->getDeliveryTag(),
                     'message_id' => $this->getMessageProperty('message_id'),
                     'json_error' => $errorMsg,
-                    'body_preview' => substr($body, 0, 200),
                 ]);
 
                 throw new \RuntimeException(

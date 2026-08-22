@@ -100,11 +100,11 @@ test('reuses existing connected connection', function () {
     expect($conn1)->toBe($conn2);
 });
 
-test('reconnects when connection is disconnected', function () {
+test('builds a fresh connection when the pooled connection is disconnected', function () {
     Log::spy();
 
     $mockConnection = mockAMQPConnection(false);
-    $mockConnection->shouldReceive('reconnect')->once()->andReturn(true);
+    $mockConnection->shouldNotReceive('reconnect');
     $mockConnection->shouldReceive('isConnected')->andReturn(false, true);
 
     $manager = new class(['default' => 'test', 'connections' => ['test' => ['hosts' => [['host' => 'localhost']]]]], $mockConnection) extends ConnectionManager

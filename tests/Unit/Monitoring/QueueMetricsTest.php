@@ -13,13 +13,15 @@ beforeEach(function () {
     $this->channelManager->shouldReceive('topologyChannel')
         ->andReturn($this->mockChannel)
         ->byDefault();
+    $this->registry = testTopologyRegistry();
+    $this->config = ['default' => 'default'];
 });
 
 test('getQueueStats indicates not connected on error', function () {
     $this->channelManager->shouldReceive('topologyChannel')
         ->andThrow(new Exception('Channel failed'));
 
-    $metrics = new QueueMetrics($this->channelManager);
+    $metrics = new QueueMetrics($this->channelManager, $this->registry, $this->config);
 
     $stats = $metrics->getQueueStats('test-queue');
 
@@ -34,7 +36,7 @@ test('getQueueStats logs warning on error', function () {
     $this->channelManager->shouldReceive('topologyChannel')
         ->andThrow(new Exception('Channel failed'));
 
-    $metrics = new QueueMetrics($this->channelManager);
+    $metrics = new QueueMetrics($this->channelManager, $this->registry, $this->config);
     $metrics->getQueueStats('test-queue');
 
     Log::shouldHaveReceived('warning')
@@ -42,7 +44,7 @@ test('getQueueStats logs warning on error', function () {
 });
 
 test('getAllQueueStats returns empty array for empty input', function () {
-    $metrics = new QueueMetrics($this->channelManager);
+    $metrics = new QueueMetrics($this->channelManager, $this->registry, $this->config);
 
     $stats = $metrics->getAllQueueStats([]);
 
@@ -50,7 +52,7 @@ test('getAllQueueStats returns empty array for empty input', function () {
 });
 
 test('hasStatistics returns true with php-amqplib', function () {
-    $metrics = new QueueMetrics($this->channelManager);
+    $metrics = new QueueMetrics($this->channelManager, $this->registry, $this->config);
 
     expect($metrics->hasStatistics())->toBeTrue();
 });

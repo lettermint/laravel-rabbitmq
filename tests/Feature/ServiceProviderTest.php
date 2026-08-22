@@ -98,9 +98,9 @@ describe('RabbitMQServiceProvider', function () {
             expect(config('rabbitmq.dead_letter.enabled'))->toBeTrue();
         });
 
-        it('has delayed config', function () {
-            expect(config('rabbitmq.delayed'))->toBeArray();
-            expect(config('rabbitmq.delayed.enabled'))->toBeTrue();
+        it('has TTL delay config', function () {
+            expect(config('rabbitmq.retry'))->toBeArray();
+            expect(config('rabbitmq.retry.maximum_delay'))->toBe(86400);
         });
     });
 

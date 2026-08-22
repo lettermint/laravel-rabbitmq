@@ -6,304 +6,223 @@ use Lettermint\RabbitMQ\Attributes\ConsumesQueue;
 use Lettermint\RabbitMQ\Attributes\Exchange;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Discovery\AttributeScanner;
-use Lettermint\RabbitMQ\Enums\ExchangeType;
 use Lettermint\RabbitMQ\Topology\TopologyManager;
+use Lettermint\RabbitMQ\Topology\TopologyRegistry;
 use PhpAmqpLib\Wire\AMQPTable;
 
-beforeEach(function () {
-    $this->mockChannel = mockAMQPChannel();
-
-    $this->channelManager = Mockery::mock(ChannelManager::class);
-    $this->channelManager->shouldReceive('topologyChannel')
-        ->andReturn($this->mockChannel)
-        ->byDefault();
-
-    $this->scanner = Mockery::mock(AttributeScanner::class);
-    $this->scanner->shouldReceive('getTopology')
-        ->andReturn(['exchanges' => [], 'queues' => []])
-        ->byDefault();
-
-    $this->config = [
-        'delayed' => [
-            'enabled' => false,
-        ],
+/** @param array<string, mixed> $overrides */
+function topologyManagerConfig(array $overrides = []): array
+{
+    return array_replace_recursive([
+        'connection' => 'broker',
+        'physical_prefix' => 'staging.',
+        'strict_topology' => true,
         'dead_letter' => [
-            'default_ttl' => 604800000,
+            'enabled' => true,
+            'exchange' => 'dlx',
+            'queue_prefix' => 'dlq:',
         ],
-    ];
+        'topology' => [
+            'exchanges' => [
+                'jobs' => ['type' => 'topic'],
+                'dlx' => ['type' => 'direct'],
+            ],
+            'queues' => [
+                'default' => [
+                    'bindings' => ['jobs' => ['default']],
+                ],
+                'events' => [
+                    'bindings' => ['jobs' => ['events.*']],
+                    'single_active_consumer' => true,
+                    'delivery_limit' => 5,
+                ],
+            ],
+        ],
+    ], $overrides);
+}
+
+beforeEach(function () {
+    $this->channel = mockAMQPChannel();
+    $this->channelManager = Mockery::mock(ChannelManager::class);
+    $this->channelManager->shouldReceive('topologyChannel')->with('broker')->andReturn($this->channel)->byDefault();
+    $this->config = topologyManagerConfig();
+    $this->registry = testTopologyRegistry($this->config);
+    $this->manager = new TopologyManager($this->channelManager, $this->registry, $this->config);
 });
 
-test('performs dry run without making changes', function () {
-    $exchangeAttr = new Exchange(name: 'emails', type: ExchangeType::Topic);
-    $queueAttr = new ConsumesQueue(
-        queue: 'emails:outbound',
-        bindings: ['emails' => 'outbound.*']
-    );
-
-    $this->scanner->shouldReceive('getTopology')
-        ->andReturn([
-            'exchanges' => ['emails' => $exchangeAttr],
-            'queues' => ['emails:outbound' => ['attribute' => $queueAttr, 'class' => 'TestJob', 'allBindings' => $queueAttr->bindings]],
-        ]);
-
-    $manager = new TopologyManager(
-        $this->channelManager,
-        $this->scanner,
-        $this->config
-    );
-
-    // Channel should NOT be accessed in dry run
+test('reports the complete prefixed topology during a dry run', function () {
     $this->channelManager->shouldNotReceive('topologyChannel');
 
-    $result = $manager->declare(dryRun: true);
+    $result = $this->manager->declare(dryRun: true);
 
-    expect($result['exchanges'])->toContain('emails');
-    expect($result['exchanges'])->toContain('emails.dlq');
-    expect($result['queues'])->toContain('emails:outbound');
-    expect($result['bindings'])->not->toBeEmpty();
+    expect($result['exchanges'])->toBe(['staging.jobs', 'staging.dlx'])
+        ->and($result['queues'])->toBe([
+            'staging.default',
+            'staging.dlq:default',
+            'staging.events',
+            'staging.dlq:events',
+        ])
+        ->and($result['bindings'])->toContain('staging.jobs -> staging.default [default]')
+        ->and($result['bindings'])->toContain('staging.dlx -> staging.dlq:events [events]');
 });
 
-test('declares delayed exchange when enabled', function () {
-    $config = [
-        'delayed' => [
-            'enabled' => true,
-            'exchange' => 'custom-delayed',
-        ],
-    ];
+test('declares durable quorum queues and durable quorum dead-letter queues', function () {
+    $mainArguments = null;
+    $dlqArguments = null;
 
-    $this->scanner->shouldReceive('getTopology')
-        ->andReturn(['exchanges' => [], 'queues' => []]);
+    $this->channel->shouldReceive('queue_declare')
+        ->times(4)
+        ->withArgs(function (string $queue, bool $passive, bool $durable, bool $exclusive, bool $autoDelete, bool $nowait, AMQPTable $arguments) use (&$dlqArguments, &$mainArguments): bool {
+            if ($queue === 'staging.events') {
+                $mainArguments = $arguments->getNativeData();
+            }
 
-    $manager = new TopologyManager(
-        $this->channelManager,
-        $this->scanner,
-        $config
-    );
+            if ($queue === 'staging.dlq:events') {
+                $dlqArguments = $arguments->getNativeData();
+            }
 
-    $result = $manager->declare(dryRun: true);
+            return ! $passive && $durable && ! $exclusive && ! $autoDelete && ! $nowait;
+        });
 
-    expect($result['exchanges'])->toContain('custom-delayed (x-delayed-message)');
+    $this->manager->declare();
+
+    expect($mainArguments)->toMatchArray([
+        'x-queue-type' => 'quorum',
+        'x-overflow' => 'reject-publish',
+        'x-single-active-consumer' => true,
+        'x-delivery-limit' => 5,
+        'x-dead-letter-exchange' => 'staging.dlx',
+        'x-dead-letter-routing-key' => 'events',
+        'x-dead-letter-strategy' => 'at-least-once',
+    ])->not->toHaveKey('x-message-ttl')
+        ->and($dlqArguments)->toBe([
+            'x-queue-type' => 'quorum',
+            'x-overflow' => 'reject-publish',
+        ]);
 });
 
-test('skips delayed exchange when disabled', function () {
-    $manager = new TopologyManager(
-        $this->channelManager,
-        $this->scanner,
-        $this->config
-    );
+test('declares exchanges before queue bindings', function () {
+    $this->channel->shouldReceive('exchange_declare')
+        ->withArgs(fn (string $name): bool => $name === 'staging.jobs')
+        ->once()
+        ->ordered();
+    $this->channel->shouldReceive('queue_bind')
+        ->withArgs(fn (string $queue, string $exchange): bool => $queue === 'staging.default' && $exchange === 'staging.jobs')
+        ->once()
+        ->ordered();
 
-    $result = $manager->declare(dryRun: true);
-
-    $hasDelayed = collect($result['exchanges'])
-        ->contains(fn ($e) => str_contains($e, 'delayed'));
-
-    expect($hasDelayed)->toBeFalse();
+    $this->manager->declare();
 });
 
-test('includes exchange-to-exchange binding in result', function () {
-    $parentExchange = new Exchange(name: 'parent', type: ExchangeType::Topic);
-    $childExchange = new Exchange(
-        name: 'child',
-        type: ExchangeType::Topic,
-        bindTo: 'parent',
-        bindRoutingKey: 'child.#'
-    );
-
-    $this->scanner->shouldReceive('getTopology')
-        ->andReturn([
+test('declares exchange bindings after both exchanges exist', function () {
+    $config = topologyManagerConfig([
+        'topology' => [
             'exchanges' => [
-                'parent' => $parentExchange,
-                'child' => $childExchange,
+                'jobs' => ['type' => 'topic'],
+                'child' => [
+                    'type' => 'topic',
+                    'bind_to' => 'jobs',
+                    'bind_routing_key' => 'child.#',
+                ],
+                'dlx' => ['type' => 'direct'],
             ],
-            'queues' => [],
-        ]);
-
-    $manager = new TopologyManager(
-        $this->channelManager,
-        $this->scanner,
-        $this->config
-    );
-
-    $result = $manager->declare(dryRun: true);
-
-    expect($result['bindings'])->toContain('parent -> child [child.#]');
-});
-
-test('includes queue bindings in result', function () {
-    $queueAttr = new ConsumesQueue(
-        queue: 'notifications:push',
-        bindings: ['notifications' => ['push.high', 'push.low']]
-    );
-
-    $this->scanner->shouldReceive('getTopology')
-        ->andReturn([
-            'exchanges' => [],
-            'queues' => ['notifications:push' => ['attribute' => $queueAttr, 'class' => 'TestJob', 'allBindings' => $queueAttr->bindings]],
-        ]);
-
-    $manager = new TopologyManager(
-        $this->channelManager,
-        $this->scanner,
-        $this->config
-    );
-
-    $result = $manager->declare(dryRun: true);
-
-    expect($result['bindings'])->toContain('notifications -> notifications:push [push.high]');
-    expect($result['bindings'])->toContain('notifications -> notifications:push [push.low]');
-});
-
-test('auto-creates DLQ exchange', function () {
-    $exchangeAttr = new Exchange(name: 'emails', type: ExchangeType::Topic);
-
-    $this->scanner->shouldReceive('getTopology')
-        ->andReturn([
-            'exchanges' => ['emails' => $exchangeAttr],
-            'queues' => [],
-        ]);
-
-    $manager = new TopologyManager(
-        $this->channelManager,
-        $this->scanner,
-        $this->config
-    );
-
-    $result = $manager->declare(dryRun: true);
-
-    expect($result['exchanges'])->toContain('emails.dlq');
-});
-
-test('auto-creates DLQ queue', function () {
-    $queueAttr = new ConsumesQueue(
-        queue: 'emails:outbound',
-        bindings: ['emails' => 'outbound.*']
-    );
-
-    $this->scanner->shouldReceive('getTopology')
-        ->andReturn([
-            'exchanges' => [],
-            'queues' => ['emails:outbound' => ['attribute' => $queueAttr, 'class' => 'TestJob', 'allBindings' => $queueAttr->bindings]],
-        ]);
-
-    $manager = new TopologyManager(
-        $this->channelManager,
-        $this->scanner,
-        $this->config
-    );
-
-    $result = $manager->declare(dryRun: true);
-
-    expect($result['queues'])->toContain('dlq:emails:outbound');
-    expect($result['bindings'])->toContain('emails.dlq -> dlq:emails:outbound [emails.outbound]');
-});
-
-test('declares the DLX exchange for a queue whose DLX derives from its bindings', function () {
-    // No matching Exchange attribute, so the exchange loop does not create the
-    // DLX. declareDlqQueue must declare 'orders.dlq' itself, otherwise the
-    // queue's x-dead-letter-exchange (and x-delivery-limit parking) would target
-    // an undeclared exchange and messages would be dropped.
-    $queueAttr = new ConsumesQueue(
-        queue: 'orders:process',
-        bindings: ['orders' => 'process.*'],
-        quorum: true,
-        deliveryLimit: 3,
-    );
-
-    $this->scanner->shouldReceive('getTopology')->andReturn([
-        'exchanges' => [],
-        'queues' => ['orders:process' => ['attribute' => $queueAttr, 'class' => 'TestJob', 'allBindings' => $queueAttr->bindings]],
+        ],
     ]);
-
-    // The DLX exchange must be declared BEFORE the DLQ queue is declared and
-    // bound to it — ordered() guards that sequence, not just its presence.
-    $this->mockChannel->shouldReceive('exchange_declare')
-        ->withArgs(fn ($name, $type) => $name === 'orders.dlq' && $type === 'direct')
-        ->once()
-        ->ordered();
-
-    $this->mockChannel->shouldReceive('queue_declare')
-        ->withArgs(function ($name, $passive, $durable, $exclusive, $autoDelete, $nowait, $arguments): bool {
-            expect($arguments)->toBeInstanceOf(AMQPTable::class)
-                ->and($arguments->getNativeData())->not->toHaveKey('x-message-ttl');
-
-            return $name === 'dlq:orders:process';
-        })
-        ->once()
-        ->ordered()
-        ->andReturn(['dlq:orders:process', 0, 0]);
-
-    $this->mockChannel->shouldReceive('queue_bind')
-        ->withArgs(fn ($queue, $exchange) => $queue === 'dlq:orders:process' && $exchange === 'orders.dlq')
-        ->once()
-        ->ordered();
-
     $manager = new TopologyManager(
         $this->channelManager,
-        $this->scanner,
-        $this->config
+        testTopologyRegistry($config),
+        $config,
     );
 
-    $manager->declare(dryRun: false);
+    $this->channel->shouldReceive('exchange_bind')
+        ->once()
+        ->with('staging.child', 'staging.jobs', 'child.#');
 
-    // Expectations verified on teardown by Mockery.
-    expect(true)->toBeTrue();
+    $result = $manager->declare();
+
+    expect($result['bindings'])
+        ->toContain('staging.jobs -> staging.child [child.#]');
 });
 
-test('purges queue', function () {
-    // Mock channel to return purge count
-    $this->mockChannel->shouldReceive('queue_purge')
-        ->with('test-queue')
+test('purges and deletes the registered physical queue', function () {
+    $this->channel->shouldReceive('queue_purge')->once()->with('staging.default')->andReturn(42);
+    $this->channel->shouldReceive('queue_delete')->once()->with('staging.default');
+
+    expect($this->manager->purgeQueue('default'))->toBe(42);
+    $this->manager->deleteQueue('default');
+});
+
+test('gets queue information with a passive broker operation', function () {
+    $this->channel->shouldReceive('queue_declare')
         ->once()
-        ->andReturn(42);
+        ->with('staging.default', true, false, false, false)
+        ->andReturn(['staging.default', 9, 2]);
 
-    $manager = new TopologyManager(
-        $this->channelManager,
-        $this->scanner,
-        $this->config
-    );
-
-    $count = $manager->purgeQueue('test-queue');
-
-    expect($count)->toBe(42);
+    expect($this->manager->getQueueInfo('default'))->toBe([
+        'name' => 'staging.default',
+        'messages' => 9,
+        'consumers' => 2,
+    ]);
 });
 
-test('deletes queue', function () {
-    // Mock channel queue_delete
-    $this->mockChannel->shouldReceive('queue_delete')
-        ->with('test-queue')
-        ->once();
+test('audits each main queue and dead-letter queue passively', function () {
+    $this->channelManager->shouldReceive('channel')
+        ->andReturn($this->channel)
+        ->byDefault();
+    $this->channel->shouldReceive('queue_declare')
+        ->times(4)
+        ->withArgs(fn (string $queue, bool $passive): bool => str_starts_with($queue, 'staging.') && $passive)
+        ->andReturnUsing(fn (string $queue): array => [$queue, 0, str_contains($queue, 'dlq:') ? 0 : 1]);
 
-    $manager = new TopologyManager(
-        $this->channelManager,
-        $this->scanner,
-        $this->config
-    );
+    $result = $this->manager->audit();
 
-    $manager->deleteQueue('test-queue');
-
-    expect(true)->toBeTrue();
+    expect($result['healthy'])->toBeTrue()
+        ->and($result['queues'])->toHaveCount(4)
+        ->and($result['failures'])->toBe([]);
 });
 
-test('clears declared exchanges and queues tracking on reset', function () {
-    $manager = new TopologyManager(
-        $this->channelManager,
-        $this->scanner,
-        $this->config
-    );
+test('audits a dead-letter exchange that is derived from a discovered queue', function () {
+    $scanner = Mockery::mock(AttributeScanner::class);
+    $scanner->shouldReceive('getTopology')->andReturn([
+        'exchanges' => [
+            'jobs' => new Exchange('jobs', 'topic'),
+        ],
+        'queues' => [
+            'events' => [
+                'attribute' => new ConsumesQueue(
+                    queue: 'events',
+                    bindings: ['jobs' => ['events']],
+                ),
+                'allBindings' => ['jobs' => ['events']],
+            ],
+        ],
+    ]);
+    $config = [
+        'connection' => 'broker',
+        'physical_prefix' => 'staging.',
+        'strict_topology' => false,
+        'topology' => ['queues' => []],
+    ];
+    $registry = new TopologyRegistry($scanner, $config);
+    $manager = new TopologyManager($this->channelManager, $registry, $config);
 
-    // Use reflection to verify internal state
-    $reflection = new ReflectionClass($manager);
+    $this->channelManager->shouldReceive('channel')->andReturn($this->channel)->byDefault();
+    $this->channel->shouldReceive('exchange_declare')
+        ->once()
+        ->withArgs(fn (string $name, string $type, bool $passive): bool => $name === 'staging.jobs.dlq'
+            && $type === 'direct'
+            && $passive);
+    $this->channel->shouldReceive('queue_declare')
+        ->twice()
+        ->andReturnUsing(fn (string $queue): array => [$queue, 0, 0]);
 
-    $exchangesProp = $reflection->getProperty('declaredExchanges');
-    $exchangesProp->setAccessible(true);
-    $exchangesProp->setValue($manager, ['test-exchange' => true]);
+    expect($manager->audit()['healthy'])->toBeTrue();
+});
 
-    $queuesProp = $reflection->getProperty('declaredQueues');
-    $queuesProp->setAccessible(true);
-    $queuesProp->setValue($manager, ['test-queue' => true]);
+test('reset permits a second declaration on the same manager', function () {
+    $this->channel->shouldReceive('exchange_declare')->times(4);
 
-    $manager->reset();
-
-    expect($exchangesProp->getValue($manager))->toBeEmpty();
-    expect($queuesProp->getValue($manager))->toBeEmpty();
+    $this->manager->declare();
+    $this->manager->reset();
+    $this->manager->declare();
 });

@@ -54,6 +54,7 @@ class AMQPMocks
         $mock->shouldReceive('confirm_select')->andReturn(null)->byDefault();
         $mock->shouldReceive('set_ack_handler')->andReturn(null)->byDefault();
         $mock->shouldReceive('set_nack_handler')->andReturn(null)->byDefault();
+        $mock->shouldReceive('set_return_listener')->andReturn(null)->byDefault();
         $mock->shouldReceive('wait_for_pending_acks_returns')->andReturn(null)->byDefault();
 
         // Transactions
