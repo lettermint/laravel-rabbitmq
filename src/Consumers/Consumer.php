@@ -98,7 +98,6 @@ final class Consumer
         $this->resolveQueueConnection();
 
         $maximumRecoveries = max(0, (int) config('rabbitmq.recovery.max_attempts', 3));
-        $recoveryAttempt = 0;
 
         try {
             while (! $this->shouldQuit) {
@@ -109,7 +108,7 @@ final class Consumer
                 } catch (AMQPIOException|AMQPChannelClosedException|AMQPConnectionClosedException|AMQPProtocolChannelException|AMQPRuntimeException|ConnectionException|PublishException $exception) {
                     $this->cleanup();
 
-                    if ($this->shouldQuit || $recoveryAttempt >= $maximumRecoveries) {
+                    if ($this->shouldQuit || $maximumRecoveries === 0) {
                         ExceptionReporter::report($exception);
 
                         throw new ConnectionException(
@@ -118,8 +117,7 @@ final class Consumer
                         );
                     }
 
-                    $recoveryAttempt++;
-                    $this->channelManager->recoverConnection($this->brokerConnection, 1);
+                    $this->channelManager->recoverConnection($this->brokerConnection, $maximumRecoveries);
                 }
             }
         } finally {

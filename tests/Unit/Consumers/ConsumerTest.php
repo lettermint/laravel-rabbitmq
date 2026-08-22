@@ -155,7 +155,7 @@ test('closes the consume channel when QoS setup fails', function () {
 });
 
 test('recovers a connection and rebuilds the consume channel', function () {
-    config()->set('rabbitmq.recovery.max_attempts', 1);
+    config()->set('rabbitmq.recovery.max_attempts', 3);
 
     $workingChannel = mockAMQPChannel();
     $workingChannel->shouldReceive('wait')->andThrow(new AMQPTimeoutException('empty'));
@@ -168,7 +168,7 @@ test('recovers a connection and rebuilds the consume channel', function () {
         ->with('broker')
         ->once()
         ->andReturn($workingChannel);
-    $channelManager->shouldReceive('recoverConnection')->once()->with('broker', 1);
+    $channelManager->shouldReceive('recoverConnection')->once()->with('broker', 3);
     $channelManager->shouldReceive('closeChannel')->andReturnNull()->byDefault();
 
     $queue = testRabbitMQQueue($channelManager, ['connection' => 'broker']);
