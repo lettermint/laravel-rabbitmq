@@ -12,6 +12,14 @@ final class ThrowingJob implements ShouldQueue
 {
     use Queueable;
 
+    /**
+     * @return list<int>
+     */
+    public function backoff(): array
+    {
+        return [0, 1];
+    }
+
     public function handle(): void
     {
         throw new RuntimeException('Retry this test job.');
