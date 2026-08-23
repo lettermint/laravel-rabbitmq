@@ -240,6 +240,7 @@ final class RabbitMQDeadLetters extends Page implements Tables\Contracts\HasTabl
         return array_map(
             fn ($message): array => [
                 'key' => $message->id,
+                'logical_queue' => $this->queue,
                 'id' => $message->id,
                 'job_class' => $message->jobClass,
                 'attempts' => $message->attempts,

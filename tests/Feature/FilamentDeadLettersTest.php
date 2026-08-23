@@ -164,6 +164,7 @@ test('the dead-letter page loads full details only when a message is inspected',
 
     expect($records)->toHaveCount(1)
         ->and($records[0]['id'])->toBe('job-1')
+        ->and($records[0]['logical_queue'])->toBe('default')
         ->and($records[0])->not->toHaveKeys(['exception', 'payload']);
 
     $detailsMethod = new ReflectionMethod($page, 'messageDetails');
