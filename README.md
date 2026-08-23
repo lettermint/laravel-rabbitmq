@@ -256,7 +256,7 @@ return $panel->plugins([
 
 The page denies access unless the current user passes the `viewRabbitMQDeadLetters` Laravel Gate ability. Set `rabbitmq.filament.gate` if the application uses another ability name.
 
-The page can inspect, retry, forget, retry in bulk, and forget in bulk. It writes an operator audit log for changes. RabbitMQ remains the canonical dead-letter store. If Laravel has a failed-job provider, the page can read exception details from it and remove those optional details after a retry or forget action. The page does not require Redis or a new database migration. Dead-letter payloads can contain sensitive application data.
+The first page shows every registered dead-letter queue and its current RabbitMQ message count. Open a queue to inspect, retry, forget, retry in bulk, or forget in bulk. The Inspect action loads one message at a time and shows its exception and payload in separate scrollable fields. The page writes an operator audit log for changes. RabbitMQ remains the canonical dead-letter store. If Laravel has a failed-job provider, the page can read exception details from it and remove those optional details after a retry or forget action. The page does not require Redis or a new database migration. Dead-letter payloads can contain sensitive application data.
 
 ## Diagnostics and monitoring
 
