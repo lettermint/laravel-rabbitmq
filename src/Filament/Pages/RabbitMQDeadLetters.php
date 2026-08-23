@@ -129,7 +129,7 @@ final class RabbitMQDeadLetters extends Page implements Tables\Contracts\HasTabl
                     ->schema([
                         Section::make('Message')
                             ->schema([
-                                TextEntry::make('queue'),
+                                TextEntry::make('logical_queue')->label('Queue'),
                                 TextEntry::make('id')->label('Job ID')->copyable(),
                                 TextEntry::make('job_class')->label('Job')->copyable(),
                                 TextEntry::make('attempts'),
@@ -263,7 +263,7 @@ final class RabbitMQDeadLetters extends Page implements Tables\Contracts\HasTabl
         if ($message === null) {
             return [
                 ...$record,
-                'queue' => $this->queue,
+                'logical_queue' => $this->queue,
                 'failed_at' => $this->formatDateTime($record['failed_at'] ?? null),
                 'reason' => 'not found',
                 'exception' => 'The message is no longer in the dead-letter queue. It may have been retried or removed.',
@@ -278,7 +278,7 @@ final class RabbitMQDeadLetters extends Page implements Tables\Contracts\HasTabl
             : null;
 
         return [
-            'queue' => $this->queue,
+            'logical_queue' => $this->queue,
             'id' => $message->id,
             'job_class' => $message->jobClass,
             'attempts' => $message->attempts,

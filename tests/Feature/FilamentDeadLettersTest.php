@@ -170,7 +170,7 @@ test('the dead-letter page loads full details only when a message is inspected',
     $details = $detailsMethod->invoke($page, $records[0]);
 
     expect($details['id'])->toBe('job-1')
-        ->and($details['queue'])->toBe('default')
+        ->and($details['logical_queue'])->toBe('default')
         ->and($details['exception'])->toContain('Payload exception')
         ->and($details['payload'])->toContain('App\\\\Jobs\\\\ExampleJob');
 });
