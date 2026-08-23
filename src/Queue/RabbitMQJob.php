@@ -498,11 +498,23 @@ class RabbitMQJob extends Job implements JobContract
     /**
      * Get the number of seconds to wait before retrying.
      *
-     * @return int|int[]|null
+     * Laravel stores a job's backoff sequence as a comma-separated string in
+     * the queue payload. Keep this value in the format that Laravel's worker
+     * expects. Normalize array values from older or custom payloads.
      */
-    public function backoff(): int|array|null
+    public function backoff(): int|string|null
     {
-        return Arr::get($this->decoded(), 'backoff');
+        $payload = $this->decoded();
+        $backoff = Arr::get($payload, 'backoff') ?? Arr::get($payload, 'delay');
+
+        if (is_array($backoff)) {
+            return implode(',', array_map(
+                static fn (mixed $delay): int => (int) $delay,
+                $backoff,
+            ));
+        }
+
+        return is_int($backoff) || is_string($backoff) ? $backoff : null;
     }
 
     /**

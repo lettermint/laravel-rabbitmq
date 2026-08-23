@@ -521,7 +521,24 @@ test('returns timeout from payload', function () {
     expect($job->timeout())->toBe(120);
 });
 
-test('returns backoff from payload', function () {
+test('returns Laravel backoff from payload', function () {
+    $message = mockAMQPMessage([
+        'body' => json_encode(['backoff' => '60,120,300']),
+    ]);
+
+    $job = new RabbitMQJob(
+        $this->container,
+        $this->rabbitmq,
+        $this->mockChannel,
+        $message,
+        'rabbitmq',
+        'test-queue'
+    );
+
+    expect($job->backoff())->toBe('60,120,300');
+});
+
+test('normalizes an array backoff from a legacy payload', function () {
     $message = mockAMQPMessage([
         'body' => json_encode(['backoff' => [60, 120, 300]]),
     ]);
@@ -535,7 +552,24 @@ test('returns backoff from payload', function () {
         'test-queue'
     );
 
-    expect($job->backoff())->toBe([60, 120, 300]);
+    expect($job->backoff())->toBe('60,120,300');
+});
+
+test('uses the legacy delay when backoff is absent', function () {
+    $message = mockAMQPMessage([
+        'body' => json_encode(['delay' => 45]),
+    ]);
+
+    $job = new RabbitMQJob(
+        $this->container,
+        $this->rabbitmq,
+        $this->mockChannel,
+        $message,
+        'rabbitmq',
+        'test-queue'
+    );
+
+    expect($job->backoff())->toBe(45);
 });
 
 test('returns message', function () {
