@@ -27,8 +27,8 @@ Add a Laravel queue connection. The `driver` value must match `rabbitmq.driver_n
 ```php
 // config/queue.php
 'connections' => [
-    'rabbitmq-native' => [
-        'driver' => 'rabbitmq-native',
+    'rabbitmq' => [
+        'driver' => 'rabbitmq',
         'connection' => 'default',
         'queue' => 'default',
     ],
@@ -39,11 +39,9 @@ Set the driver name and the broker connection in the package configuration.
 
 ```php
 // config/rabbitmq.php
-'driver_name' => env('RABBITMQ_DRIVER_NAME', 'rabbitmq-native'),
+'driver_name' => env('RABBITMQ_DRIVER_NAME', 'rabbitmq'),
 'default' => env('RABBITMQ_CONNECTION', 'default'),
 ```
-
-This separate name lets an application run a new connection beside an older RabbitMQ driver.
 
 ## Broker connection
 
@@ -154,7 +152,7 @@ Strict mode accepts an explicit registry or a compiled attribute cache. In non-s
 Laravel queue APIs work with the driver:
 
 ```php
-ProcessEvent::dispatch($event)->onConnection('rabbitmq-native')->onQueue('events');
+ProcessEvent::dispatch($event)->onConnection('rabbitmq')->onQueue('events');
 ```
 
 Jobs without `onQueue()` use the configured default logical queue. Register that queue before you enable strict mode.
@@ -185,7 +183,7 @@ Start one consumer for one logical queue:
 
 ```bash
 php artisan rabbitmq:consume events \
-    --connection=rabbitmq-native \
+    --connection=rabbitmq \
     --prefetch=1 \
     --tries=3 \
     --timeout=60 \
@@ -265,8 +263,8 @@ Use the broker commands for deployment and runtime checks:
 ```bash
 php artisan rabbitmq:health --json
 php artisan rabbitmq:audit --strict --json
-php artisan rabbitmq:probe --all --connection=rabbitmq-native --json
-php artisan rabbitmq:test-event default --connection=rabbitmq-native --roundtrip --json
+php artisan rabbitmq:probe --all --connection=rabbitmq --json
+php artisan rabbitmq:test-event default --connection=rabbitmq --roundtrip --json
 php artisan rabbitmq:queues --include-dlq
 ```
 

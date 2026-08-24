@@ -75,7 +75,7 @@ beforeEach(function () {
     $this->registry = testTopologyRegistry($this->config);
     $this->queue = testRabbitMQQueue($this->channelManager, $this->config, $this->registry);
     $this->queue->setContainer(new Container);
-    $this->queue->setConnectionName('rabbitmq-native');
+    $this->queue->setConnectionName('rabbitmq');
 });
 
 test('requires publisher confirmations and mandatory routing', function (array $publisher) {

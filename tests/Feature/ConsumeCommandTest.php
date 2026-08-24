@@ -31,7 +31,7 @@ function commandConsumer(array $expectedQueues): Consumer
         'strict_topology' => false,
     ]);
     $queueManager = Mockery::mock(QueueManager::class);
-    $queueManager->shouldReceive('connection')->with('rabbitmq-native')->andReturn($queue);
+    $queueManager->shouldReceive('connection')->with('rabbitmq')->andReturn($queue);
     $events = Mockery::mock(Dispatcher::class);
     $events->shouldReceive('dispatch')->andReturnNull()->byDefault();
     $exceptions = Mockery::mock(ExceptionHandler::class);
@@ -46,7 +46,7 @@ it('forwards multiple queue arguments to the consumer', function () {
 
     $this->artisan('rabbitmq:consume', [
         'queue' => ['default', 'reporting'],
-        '--connection' => 'rabbitmq-native',
+        '--connection' => 'rabbitmq',
         '--stop-when-empty' => true,
     ])->assertExitCode(0);
 });
@@ -56,7 +56,7 @@ it('accepts a single queue argument', function () {
 
     $this->artisan('rabbitmq:consume', [
         'queue' => ['default'],
-        '--connection' => 'rabbitmq-native',
+        '--connection' => 'rabbitmq',
         '--stop-when-empty' => true,
     ])->assertExitCode(0);
 });

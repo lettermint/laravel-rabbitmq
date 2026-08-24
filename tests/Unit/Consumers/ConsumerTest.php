@@ -37,7 +37,7 @@ function makeConsumerForTest(): array
     ]);
 
     $queueManager = Mockery::mock(QueueManager::class);
-    $queueManager->shouldReceive('connection')->with('rabbitmq-native')->andReturn($queue)->byDefault();
+    $queueManager->shouldReceive('connection')->with('rabbitmq')->andReturn($queue)->byDefault();
 
     $events = Mockery::mock(Dispatcher::class);
     $events->shouldReceive('dispatch')->andReturnNull()->byDefault();
@@ -101,7 +101,7 @@ test('registers one broker consumer for each logical queue', function () {
         ->withArgs(fn (string $queue): bool => $queue === 'queue-b')
         ->andReturn('tag-b');
 
-    $consumer->setConnection('rabbitmq-native')
+    $consumer->setConnection('rabbitmq')
         ->setQueues(['queue-a', 'queue-b'])
         ->setPrefetch(2)
         ->setStopWhenEmpty(true)
@@ -120,7 +120,7 @@ test('uses the configured physical queue names', function () {
         'strict_topology' => false,
     ]);
     $queueManager = Mockery::mock(QueueManager::class);
-    $queueManager->shouldReceive('connection')->with('rabbitmq-native')->andReturn($queue);
+    $queueManager->shouldReceive('connection')->with('rabbitmq')->andReturn($queue);
     $worker = app(RabbitMQWorker::class);
     $consumer = new Consumer($channelManager, $queueManager, $worker);
 
@@ -129,7 +129,7 @@ test('uses the configured physical queue names', function () {
         ->withArgs(fn (string $queue): bool => $queue === 'staging.default')
         ->andReturn('tag');
 
-    $consumer->setConnection('rabbitmq-native')->setQueue('default')->setStopWhenEmpty(true)->consume();
+    $consumer->setConnection('rabbitmq')->setQueue('default')->setStopWhenEmpty(true)->consume();
 });
 
 test('cancels all registered consumers during shutdown', function () {
@@ -139,7 +139,7 @@ test('cancels all registered consumers during shutdown', function () {
     $channel->shouldReceive('basic_cancel')->once()->with('tag-a');
     $channel->shouldReceive('basic_cancel')->once()->with('tag-b');
 
-    $consumer->setConnection('rabbitmq-native')
+    $consumer->setConnection('rabbitmq')
         ->setQueues(['queue-a', 'queue-b'])
         ->setStopWhenEmpty(true)
         ->consume();
@@ -150,7 +150,7 @@ test('closes the consume channel when QoS setup fails', function () {
     $channel->shouldReceive('basic_qos')->once()->andThrow(new AMQPIOException('qos failed'));
     $channelManager->shouldReceive('closeChannel')->with('consume', 'broker')->atLeast()->once();
 
-    expect(fn () => $consumer->setConnection('rabbitmq-native')->consume())
+    expect(fn () => $consumer->setConnection('rabbitmq')->consume())
         ->toThrow(ConnectionException::class, 'qos failed');
 });
 
@@ -173,7 +173,7 @@ test('recovers a connection and rebuilds the consume channel', function () {
 
     $queue = testRabbitMQQueue($channelManager, ['connection' => 'broker']);
     $queueManager = Mockery::mock(QueueManager::class);
-    $queueManager->shouldReceive('connection')->with('rabbitmq-native')->andReturn($queue);
+    $queueManager->shouldReceive('connection')->with('rabbitmq')->andReturn($queue);
     $events = Mockery::mock(Dispatcher::class);
     $events->shouldReceive('dispatch')->andReturnNull()->byDefault();
     $exceptions = Mockery::mock(ExceptionHandler::class);
@@ -181,7 +181,7 @@ test('recovers a connection and rebuilds the consume channel', function () {
     $worker = new RabbitMQWorker($queueManager, $events, $exceptions, fn (): bool => false, fn (): null => null);
 
     (new Consumer($channelManager, $queueManager, $worker))
-        ->setConnection('rabbitmq-native')
+        ->setConnection('rabbitmq')
         ->setStopWhenEmpty(true)
         ->consume();
 });
@@ -240,6 +240,6 @@ test('does not hide a failed replacement publish', function () {
         }
     };
 
-    expect(fn () => $worker->processMessage($job, 'rabbitmq-native', new WorkerOptions(maxTries: 0)))
+    expect(fn () => $worker->processMessage($job, 'rabbitmq', new WorkerOptions(maxTries: 0)))
         ->toThrow(PublishException::class, 'replacement publish failed');
 });
