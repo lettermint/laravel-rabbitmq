@@ -98,7 +98,8 @@ jobs:
       - name: Install dependencies
         run: composer update --prefer-dist --no-interaction
       - name: Confirm that Filament is absent
-        run: php -r 'require "vendor/autoload.php"; exit(class_exists("Filament\\Panel") ? 1 : 0);'
+        run: |
+          php -r 'require "vendor/autoload.php"; exit(class_exists("Filament\\Panel") ? 1 : 0);'
       - name: Test core processing and DLQ actions
         env:
           QUEUE_FAILED_DRIVER: 'null'
