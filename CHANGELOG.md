@@ -4,6 +4,16 @@ This file records notable changes. The project uses [Semantic Versioning](https:
 
 ## Unreleased
 
+- Separate broker settlement from Laravel job flags. Stop or recover after settlement failure.
+- Confirm retries before acknowledgement and keep retries within the originating queue.
+- Retain malformed deliveries and keep optional failure-history errors visible.
+- Use durable quorum TTL queues for delays. Keep existing classic delay queues until they drain. Refuse unsafe quorum queue cleanup.
+- Verify effective DLQ retention policies before inspection. Bound scans and replay results. Report incomplete and uncertain outcomes in the CLI and Filament page.
+- Preserve Laravel retries, deadlines, middleware, unique locks, chains, batches, restart, and maintenance behavior.
+- Add local worker status, timeout and settlement events, shared operator audit events, and current-run probe completion.
+- Stop heartbeat helpers after forced worker termination. Bound connection I/O defaults and recovery.
+- Require a pinned three-broker test fixture for broker failure tests. See the README for upgrade requirements.
+
 ## 1.1.0 - 2026-08-22
 
 ### Added

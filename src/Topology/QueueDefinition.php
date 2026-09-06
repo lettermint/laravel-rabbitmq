@@ -104,6 +104,7 @@ final readonly class QueueDefinition
         return [
             'x-queue-type' => 'quorum',
             'x-overflow' => 'reject-publish',
+            'x-delivery-limit' => -1,
         ];
     }
 }

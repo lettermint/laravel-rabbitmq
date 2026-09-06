@@ -13,7 +13,14 @@ test('a monitoring failure does not replace the reported exception', function ()
         ->andThrow(new RuntimeException('monitoring failure'));
     app()->instance(ExceptionHandler::class, $handler);
 
-    ExceptionReporter::report(new RuntimeException('broker failure'));
-
-    expect(true)->toBeTrue();
+    $path = tempnam(sys_get_temp_dir(), 'rabbitmq-report-');
+    $previous = ini_set('error_log', $path);
+    try {
+        ExceptionReporter::report(new RuntimeException('broker failure'));
+        expect(file_get_contents($path))->toContain('RabbitMQ exception reporting failed: RuntimeException; original exception: RuntimeException')
+            ->not->toContain('broker failure');
+    } finally {
+        ini_set('error_log', $previous);
+        unlink($path);
+    }
 });

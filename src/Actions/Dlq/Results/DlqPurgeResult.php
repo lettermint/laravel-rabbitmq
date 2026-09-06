@@ -18,10 +18,13 @@ final readonly class DlqPurgeResult
         public bool $wasDryRun,
         public ?string $notFoundId = null,
         public array $purgedMessages = [],
+        public bool $incomplete = false,
+        public ?string $error = null,
+        public bool $uncertain = false,
     ) {}
 
     public function wasMessageNotFound(): bool
     {
-        return $this->notFoundId !== null;
+        return $this->notFoundId !== null && ! $this->incomplete;
     }
 }

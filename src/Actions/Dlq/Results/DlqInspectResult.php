@@ -16,6 +16,7 @@ final readonly class DlqInspectResult
         public array $messages,
         public int $totalFound,
         public ?string $notFoundId = null,
+        public bool $incomplete = false,
     ) {}
 
     public function isEmpty(): bool
@@ -25,6 +26,6 @@ final readonly class DlqInspectResult
 
     public function wasMessageNotFound(): bool
     {
-        return $this->notFoundId !== null;
+        return $this->notFoundId !== null && ! $this->incomplete;
     }
 }

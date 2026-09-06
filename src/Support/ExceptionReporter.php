@@ -12,8 +12,8 @@ final class ExceptionReporter
     {
         try {
             report($exception);
-        } catch (Throwable) {
-            // Monitoring must not replace a broker or queue operation result.
+        } catch (Throwable $reportingException) {
+            error_log('RabbitMQ exception reporting failed: '.$reportingException::class.'; original exception: '.$exception::class);
         }
     }
 }

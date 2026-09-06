@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Lettermint\RabbitMQ\Console\Commands;
 
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Log;
 use Lettermint\RabbitMQ\Exceptions\TopologyException;
 use Lettermint\RabbitMQ\Support\ExceptionReporter;
 use Lettermint\RabbitMQ\Topology\TopologyManager;
@@ -19,7 +20,17 @@ final class AuditCommand extends Command
 
     public function handle(TopologyManager $topology): int
     {
-        $result = $topology->audit();
+        $result = $topology->audit((bool) $this->option('strict'));
+        try {
+            Log::info('RabbitMQ topology audit finished', [
+                'event' => 'rabbitmq.topology.audit_finished',
+                'healthy' => $result['healthy'],
+                'queue_count' => count($result['queues']),
+                'failure_count' => count($result['failures']),
+            ]);
+        } catch (\Throwable $exception) {
+            ExceptionReporter::report($exception);
+        }
 
         if ($this->option('json')) {
             $this->line((string) json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));

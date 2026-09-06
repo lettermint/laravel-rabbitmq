@@ -15,6 +15,7 @@ use Lettermint\RabbitMQ\Console\Commands\AuditCommand;
 use Lettermint\RabbitMQ\Console\Commands\CacheTopologyCommand;
 use Lettermint\RabbitMQ\Console\Commands\ConsumeCommand;
 use Lettermint\RabbitMQ\Console\Commands\DeclareCommand;
+use Lettermint\RabbitMQ\Console\Commands\DelayCleanupCommand;
 use Lettermint\RabbitMQ\Console\Commands\DlqInspectCommand;
 use Lettermint\RabbitMQ\Console\Commands\DlqPurgeCommand;
 use Lettermint\RabbitMQ\Console\Commands\HealthCommand;
@@ -24,6 +25,7 @@ use Lettermint\RabbitMQ\Console\Commands\QueuesCommand;
 use Lettermint\RabbitMQ\Console\Commands\ReplayDlqCommand;
 use Lettermint\RabbitMQ\Console\Commands\TestEventCommand;
 use Lettermint\RabbitMQ\Console\Commands\TopologyCommand;
+use Lettermint\RabbitMQ\Console\Commands\WorkerStatusCommand;
 use Lettermint\RabbitMQ\Consumers\Consumer;
 use Lettermint\RabbitMQ\Consumers\RabbitMQWorker;
 use Lettermint\RabbitMQ\Discovery\AttributeScanner;
@@ -251,6 +253,8 @@ class RabbitMQServiceProvider extends ServiceProvider
         if ($this->app->runningInConsole()) {
             $this->commands([
                 ConsumeCommand::class,
+                DelayCleanupCommand::class,
+                WorkerStatusCommand::class,
                 AuditCommand::class,
                 CacheTopologyCommand::class,
                 DeclareCommand::class,

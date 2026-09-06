@@ -16,7 +16,7 @@ enum ExchangeType: string
      *
      * Supports wildcards: * (one word), # (zero or more words).
      * Use for: Multi-tenant routing, category-based routing.
-     * Example: 'email.outbound.*' matches 'email.outbound.transactional'.
+     * Example: 'notifications.*' matches 'notifications.standard'.
      */
     case Topic = 'topic';
 

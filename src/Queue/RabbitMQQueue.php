@@ -156,7 +156,9 @@ final class RabbitMQQueue extends Queue implements QueueContract
     {
         $logicalQueue = $this->getQueue($queue);
         $definition = $this->registry->queue($logicalQueue);
-        [$exchange, $routingKey] = $this->route($definition, (string) $payload);
+        [$exchange, $routingKey] = ($options['queue_only'] ?? false) === true
+            ? ['', $definition->physicalName]
+            : $this->route($definition, (string) $payload);
         $delay = max(0, (int) ($options['delay'] ?? 0));
 
         if ($delay > 0) {
@@ -278,11 +280,11 @@ final class RabbitMQQueue extends Queue implements QueueContract
 
         $delayMilliseconds = max(1, $delaySeconds * 1000);
         $delayQueue = $this->delayQueueName($definition, $exchange, $routingKey, $delayMilliseconds);
-        $cleanupGrace = max(60000, (int) ($this->config['retry']['delay_queue_cleanup_grace'] ?? 86400000));
         $arguments = new AMQPTable([
-            'x-queue-type' => 'classic',
+            'x-queue-type' => 'quorum',
+            'x-overflow' => 'reject-publish',
+            'x-dead-letter-strategy' => 'at-least-once',
             'x-message-ttl' => $delayMilliseconds,
-            'x-expires' => $delayMilliseconds + $cleanupGrace,
             'x-dead-letter-exchange' => $exchange,
             'x-dead-letter-routing-key' => $routingKey,
         ]);
@@ -334,6 +336,7 @@ final class RabbitMQQueue extends Queue implements QueueContract
         $startedAt = microtime(true);
         $returned = null;
         $nacked = false;
+        $publishStarted = false;
 
         try {
             $channel = $this->channelManager->publishChannel($this->brokerConnection);
@@ -347,6 +350,7 @@ final class RabbitMQQueue extends Queue implements QueueContract
                 $nacked = true;
             });
 
+            $publishStarted = true;
             $channel->basic_publish($message, $exchange, $routingKey, $this->mandatory);
             $channel->wait_for_pending_acks_returns($this->confirmTimeout);
 
@@ -387,18 +391,13 @@ final class RabbitMQQueue extends Queue implements QueueContract
                     exchange: $exchange,
                     routingKey: $routingKey,
                     previous: $exception,
+                    uncertain: $publishStarted,
                 ),
             );
         } catch (PublishException $exception) {
             $this->failPublish($definition, $exchange, $routingKey, $messageId, $exception);
         } catch (AMQPIOException|AMQPConnectionClosedException|AMQPChannelClosedException|AMQPProtocolChannelException|AMQPRuntimeException|ConnectionException $exception) {
             $this->channelManager->closeChannel('publish', $this->brokerConnection);
-
-            try {
-                $this->channelManager->recoverConnection($this->brokerConnection);
-            } catch (Throwable $recoveryException) {
-                ExceptionReporter::report($recoveryException);
-            }
 
             $this->failPublish(
                 definition: $definition,
@@ -410,6 +409,7 @@ final class RabbitMQQueue extends Queue implements QueueContract
                     exchange: $exchange,
                     routingKey: $routingKey,
                     previous: $exception,
+                    uncertain: $publishStarted,
                 ),
             );
         }
@@ -486,7 +486,7 @@ final class RabbitMQQueue extends Queue implements QueueContract
     ): string {
         $suffix = substr(hash('sha256', $exchange."\0".$routingKey), 0, 12);
         $name = $this->registry->physicalName(
-            'delay:'.$definition->logicalName.':'.$delayMilliseconds.':'.$suffix
+            'delay-v2:'.$definition->logicalName.':'.$delayMilliseconds.':'.$suffix
         );
 
         if (strlen($name) <= 255) {
@@ -494,7 +494,7 @@ final class RabbitMQQueue extends Queue implements QueueContract
         }
 
         $shortName = $this->registry->physicalName(
-            'delay:'.substr(hash('sha256', $definition->logicalName), 0, 20).':'.$delayMilliseconds.':'.$suffix
+            'delay-v2:'.substr(hash('sha256', $definition->logicalName), 0, 20).':'.$delayMilliseconds.':'.$suffix
         );
 
         if (strlen($shortName) > 255) {

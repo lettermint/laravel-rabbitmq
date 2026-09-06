@@ -19,17 +19,14 @@ use Filament\Support\Enums\Width;
 use Filament\Tables;
 use Filament\Tables\Columns\TextColumn;
 use Filament\Tables\Table;
-use Illuminate\Queue\Failed\FailedJobProviderInterface;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Gate;
-use Illuminate\Support\Facades\Log;
 use Lettermint\RabbitMQ\Actions\Dlq\InspectDlqMessages;
 use Lettermint\RabbitMQ\Actions\Dlq\PurgeDlqMessages;
 use Lettermint\RabbitMQ\Actions\Dlq\ReplayDlqMessages;
 use Lettermint\RabbitMQ\Monitoring\QueueMetrics;
-use Lettermint\RabbitMQ\Support\ExceptionReporter;
+use Lettermint\RabbitMQ\Support\FailedJobDetails;
 use Lettermint\RabbitMQ\Topology\TopologyRegistry;
-use Throwable;
 
 final class RabbitMQDeadLetters extends Page implements Tables\Contracts\HasTable
 {
@@ -238,8 +235,8 @@ final class RabbitMQDeadLetters extends Page implements Tables\Contracts\HasTabl
         $result = app(InspectDlqMessages::class)($this->queue, limit: 100);
 
         return array_map(
-            fn ($message): array => [
-                'key' => $message->id,
+            fn ($message, int $index): array => [
+                'key' => $message->id.':'.$index,
                 'logical_queue' => $this->queue,
                 'id' => $message->id,
                 'job_class' => $message->jobClass,
@@ -248,6 +245,7 @@ final class RabbitMQDeadLetters extends Page implements Tables\Contracts\HasTabl
                 'reason' => $message->reason,
             ],
             $result->messages,
+            array_keys($result->messages),
         );
     }
 
@@ -257,6 +255,7 @@ final class RabbitMQDeadLetters extends Page implements Tables\Contracts\HasTabl
      */
     protected function messageDetails(array $record): array
     {
+        abort_unless(self::canAccess(), 403);
         $id = (string) $record['id'];
         $result = app(InspectDlqMessages::class)($this->queue, messageId: $id);
         $message = $result->messages[0] ?? null;
@@ -266,14 +265,14 @@ final class RabbitMQDeadLetters extends Page implements Tables\Contracts\HasTabl
                 ...$record,
                 'logical_queue' => $this->queue,
                 'failed_at' => $this->formatDateTime($record['failed_at'] ?? null),
-                'reason' => 'not found',
-                'exception' => 'The message is no longer in the dead-letter queue. It may have been retried or removed.',
+                'reason' => $result->incomplete ? 'incomplete search' : 'not found',
+                'exception' => $result->incomplete ? 'The scan limit was reached. Use the CLI with a larger scan limit.' : 'The message is no longer in the dead-letter queue. It may have been retried or removed.',
                 'payload' => 'The payload is no longer available.',
             ];
         }
 
         $provider = app()->bound('queue.failer') ? app('queue.failer') : null;
-        $failed = $this->findFailureDetails($provider, $message->id);
+        $failed = app(FailedJobDetails::class)->find($message->id);
         $failedException = is_object($failed) && isset($failed->exception)
             ? (string) $failed->exception
             : null;
@@ -342,87 +341,57 @@ final class RabbitMQDeadLetters extends Page implements Tables\Contracts\HasTabl
         return is_string($encoded) ? $encoded : $fallback;
     }
 
-    protected function retry(string $id): void
+    protected function retry(string $id): bool
     {
+        abort_unless(self::canAccess(), 403);
         $result = app(ReplayDlqMessages::class)($this->queue, messageId: $id);
 
         if ($result->replayedCount !== 1) {
-            Notification::make()->danger()->title('The job was not retried')->send();
+            Notification::make()->danger()->title('The job was not retried')
+                ->body($result->uncertain ? 'The transfer is uncertain. Check the destination before another replay.' : ($result->failures[0]['error'] ?? ($result->incomplete ? 'The search is incomplete.' : 'The message was not found.')))->send();
 
-            return;
+            return false;
         }
 
-        $this->forgetFailureDetails($id);
-        $this->auditOperator('retry', $id);
         $this->resetTable();
         Notification::make()->success()->title('The job was sent to its queue')->send();
+
+        return true;
     }
 
-    protected function forget(string $id): void
+    protected function forget(string $id): bool
     {
+        abort_unless(self::canAccess(), 403);
         $result = app(PurgeDlqMessages::class)($this->queue, messageId: $id);
 
         if ($result->purgedCount !== 1) {
-            Notification::make()->danger()->title('The job was not removed')->send();
+            Notification::make()->danger()->title('The job was not removed')
+                ->body($result->uncertain ? 'The acknowledgement is uncertain. Refresh the queue before another action.' : ($result->error ?? ($result->incomplete ? 'The search is incomplete.' : 'The message was not found.')))->send();
 
-            return;
+            return false;
         }
 
-        $this->forgetFailureDetails($id);
-        $this->auditOperator('forget', $id);
         $this->resetTable();
         Notification::make()->success()->title('The job was removed')->send();
+
+        return true;
     }
 
     protected function retryMany(Collection $records): void
     {
         foreach ($records as $record) {
-            $this->retry((string) $record['id']);
+            if (! $this->retry((string) $record['id'])) {
+                break;
+            }
         }
     }
 
     protected function forgetMany(Collection $records): void
     {
         foreach ($records as $record) {
-            $this->forget((string) $record['id']);
-        }
-    }
-
-    protected function forgetFailureDetails(string $id): void
-    {
-        $provider = app()->bound('queue.failer') ? app('queue.failer') : null;
-
-        if (! $provider instanceof FailedJobProviderInterface) {
-            return;
-        }
-
-        try {
-            $provider->forget($id);
-        } catch (Throwable $exception) {
-            ExceptionReporter::report($exception);
-            Log::warning('RabbitMQ DLQ action could not remove optional failed-job details', [
-                'job_id' => $id,
-                'exception_class' => $exception::class,
-            ]);
-        }
-    }
-
-    protected function findFailureDetails(mixed $provider, string $id): mixed
-    {
-        if (! $provider instanceof FailedJobProviderInterface) {
-            return null;
-        }
-
-        try {
-            return $provider->find($id);
-        } catch (Throwable $exception) {
-            ExceptionReporter::report($exception);
-            Log::warning('RabbitMQ DLQ page could not read optional failed-job details', [
-                'job_id' => $id,
-                'exception_class' => $exception::class,
-            ]);
-
-            return null;
+            if (! $this->forget((string) $record['id'])) {
+                break;
+            }
         }
     }
 
@@ -430,15 +399,5 @@ final class RabbitMQDeadLetters extends Page implements Tables\Contracts\HasTabl
     protected function deadLetterQueues(): array
     {
         return app(TopologyRegistry::class)->deadLetterQueueNames();
-    }
-
-    protected function auditOperator(string $action, string $jobId): void
-    {
-        Log::notice('RabbitMQ DLQ operator action', [
-            'action' => $action,
-            'queue' => $this->queue,
-            'job_id' => $jobId,
-            'operator_id' => auth()->user()?->getAuthIdentifier(),
-        ]);
     }
 }

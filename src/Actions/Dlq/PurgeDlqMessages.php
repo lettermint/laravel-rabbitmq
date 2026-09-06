@@ -10,18 +10,20 @@ use Lettermint\RabbitMQ\Actions\Dlq\Results\DlqPurgeResult;
 use Lettermint\RabbitMQ\Actions\Dlq\Results\DlqQueueConfig;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Exceptions\DlqOperationException;
+use Lettermint\RabbitMQ\Monitoring\ManagementClient;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
+use Lettermint\RabbitMQ\Support\DlqOperationAudit;
+use Lettermint\RabbitMQ\Support\FailedJobDetails;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Message\AMQPMessage;
 use PhpAmqpLib\Wire\AMQPTable;
+use Throwable;
 
 /**
  * Purge messages from a DLQ (permanently delete).
  */
 final class PurgeDlqMessages
 {
-    private const MAX_MESSAGES = 100000;
-
     public function __construct(
         private ChannelManager $channelManager,
         private ResolveDlqQueue $resolveDlqQueue,
@@ -40,17 +42,28 @@ final class PurgeDlqMessages
         ?Carbon $olderThan = null,
         bool $dryRun = false,
     ): DlqPurgeResult {
+        return DlqOperationAudit::run('purge', $queueName, $messageId, $dryRun, fn () => $this->execute($queueName, $messageId, $olderThan, $dryRun));
+    }
+
+    private function execute(string $queueName, ?string $messageId, ?Carbon $olderThan, bool $dryRun): DlqPurgeResult
+    {
         $config = ($this->resolveDlqQueue)($queueName);
-        $channel = $this->channelManager->channel(
-            'dlq-purge',
-            $this->rabbitmq->getBrokerConnectionName(),
-        );
+        app(ManagementClient::class)->assertSafeDeadLetterQueue($config->dlqQueueName, $this->rabbitmq->getBrokerConnectionName());
 
-        if ($messageId !== null) {
-            return $this->purgeById($channel, $config, $messageId, $dryRun);
+        try {
+            $channel = $this->channelManager->channel(
+                'dlq-purge',
+                $this->rabbitmq->getBrokerConnectionName(),
+            );
+
+            if ($messageId !== null) {
+                return $this->purgeById($channel, $config, $messageId, $dryRun);
+            }
+
+            return $this->purgeBulk($channel, $config, $olderThan, $dryRun);
+        } finally {
+            $this->channelManager->closeChannel('dlq-purge', $this->rabbitmq->getBrokerConnectionName());
         }
-
-        return $this->purgeBulk($channel, $config, $olderThan, $dryRun);
     }
 
     private function purgeById(
@@ -76,6 +89,7 @@ final class PurgeDlqMessages
                 skippedCount: 0,
                 wasDryRun: $dryRun,
                 notFoundId: $messageId,
+                incomplete: $result['incomplete'],
             );
         }
 
@@ -84,7 +98,12 @@ final class PurgeDlqMessages
         if ($dryRun) {
             $channel->basic_reject($result['target']->getDeliveryTag(), true);
         } else {
-            $channel->basic_ack($result['target']->getDeliveryTag());
+            try {
+                $channel->basic_ack($result['target']->getDeliveryTag());
+            } catch (Throwable $exception) {
+                return new DlqPurgeResult(0, 0, false, incomplete: true, error: $exception->getMessage(), uncertain: true);
+            }
+            app(FailedJobDetails::class)->forget($messageData->id);
         }
 
         return new DlqPurgeResult(
@@ -103,7 +122,11 @@ final class PurgeDlqMessages
     ): DlqPurgeResult {
         // Fetch all messages first
         $fetchedMessages = [];
-        while (count($fetchedMessages) < self::MAX_MESSAGES) {
+        $bytes = 0;
+        $maxMessages = max(1, (int) config('rabbitmq.dlq.max_scan_messages', 1000));
+        $maxBytes = max(1, (int) config('rabbitmq.dlq.max_scan_bytes', 16777216));
+        $deadline = microtime(true) + (int) config('rabbitmq.dlq.max_runtime_seconds', 30);
+        while (count($fetchedMessages) < $maxMessages && $bytes < $maxBytes && microtime(true) < $deadline) {
             $message = $channel->basic_get($config->dlqQueueName, false);
 
             if ($message === null) {
@@ -111,47 +134,51 @@ final class PurgeDlqMessages
             }
 
             $fetchedMessages[] = $message;
-        }
-
-        // Categorize messages into purge vs skip
-        $toPurge = [];
-        $toSkip = [];
-
-        foreach ($fetchedMessages as $message) {
-            if ($olderThan !== null) {
-                $messageTime = $this->getMessageTime($message);
-
-                if ($messageTime === null || $messageTime->isAfter($olderThan)) {
-                    $toSkip[] = $message;
-
-                    continue;
-                }
-            }
-
-            $toPurge[] = $message;
-        }
-
-        // Process messages
-        foreach ($toSkip as $message) {
-            $channel->basic_reject($message->getDeliveryTag(), true);
+            $bytes += strlen($message->getBody());
         }
 
         $purgedMessages = [];
-        foreach ($toPurge as $message) {
-            $purgedMessages[] = DlqMessageData::fromAmqpMessage($message);
+        $purged = 0;
+        $skipped = 0;
+        $error = null;
+        $uncertain = false;
+        foreach ($fetchedMessages as $message) {
+            try {
+                $messageTime = $olderThan === null ? null : $this->getMessageTime($message);
+                if ($olderThan !== null && ($messageTime === null || $messageTime->isAfter($olderThan))) {
+                    $channel->basic_reject($message->getDeliveryTag(), true);
+                    $skipped++;
 
-            if ($dryRun) {
-                $channel->basic_reject($message->getDeliveryTag(), true);
-            } else {
-                $channel->basic_ack($message->getDeliveryTag());
+                    continue;
+                }
+
+                $data = DlqMessageData::fromAmqpMessage($message);
+                if ($dryRun) {
+                    $channel->basic_reject($message->getDeliveryTag(), true);
+                } else {
+                    $uncertain = true;
+                    $channel->basic_ack($message->getDeliveryTag());
+                    $uncertain = false;
+                    app(FailedJobDetails::class)->forget($data->id);
+                }
+                $purged++;
+                if (count($purgedMessages) < (int) config('rabbitmq.dlq.max_result_messages', 100)) {
+                    $purgedMessages[] = $data;
+                }
+            } catch (Throwable $exception) {
+                $error = $exception->getMessage();
+                break;
             }
         }
 
         return new DlqPurgeResult(
-            purgedCount: count($toPurge),
-            skippedCount: count($toSkip),
+            purgedCount: $purged,
+            skippedCount: $skipped,
             wasDryRun: $dryRun,
             purgedMessages: $purgedMessages,
+            incomplete: $error !== null || count($fetchedMessages) >= $maxMessages || $bytes >= $maxBytes || microtime(true) >= $deadline,
+            error: $error,
+            uncertain: $uncertain,
         );
     }
 

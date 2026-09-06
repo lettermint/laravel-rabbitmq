@@ -42,9 +42,10 @@ final readonly class DlqMessageData
         $xDeath = $headers['x-death'][0] ?? null;
         $xDeath = $xDeath instanceof AMQPTable ? $xDeath->getNativeData() : $xDeath;
 
-        $attempts = (int) ($headers[RabbitMQJob::ATTEMPT_HEADER] ?? $payload['attempts'] ?? 1);
+        $attemptValue = $headers[RabbitMQJob::ATTEMPT_HEADER] ?? $payload['attempts'] ?? 1;
+        $attempts = is_numeric($attemptValue) ? max(1, (int) $attemptValue) : 1;
         $failedAt = self::extractFailedAt(is_array($xDeath) ? $xDeath : null);
-        $reason = is_array($xDeath) ? (string) ($xDeath['reason'] ?? 'unknown') : 'unknown';
+        $reason = is_array($xDeath) && is_string($xDeath['reason'] ?? null) ? $xDeath['reason'] : 'unknown';
 
         $exception = null;
         if (isset($payload['exception']) && is_array($payload['exception'])) {
@@ -54,7 +55,7 @@ final readonly class DlqMessageData
         $id = $payload['uuid'] ?? $payload['id'] ?? null;
         $id = is_string($id) || is_numeric($id)
             ? (string) $id
-            : ($message->has('message_id') ? (string) $message->get('message_id') : 'unknown');
+            : ($message->has('message_id') ? (string) $message->get('message_id') : 'body:'.hash('sha256', $message->getBody()));
         $jobClass = $payload['displayName'] ?? $payload['job'] ?? 'Unknown';
         $jobClass = is_string($jobClass) ? $jobClass : 'Unknown';
 
@@ -80,11 +81,15 @@ final readonly class DlqMessageData
         }
 
         $timestamp = $xDeath['time'];
-        if (is_object($timestamp) && method_exists($timestamp, 'getTimestamp')) {
-            return Carbon::createFromTimestamp($timestamp->getTimestamp());
-        }
-        if (is_numeric($timestamp)) {
-            return Carbon::createFromTimestamp($timestamp);
+        try {
+            if (is_object($timestamp) && method_exists($timestamp, 'getTimestamp')) {
+                return Carbon::createFromTimestamp($timestamp->getTimestamp());
+            }
+            if (is_numeric($timestamp)) {
+                return Carbon::createFromTimestamp($timestamp);
+            }
+        } catch (\Throwable) {
+            return null;
         }
 
         return null;

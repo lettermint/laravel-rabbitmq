@@ -10,6 +10,9 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
 use Lettermint\RabbitMQ\Events\QueueProbeProcessed;
+use Lettermint\RabbitMQ\Queue\RabbitMQJob;
+use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
+use PhpAmqpLib\Message\AMQPMessage;
 
 final class QueueProbeJob implements ShouldQueue
 {
@@ -25,6 +28,7 @@ final class QueueProbeJob implements ShouldQueue
         public readonly string $probeId,
         public readonly string $logicalQueue,
         public readonly int $dispatchedAt,
+        public readonly ?string $replyQueue = null,
     ) {}
 
     public function handle(): void
@@ -46,5 +50,18 @@ final class QueueProbeJob implements ShouldQueue
             dispatchedAt: $this->dispatchedAt,
             processedAt: $processedAt,
         ));
+
+        if ($this->job instanceof RabbitMQJob && ($this->replyQueue ?? null) !== null) {
+            $connection = app('queue')->connection($this->job->getConnectionName());
+
+            if ($connection instanceof RabbitMQQueue) {
+                $channel = $connection->getChannelManager()->publishChannel($connection->getBrokerConnectionName());
+                $channel->basic_publish(new AMQPMessage(json_encode([
+                    'probe_id' => $this->probeId,
+                    'queue' => $this->logicalQueue,
+                ], JSON_THROW_ON_ERROR)), '', $this->replyQueue);
+                $channel->wait_for_pending_acks_returns(5);
+            }
+        }
     }
 }

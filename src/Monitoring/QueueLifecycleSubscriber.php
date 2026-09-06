@@ -9,15 +9,19 @@ use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
+use Illuminate\Queue\Events\JobTimedOut;
 use Illuminate\Support\Facades\Log;
 use Lettermint\RabbitMQ\Events\ConnectionRecovered;
 use Lettermint\RabbitMQ\Events\DlqMessageReplayed;
+use Lettermint\RabbitMQ\Events\DlqOperationFinished;
 use Lettermint\RabbitMQ\Events\JobDeadLettered;
 use Lettermint\RabbitMQ\Events\JobReleased;
 use Lettermint\RabbitMQ\Events\JobRetried;
+use Lettermint\RabbitMQ\Events\JobSettlementFailed;
 use Lettermint\RabbitMQ\Events\MessagePublished;
 use Lettermint\RabbitMQ\Events\MessagePublishFailed;
 use Lettermint\RabbitMQ\Events\UnknownQueueFallbackUsed;
+use Lettermint\RabbitMQ\Exceptions\PublishException;
 use Lettermint\RabbitMQ\Queue\RabbitMQJob;
 
 final class QueueLifecycleSubscriber
@@ -31,10 +35,28 @@ final class QueueLifecycleSubscriber
         $events->listen(JobProcessed::class, $this->processed(...));
         $events->listen(JobExceptionOccurred::class, $this->exceptionOccurred(...));
         $events->listen(JobFailed::class, $this->failed(...));
+        $events->listen(JobTimedOut::class, function (JobTimedOut $event): void {
+            if ($event->job instanceof RabbitMQJob) {
+                Log::error('RabbitMQ job timed out', $this->jobContext($event->job, 'timed_out'));
+                unset($this->startedAt[$this->key($event->job)]);
+            }
+        });
         $events->listen(JobReleased::class, $this->released(...));
         $events->listen(JobRetried::class, $this->retried(...));
+        $events->listen(JobSettlementFailed::class, function (JobSettlementFailed $event): void {
+            unset($this->startedAt[$event->jobId]);
+            Log::error('RabbitMQ delivery settlement failed', [
+                'event' => 'rabbitmq.job.settlement_error',
+                'queue' => $event->queue,
+                'job_id' => $event->jobId,
+                'exception_class' => $event->exception::class,
+            ]);
+        });
         $events->listen(JobDeadLettered::class, $this->deadLettered(...));
         $events->listen(DlqMessageReplayed::class, $this->replayed(...));
+        $events->listen(DlqOperationFinished::class, function (DlqOperationFinished $event): void {
+            Log::notice('RabbitMQ DLQ operator action', $event->context);
+        });
         $events->listen(MessagePublished::class, $this->published(...));
         $events->listen(MessagePublishFailed::class, $this->publishFailed(...));
         $events->listen(ConnectionRecovered::class, $this->connectionRecovered(...));
@@ -59,7 +81,9 @@ final class QueueLifecycleSubscriber
             return;
         }
 
-        Log::info('RabbitMQ job processed', $this->jobContext($event->job, 'processed'));
+        if (! $event->job->isReleased() && ! $event->job->hasFailed()) {
+            Log::info('RabbitMQ job processed', $this->jobContext($event->job, 'processed'));
+        }
         unset($this->startedAt[$this->key($event->job)]);
     }
 
@@ -176,7 +200,7 @@ final class QueueLifecycleSubscriber
             'physical_queue' => $event->physicalQueue,
             'exchange' => $event->exchange,
             'message_id' => $event->messageId,
-            'result' => 'failed',
+            'result' => $event->exception instanceof PublishException && $event->exception->uncertain ? 'uncertain' : 'failed',
             'exception_class' => $event->exception::class,
         ]);
     }
@@ -216,7 +240,7 @@ final class QueueLifecycleSubscriber
             'attempt' => $job->attempts(),
             'result' => $result,
             'processing_ms' => $startedAt === null ? null : round((microtime(true) - $startedAt) * 1000, 2),
-            'queue_wait_ms' => $timestamp > 0 ? max(0, (time() - $timestamp) * 1000) : null,
+            'queue_wait_ms' => $timestamp > 0 && $startedAt !== null ? max(0, (int) (($startedAt - $timestamp) * 1000)) : null,
             'redelivered' => $job->getMessage()->isRedelivered(),
             'broker_delivery_count' => $job->brokerDeliveryCount(),
         ];

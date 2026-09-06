@@ -34,6 +34,7 @@ function commandConsumer(array $expectedQueues): Consumer
     $queueManager->shouldReceive('connection')->with('rabbitmq')->andReturn($queue);
     $events = Mockery::mock(Dispatcher::class);
     $events->shouldReceive('dispatch')->andReturnNull()->byDefault();
+    $events->shouldReceive('until')->andReturnNull()->byDefault();
     $exceptions = Mockery::mock(ExceptionHandler::class);
     $exceptions->shouldReceive('report')->andReturnNull()->byDefault();
     $worker = new RabbitMQWorker($queueManager, $events, $exceptions, fn (): bool => false, fn (): null => null);

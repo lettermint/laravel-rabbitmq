@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace Lettermint\RabbitMQ\Consumers;
 
-use Illuminate\Queue\Events\Looping;
 use Illuminate\Queue\Events\WorkerStopping;
 use Illuminate\Queue\QueueManager;
 use Illuminate\Queue\WorkerOptions;
@@ -12,13 +11,14 @@ use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Log;
 use InvalidArgumentException;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
+use Lettermint\RabbitMQ\Connection\HeartbeatSender;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
 use Lettermint\RabbitMQ\Exceptions\PublishException;
+use Lettermint\RabbitMQ\Monitoring\WorkerStatus;
 use Lettermint\RabbitMQ\Queue\RabbitMQJob;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
 use Lettermint\RabbitMQ\Support\ExceptionReporter;
 use PhpAmqpLib\Channel\AMQPChannel;
-use PhpAmqpLib\Connection\Heartbeat\SIGHeartbeatSender;
 use PhpAmqpLib\Exception\AMQPChannelClosedException;
 use PhpAmqpLib\Exception\AMQPConnectionClosedException;
 use PhpAmqpLib\Exception\AMQPIOException;
@@ -74,7 +74,7 @@ final class Consumer
 
     protected ?string $brokerConnection = null;
 
-    protected ?SIGHeartbeatSender $heartbeatSender = null;
+    protected ?HeartbeatSender $heartbeatSender = null;
 
     protected bool $heartbeatStopListenerRegistered = false;
 
@@ -96,20 +96,48 @@ final class Consumer
         $this->registerSignalHandlers();
         $this->registerHeartbeatStopListener();
         $this->resolveQueueConnection();
+        $this->worker->startSession();
+        app(WorkerStatus::class)->write('starting', false);
 
         $maximumRecoveries = max(0, (int) config('rabbitmq.recovery.max_attempts', 3));
+        $recoveries = 0;
+        $needsRecovery = false;
 
         try {
             while (! $this->shouldQuit) {
                 try {
-                    $this->consumeSession();
+                    if ($this->shouldStop()) {
+                        return;
+                    }
+                    if (! $this->worker->mayRun($this->workerOptions(), $this->connection, $this->queueLabel())) {
+                        app(WorkerStatus::class)->write('paused', false);
+                        $this->sleep($this->sleep);
 
-                    return;
+                        continue;
+                    }
+                    if ($needsRecovery) {
+                        $this->channelManager->recoverConnection($this->brokerConnection, 1);
+                        $needsRecovery = false;
+                    }
+                    if ($this->consumeSession()) {
+                        return;
+                    }
                 } catch (AMQPIOException|AMQPChannelClosedException|AMQPConnectionClosedException|AMQPProtocolChannelException|AMQPRuntimeException|ConnectionException|PublishException $exception) {
                     $this->cleanup();
 
-                    if ($this->shouldQuit || $maximumRecoveries === 0) {
+                    if ($this->shouldQuit) {
+                        return;
+                    }
+
+                    if ($recoveries >= $maximumRecoveries) {
                         ExceptionReporter::report($exception);
+                        Log::error('RabbitMQ consumer recovery exhausted', [
+                            'event' => 'rabbitmq.consumer.recovery_failed',
+                            'connection' => $this->connection,
+                            'queues' => $this->queues,
+                            'recoveries' => $recoveries,
+                            'exception_class' => $exception::class,
+                        ]);
 
                         throw new ConnectionException(
                             "RabbitMQ consumer recovery failed for [{$this->queueLabel()}]: {$exception->getMessage()}",
@@ -117,15 +145,22 @@ final class Consumer
                         );
                     }
 
-                    $this->channelManager->recoverConnection($this->brokerConnection, $maximumRecoveries);
+                    $recoveries++;
+                    $needsRecovery = true;
+                    app(WorkerStatus::class)->write('recovering', false);
+                    usleep(min(
+                        (int) config('rabbitmq.recovery.max_delay_ms', 2000),
+                        (int) config('rabbitmq.recovery.initial_delay_ms', 100) * (2 ** min($recoveries - 1, 10)),
+                    ) * 1000);
                 }
             }
         } finally {
             $this->cleanup();
+            app(WorkerStatus::class)->write('stopping', false);
         }
     }
 
-    protected function consumeSession(): void
+    protected function consumeSession(): bool
     {
         $this->channel = $this->channelManager->consumeChannel($this->brokerConnection);
         $this->startHeartbeatSender();
@@ -154,17 +189,17 @@ final class Consumer
         ]);
 
         while ($this->channel->is_consuming() && ! $this->shouldQuit) {
+            app(WorkerStatus::class)->write('idle', true);
             if ($this->shouldStop()) {
                 break;
             }
 
-            if (app()->isDownForMaintenance() && ! $this->force) {
-                $this->sleep($this->sleep);
+            if (! $this->worker->mayRun($this->workerOptions(), $this->connection, $this->queueLabel())) {
+                $this->cleanup();
+                app(WorkerStatus::class)->write('paused', false);
 
-                continue;
+                return false;
             }
-
-            event(new Looping($this->connection, $this->queueLabel()));
 
             try {
                 $this->channel->wait(null, false, $this->waitTimeout);
@@ -174,10 +209,16 @@ final class Consumer
                 }
             }
         }
+
+        return true;
     }
 
     protected function handleMessage(AMQPMessage $message, string $queue): void
     {
+        if ($this->shouldQuit || $this->worker->paused || $this->shouldStop() || (app()->isDownForMaintenance() && ! $this->force)) {
+            return;
+        }
+
         $job = new RabbitMQJob(
             container: app(),
             rabbitmq: $this->rabbitmq(),
@@ -187,7 +228,15 @@ final class Consumer
             queueName: $queue,
         );
 
+        try {
+            $timeout = $job->timeout() ?? $this->jobTimeout;
+        } catch (Throwable) {
+            $timeout = $this->jobTimeout;
+        }
+
+        app(WorkerStatus::class)->write('processing', true, $timeout > 0 ? time() + $timeout : null);
         $this->worker->processMessage($job, $this->connection, $this->workerOptions());
+        app(WorkerStatus::class)->write('idle', true);
         $this->jobsProcessed++;
 
         if ($this->rest > 0) {
@@ -263,6 +312,10 @@ final class Consumer
 
     protected function shouldStop(): bool
     {
+        if ($this->worker->restartRequested()) {
+            return true;
+        }
+
         if ($this->maxJobs > 0 && $this->jobsProcessed >= $this->maxJobs) {
             return true;
         }
@@ -294,6 +347,13 @@ final class Consumer
                 $this->shouldQuit = true;
             });
         }
+
+        pcntl_signal(SIGUSR2, function (): void {
+            $this->worker->paused = true;
+        });
+        pcntl_signal(SIGCONT, function (): void {
+            $this->worker->paused = false;
+        });
     }
 
     protected function registerHeartbeatStopListener(): void
@@ -329,13 +389,13 @@ final class Consumer
             return;
         }
 
-        $this->heartbeatSender = new SIGHeartbeatSender($connection);
+        $this->heartbeatSender = new HeartbeatSender($connection);
         $this->heartbeatSender->register();
     }
 
     protected function stopHeartbeatSender(): void
     {
-        if (! $this->heartbeatSender instanceof SIGHeartbeatSender) {
+        if (! $this->heartbeatSender instanceof HeartbeatSender) {
             return;
         }
 

@@ -12,6 +12,7 @@ use Lettermint\RabbitMQ\Actions\Dlq\ResolveDlqQueue;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Filament\Pages\RabbitMQDeadLetters;
 use Lettermint\RabbitMQ\Filament\RabbitMQPlugin;
+use Lettermint\RabbitMQ\Monitoring\ManagementClient;
 use Lettermint\RabbitMQ\Monitoring\QueueMetrics;
 use Lettermint\RabbitMQ\Topology\TopologyRegistry;
 
@@ -39,7 +40,7 @@ test('the dead-letter page permits a user authorized by the application gate', f
 
 test('the dead-letter page shows broker message counts and puts queues with failures first', function () {
     $config = [
-        'physical_prefix' => 'lm.test.',
+        'physical_prefix' => 'test.',
         'queue' => ['default' => 'default'],
         'connection' => 'broker',
         'strict_topology' => true,
@@ -84,9 +85,9 @@ test('the dead-letter page shows broker message counts and puts queues with fail
         'error' => 'Queue not found',
     ];
     $metrics = Mockery::mock(QueueMetrics::class);
-    $metrics->shouldReceive('getPhysicalQueueStats')->once()->with('lm.test.dlq:default')->andReturn($available(0));
-    $metrics->shouldReceive('getPhysicalQueueStats')->once()->with('lm.test.dlq:busy')->andReturn($available(7));
-    $metrics->shouldReceive('getPhysicalQueueStats')->once()->with('lm.test.dlq:missing')->andReturn($unavailable);
+    $metrics->shouldReceive('getPhysicalQueueStats')->once()->with('test.dlq:default')->andReturn($available(0));
+    $metrics->shouldReceive('getPhysicalQueueStats')->once()->with('test.dlq:busy')->andReturn($available(7));
+    $metrics->shouldReceive('getPhysicalQueueStats')->once()->with('test.dlq:missing')->andReturn($unavailable);
     app()->instance(QueueMetrics::class, $metrics);
 
     $page = new RabbitMQDeadLetters;
@@ -127,6 +128,11 @@ test('the dead-letter page loads full details only when a message is inspected',
             ],
         ],
     ];
+    $management = Mockery::mock(ManagementClient::class);
+    $management->shouldReceive('assertSafeDeadLetterQueue')->andReturnNull();
+    app()->instance(ManagementClient::class, $management);
+    Gate::define('viewRabbitMQDeadLetters', fn () => true);
+    Auth::setUser(new GenericUser(['id' => 1]));
     $channel = mockAMQPChannel();
     $message = mockAMQPMessage([
         'body' => (string) json_encode([
@@ -142,6 +148,7 @@ test('the dead-letter page loads full details only when a message is inspected',
         ->andReturn($message, null, $message);
     $channel->shouldReceive('basic_reject')->twice()->with($message->getDeliveryTag(), true);
     $channels = Mockery::mock(ChannelManager::class);
+    $channels->shouldReceive('closeChannel')->andReturnNull()->byDefault();
     $channels->shouldReceive('channel')->twice()->with('dlq-inspect', 'broker')->andReturn($channel);
     $registry = testTopologyRegistry($config);
     $queue = testRabbitMQQueue($channels, $config, $registry);

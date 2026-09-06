@@ -9,6 +9,8 @@ use Lettermint\RabbitMQ\Attributes\Exchange;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Enums\TopologyEntityType;
 use Lettermint\RabbitMQ\Exceptions\TopologyException;
+use Lettermint\RabbitMQ\Monitoring\BrokerTopologyAudit;
+use Lettermint\RabbitMQ\Monitoring\ManagementClient;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Exception\AMQPChannelClosedException;
 use PhpAmqpLib\Exception\AMQPConnectionClosedException;
@@ -113,7 +115,7 @@ final class TopologyManager
      *
      * @return array{healthy: bool, queues: list<array{logical: string, physical: string, messages: int, consumers: int}>, failures: list<array{entity: string, name: string, error: string}>}
      */
-    public function audit(): array
+    public function audit(bool $strict = false): array
     {
         $queues = [];
         $failures = [];
@@ -181,6 +183,10 @@ final class TopologyManager
                     $this->channelManager->closeChannel($purpose, $this->brokerConnection());
                 }
             }
+        }
+
+        if ($strict || app(ManagementClient::class)->configured()) {
+            $failures = array_merge($failures, app(BrokerTopologyAudit::class)->check($this->registry, $this->brokerConnection()));
         }
 
         return ['healthy' => $failures === [], 'queues' => $queues, 'failures' => $failures];
@@ -296,6 +302,18 @@ final class TopologyManager
             return;
         }
 
+        $arguments = $definition->deadLetterQueueArguments();
+        $management = app(ManagementClient::class);
+
+        if ($management->configured()) {
+            $existing = $management->queue($definition->deadLetterQueue, $this->brokerConnection());
+
+            if ($existing !== null) {
+                $management->assertSafeDeadLetterQueue($definition->deadLetterQueue, $this->brokerConnection());
+                $arguments = $existing['arguments'];
+            }
+        }
+
         try {
             $channel->queue_declare(
                 $definition->deadLetterQueue,
@@ -304,7 +322,7 @@ final class TopologyManager
                 false,
                 false,
                 false,
-                new AMQPTable($definition->deadLetterQueueArguments()),
+                new AMQPTable($arguments),
             );
             $channel->queue_bind(
                 $definition->deadLetterQueue,

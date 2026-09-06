@@ -11,8 +11,11 @@ use Lettermint\RabbitMQ\Actions\Dlq\Results\DlqReplayResult;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Events\DlqMessageReplayed;
 use Lettermint\RabbitMQ\Exceptions\DlqOperationException;
+use Lettermint\RabbitMQ\Exceptions\PublishException;
+use Lettermint\RabbitMQ\Monitoring\ManagementClient;
 use Lettermint\RabbitMQ\Queue\RabbitMQJob;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
+use Lettermint\RabbitMQ\Support\DlqOperationAudit;
 use Lettermint\RabbitMQ\Support\ExceptionReporter;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Message\AMQPMessage;
@@ -24,7 +27,7 @@ use Throwable;
  */
 final class ReplayDlqMessages
 {
-    private const MAX_DRY_RUN_FETCH = 100000;
+    private const MAX_DRY_RUN_FETCH = 1000;
 
     public function __construct(
         private ChannelManager $channelManager,
@@ -50,13 +53,25 @@ final class ReplayDlqMessages
         bool $dryRun = false,
         ?callable $onProgress = null,
     ): DlqReplayResult {
+        return DlqOperationAudit::run('replay', $queueName, $messageId, $dryRun, fn () => $this->execute($queueName, $messageId, $limit, $rate, $batchSize, $dryRun, $onProgress));
+    }
+
+    /** @param callable(DlqMessageData, bool, ?string): void|null $onProgress */
+    private function execute(string $queueName, ?string $messageId, int $limit, int $rate, int $batchSize, bool $dryRun, ?callable $onProgress): DlqReplayResult
+    {
         $config = ($this->resolveDlqQueue)($queueName);
+        app(ManagementClient::class)->assertSafeDeadLetterQueue($config->dlqQueueName, $this->rabbitmq->getBrokerConnectionName());
 
-        if ($messageId !== null) {
-            return $this->replayById($config, $messageId, $dryRun);
+        try {
+
+            if ($messageId !== null) {
+                return $this->replayById($config, $messageId, $dryRun);
+            }
+
+            return $this->replayBulk($config, $limit, $rate, $batchSize, $dryRun, $onProgress);
+        } finally {
+            $this->channelManager->closeChannel('dlq-replay', $this->rabbitmq->getBrokerConnectionName());
         }
-
-        return $this->replayBulk($config, $limit, $rate, $batchSize, $dryRun, $onProgress);
     }
 
     /**
@@ -85,6 +100,8 @@ final class ReplayDlqMessages
                 "Failed to read DLQ [{$config->dlqQueueName}]: {$e->getMessage()}",
                 $e,
             );
+        } finally {
+            $this->channelManager->closeChannel('dlq-count', $this->rabbitmq->getBrokerConnectionName());
         }
     }
 
@@ -115,6 +132,7 @@ final class ReplayDlqMessages
                 failedCount: 0,
                 wasDryRun: $dryRun,
                 notFoundId: $messageId,
+                incomplete: $result['incomplete'],
             );
         }
 
@@ -122,12 +140,14 @@ final class ReplayDlqMessages
 
         if ($dryRun) {
             $channel->basic_reject($result['target']->getDeliveryTag(), true);
+            $error = $this->replayError($messageData);
 
             return new DlqReplayResult(
-                replayedCount: 1,
-                failedCount: 0,
+                replayedCount: $error === null ? 1 : 0,
+                failedCount: $error === null ? 0 : 1,
                 wasDryRun: true,
-                replayedMessages: [$messageData],
+                replayedMessages: $error === null ? [$messageData] : [],
+                failures: $error === null ? [] : [['message' => $messageData, 'error' => $error]],
             );
         }
 
@@ -152,6 +172,7 @@ final class ReplayDlqMessages
                 failedCount: 1,
                 wasDryRun: false,
                 failures: [['message' => $messageData, 'error' => $e->getMessage()]],
+                uncertain: $e instanceof PublishException && $e->uncertain,
             );
         }
     }
@@ -187,7 +208,14 @@ final class ReplayDlqMessages
         $delayMicroseconds = $rate > 0 ? (int) (1_000_000 / $rate) : 0;
 
         $processed = 0;
-        while (true) {
+        [, $ready] = $channel->queue_declare($config->dlqQueueName, true);
+        $maximum = min((int) $ready, max(1, (int) config('rabbitmq.dlq.max_scan_messages', 1000)));
+        $maximum = $limit > 0 ? min($maximum, $limit) : $maximum;
+        $deadline = microtime(true) + max(1, (int) config('rabbitmq.dlq.max_runtime_seconds', 30));
+        $uncertain = false;
+        $resultBytes = 0;
+
+        while ($processed < $maximum && microtime(true) < $deadline) {
             if ($limit > 0 && $processed >= $limit) {
                 break;
             }
@@ -205,17 +233,30 @@ final class ReplayDlqMessages
                 $this->replayMessage($channel, $config, $message, $messageData);
 
                 $replayed++;
-                $replayedMessages[] = $messageData;
+                if (count($replayedMessages) < (int) config('rabbitmq.dlq.max_result_messages', 100)
+                    && $resultBytes < (int) config('rabbitmq.dlq.max_scan_bytes', 16777216)) {
+                    $replayedMessages[] = $messageData;
+                    $resultBytes += strlen($messageData->rawBody);
+                }
 
                 if ($onProgress !== null) {
-                    $onProgress($messageData, true, null);
+                    try {
+                        $onProgress($messageData, true, null);
+                    } catch (Throwable $exception) {
+                        ExceptionReporter::report($exception);
+                    }
                 }
             } catch (Throwable $e) {
                 $failed++;
+                $uncertain = $e instanceof PublishException && $e->uncertain;
                 $failures[] = ['message' => $messageData, 'error' => $e->getMessage()];
 
                 if ($onProgress !== null) {
-                    $onProgress($messageData, false, $e->getMessage());
+                    try {
+                        $onProgress($messageData, false, $e->getMessage());
+                    } catch (Throwable $exception) {
+                        ExceptionReporter::report($exception);
+                    }
                 }
 
                 try {
@@ -248,6 +289,8 @@ final class ReplayDlqMessages
             wasDryRun: false,
             replayedMessages: $replayedMessages,
             failures: $failures,
+            incomplete: $processed < (int) $ready && ($limit === 0 || $processed < $limit),
+            uncertain: $uncertain,
         );
     }
 
@@ -257,9 +300,11 @@ final class ReplayDlqMessages
         int $limit,
     ): DlqReplayResult {
         $fetchedMessages = [];
-        $maxFetch = $limit > 0 ? $limit : self::MAX_DRY_RUN_FETCH;
+        $maxFetch = min($limit > 0 ? $limit : self::MAX_DRY_RUN_FETCH, (int) config('rabbitmq.dlq.max_result_messages', 100));
+        $bytes = 0;
+        $deadline = microtime(true) + (int) config('rabbitmq.dlq.max_runtime_seconds', 30);
 
-        while (count($fetchedMessages) < $maxFetch) {
+        while (count($fetchedMessages) < $maxFetch && $bytes < (int) config('rabbitmq.dlq.max_scan_bytes', 16777216) && microtime(true) < $deadline) {
             $message = $channel->basic_get($config->dlqQueueName, false);
 
             if ($message === null) {
@@ -267,12 +312,20 @@ final class ReplayDlqMessages
             }
 
             $fetchedMessages[] = $message;
+            $bytes += strlen($message->getBody());
         }
 
-        $replayedMessages = array_map(
-            fn ($m) => DlqMessageData::fromAmqpMessage($m),
-            $fetchedMessages,
-        );
+        $replayedMessages = [];
+        $failures = [];
+        foreach ($fetchedMessages as $message) {
+            $data = DlqMessageData::fromAmqpMessage($message);
+            $error = $this->replayError($data);
+            if ($error === null) {
+                $replayedMessages[] = $data;
+            } else {
+                $failures[] = ['message' => $data, 'error' => $error];
+            }
+        }
 
         // Requeue all messages
         foreach ($fetchedMessages as $message) {
@@ -280,10 +333,12 @@ final class ReplayDlqMessages
         }
 
         return new DlqReplayResult(
-            replayedCount: count($fetchedMessages),
-            failedCount: 0,
+            replayedCount: count($replayedMessages),
+            failedCount: count($failures),
             wasDryRun: true,
             replayedMessages: $replayedMessages,
+            failures: $failures,
+            incomplete: count($fetchedMessages) >= $maxFetch || $bytes >= (int) config('rabbitmq.dlq.max_scan_bytes', 16777216) || microtime(true) >= $deadline,
         );
     }
 
@@ -293,6 +348,10 @@ final class ReplayDlqMessages
         AMQPMessage $message,
         DlqMessageData $messageData,
     ): void {
+        if (($error = $this->replayError($messageData)) !== null) {
+            throw new DlqOperationException($error);
+        }
+
         $properties = $message->get_properties();
         $headers = $properties['application_headers'] ?? null;
         $headers = $headers instanceof AMQPTable ? $headers->getNativeData() : [];
@@ -312,9 +371,13 @@ final class ReplayDlqMessages
         $this->rabbitmq->pushRaw(
             $message->getBody(),
             $config->originalQueueName,
-            ['properties' => $properties],
+            ['properties' => $properties, 'queue_only' => true],
         );
-        $channel->basic_ack($message->getDeliveryTag());
+        try {
+            $channel->basic_ack($message->getDeliveryTag());
+        } catch (Throwable $exception) {
+            throw new PublishException('The replay was published, but its DLQ acknowledgement is uncertain.', previous: $exception, uncertain: true);
+        }
 
         try {
             $this->events->dispatch(new DlqMessageReplayed(
@@ -326,5 +389,14 @@ final class ReplayDlqMessages
         } catch (Throwable $exception) {
             ExceptionReporter::report($exception);
         }
+    }
+
+    private function replayError(DlqMessageData $message): ?string
+    {
+        $retryUntil = $message->payload['retryUntil'] ?? null;
+
+        return is_numeric($retryUntil) && (int) $retryUntil <= time()
+            ? 'The job retry deadline has expired. The message remains in the DLQ.'
+            : null;
     }
 }
