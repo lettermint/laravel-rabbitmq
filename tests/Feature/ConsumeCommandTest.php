@@ -49,6 +49,7 @@ it('forwards multiple queue arguments to the consumer', function () {
         'queue' => ['default', 'reporting'],
         '--connection' => 'rabbitmq',
         '--stop-when-empty' => true,
+        '--max-memory' => 1024,
     ])->assertExitCode(0);
 });
 
@@ -59,5 +60,6 @@ it('accepts a single queue argument', function () {
         'queue' => ['default'],
         '--connection' => 'rabbitmq',
         '--stop-when-empty' => true,
+        '--max-memory' => 1024,
     ])->assertExitCode(0);
 });
