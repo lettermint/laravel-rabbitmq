@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - '**.php'
+      - 'tests/Integration/**'
       - '.github/workflows/run-integration-tests.yml'
       - 'phpunit.xml.dist'
       - 'composer.json'
@@ -11,6 +12,7 @@ on:
   pull_request:
     paths:
       - '**.php'
+      - 'tests/Integration/**'
       - '.github/workflows/run-integration-tests.yml'
       - 'phpunit.xml.dist'
       - 'composer.json'
@@ -23,22 +25,7 @@ concurrency:
 jobs:
   integration-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
-    services:
-      rabbitmq:
-        image: rabbitmq:4.2-management
-        ports:
-          - 5672:5672
-          - 15672:15672
-        env:
-          RABBITMQ_DEFAULT_USER: guest
-          RABBITMQ_DEFAULT_PASS: guest
-        options: >-
-          --health-cmd "rabbitmq-diagnostics -q ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+    timeout-minutes: 20
 
     strategy:
       fail-fast: true
@@ -80,18 +67,36 @@ jobs:
         run: |
           composer update --${{ matrix.stability }} --prefer-dist --no-interaction
 
-      - name: Wait for RabbitMQ to be ready
-        run: |
-          timeout 60 bash -c 'until nc -z localhost 5672; do sleep 1; done'
+      - name: Start the required three-broker cluster
+        run: docker compose -f tests/Integration/docker/compose.yaml up -d --wait --wait-timeout 120
 
       - name: List Installed Dependencies
         run: composer show -D
 
       - name: Execute integration tests
         env:
-          RABBITMQ_HOST: localhost
-          RABBITMQ_PORT: 5672
+          RABBITMQ_HOST: 127.0.0.1
+          RABBITMQ_PORT: 25672
+          RABBITMQ_MANAGEMENT_URL: http://127.0.0.1:25673
           RABBITMQ_USER: guest
           RABBITMQ_PASSWORD: guest
           RABBITMQ_VHOST: /
         run: vendor/bin/pest --ci --group=integration
+
+      - name: Capture broker evidence
+        if: always()
+        run: |
+          docker compose -f tests/Integration/docker/compose.yaml ps
+          docker compose -f tests/Integration/docker/compose.yaml logs --no-color > broker-test.log
+
+      - name: Upload broker evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: broker-test-evidence
+          path: broker-test.log
+          retention-days: 7
+
+      - name: Remove isolated test volumes
+        if: always()
+        run: docker compose -f tests/Integration/docker/compose.yaml down --volumes

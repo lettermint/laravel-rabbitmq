@@ -1,0 +1,46 @@
+name: rabbitmq-driver-tests
+
+x-broker: &broker
+  image: rabbitmq:4.2.5-management@sha256:e43ca03df740d48770641b56ce1a26913c74a31e47c1ed36a58e8d91c10731b9
+  environment:
+    RABBITMQ_ERLANG_COOKIE: isolated-integration-test-cookie
+    RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: +S 2:2
+  healthcheck:
+    test: [CMD-SHELL, 'rabbitmq-diagnostics -q check_running && rabbitmq-diagnostics -q check_port_connectivity']
+    interval: 5s
+    timeout: 5s
+    retries: 24
+
+services:
+  broker1:
+    <<: *broker
+    hostname: broker1
+    ports:
+      - '127.0.0.1:25672:5672'
+      - '127.0.0.1:25673:15672'
+    volumes:
+      - broker1:/var/lib/rabbitmq
+      - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+  broker2:
+    <<: *broker
+    hostname: broker2
+    ports:
+      - '127.0.0.1:25674:5672'
+      - '127.0.0.1:25676:15672'
+    volumes:
+      - broker2:/var/lib/rabbitmq
+      - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+  broker3:
+    <<: *broker
+    hostname: broker3
+    ports:
+      - '127.0.0.1:25675:5672'
+      - '127.0.0.1:25677:15672'
+    volumes:
+      - broker3:/var/lib/rabbitmq
+      - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+
+volumes:
+  broker1:
+  broker2:
+  broker3:

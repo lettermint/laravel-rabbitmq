@@ -98,6 +98,7 @@ test('declares durable quorum queues and durable quorum dead-letter queues', fun
         ->and($dlqArguments)->toBe([
             'x-queue-type' => 'quorum',
             'x-overflow' => 'reject-publish',
+            'x-delivery-limit' => -1,
         ]);
 });
 

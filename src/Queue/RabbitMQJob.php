@@ -12,8 +12,10 @@ use Illuminate\Support\Facades\Log;
 use Lettermint\RabbitMQ\Events\JobDeadLettered;
 use Lettermint\RabbitMQ\Events\JobReleased;
 use Lettermint\RabbitMQ\Events\JobRetried;
+use Lettermint\RabbitMQ\Events\JobSettlementFailed;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
 use Lettermint\RabbitMQ\Exceptions\PublishException;
+use Lettermint\RabbitMQ\Exceptions\SettlementException;
 use Lettermint\RabbitMQ\Support\ExceptionReporter;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Message\AMQPMessage;
@@ -61,6 +63,10 @@ class RabbitMQJob extends Job implements JobContract
 
     protected ?Throwable $releaseException = null;
 
+    private bool $settled = false;
+
+    private ?Throwable $settlementError = null;
+
     public function __construct(
         Container $container,
         RabbitMQQueue $rabbitmq,
@@ -91,15 +97,26 @@ class RabbitMQJob extends Job implements JobContract
      */
     public function release($delay = 0): void
     {
-        parent::release($delay);
-
-        $payload = $this->decoded();
-
-        if ($this->releaseException !== null) {
-            $payload['exception'] = $this->exceptionPayload($this->releaseException);
+        if ($this->settled) {
+            return;
         }
 
-        $this->republish($payload, (int) $delay);
+        $this->assertSettlementAvailable();
+
+        try {
+            $payload = $this->decoded();
+
+            if ($this->releaseException !== null) {
+                $payload['exception'] = $this->exceptionPayload($this->releaseException);
+            }
+
+            $this->republish($payload, (int) $delay);
+            parent::release($delay);
+        } catch (Throwable $exception) {
+            $this->recordSettlementError($exception);
+
+            throw $exception;
+        }
     }
 
     /**
@@ -165,11 +182,13 @@ class RabbitMQJob extends Job implements JobContract
                 $this->queueName,
                 [
                     'delay' => max(0, $delay),
+                    'queue_only' => true,
                     'properties' => $properties,
                 ],
             );
 
             $this->rabbitmq->ack($this->message, $this->channel);
+            $this->settled = true;
 
             $this->dispatchEvent(new JobReleased(
                 queue: $this->queueName,
@@ -211,11 +230,17 @@ class RabbitMQJob extends Job implements JobContract
      */
     public function delete(): void
     {
-        parent::delete();
+        if ($this->settled) {
+            return;
+        }
+
+        $this->assertSettlementAvailable();
 
         try {
             if ($this->hasFailed()) {
                 $this->rabbitmq->reject($this->message, $this->channel, false);
+                $this->settled = true;
+                parent::delete();
 
                 $this->dispatchEvent(new JobDeadLettered(
                     queue: $this->queueName,
@@ -232,7 +257,10 @@ class RabbitMQJob extends Job implements JobContract
             }
 
             $this->rabbitmq->ack($this->message, $this->channel);
-        } catch (ConnectionException $e) {
+            $this->settled = true;
+            parent::delete();
+        } catch (Throwable $e) {
+            $this->recordSettlementError($e);
             Log::critical('RabbitMQ final delivery action failed', [
                 'queue' => $this->queueName,
                 'job_id' => $this->getJobId(),
@@ -251,11 +279,51 @@ class RabbitMQJob extends Job implements JobContract
      */
     public function fail($e = null): void
     {
+        $this->assertSettlementAvailable();
+
         $this->failureException = $e instanceof Throwable
             ? $e
             : new \RuntimeException('RabbitMQ job failed');
 
-        parent::fail($e);
+        try {
+            parent::fail($e);
+        } catch (Throwable $exception) {
+            if (! $this->settled && $this->settlementError === null) {
+                $this->delete();
+            }
+
+            throw $exception;
+        }
+    }
+
+    public function isSettled(): bool
+    {
+        return $this->settled;
+    }
+
+    public function settlementError(): ?Throwable
+    {
+        return $this->settlementError;
+    }
+
+    public function rejectMalformed(Throwable $exception): void
+    {
+        $this->failureException = $exception;
+        $this->markAsFailed();
+        $this->delete();
+    }
+
+    private function assertSettlementAvailable(): void
+    {
+        if ($this->settlementError !== null) {
+            throw new SettlementException('A previous delivery settlement failed.', previous: $this->settlementError);
+        }
+    }
+
+    private function recordSettlementError(Throwable $exception): void
+    {
+        $this->settlementError = $exception;
+        $this->dispatchEvent(new JobSettlementFailed($this->queueName, $this->getJobId(), $exception));
     }
 
     private function dispatchEvent(object $event): void
@@ -277,7 +345,7 @@ class RabbitMQJob extends Job implements JobContract
      */
     public function attempts(): int
     {
-        $payload = $this->decoded();
+        $payload = $this->diagnosticPayload();
 
         $headers = $this->getHeaders();
         $attempt = $headers[self::ATTEMPT_HEADER] ?? null;
@@ -308,7 +376,9 @@ class RabbitMQJob extends Job implements JobContract
     {
         $messageId = $this->getMessageProperty('message_id');
 
-        return $messageId ?: $this->decoded()['uuid'] ?? null;
+        $id = $messageId ?: $this->diagnosticPayload()['uuid'] ?? null;
+
+        return is_string($id) || is_int($id) ? (string) $id : null;
     }
 
     /**
@@ -359,7 +429,11 @@ class RabbitMQJob extends Job implements JobContract
                 );
             }
 
-            $this->decoded = $decoded ?? [];
+            if (! is_array($decoded)) {
+                throw new \RuntimeException('Cannot process job: the JSON payload must be an object.');
+            }
+
+            $this->decoded = $decoded;
         }
 
         return $this->decoded;
@@ -370,7 +444,9 @@ class RabbitMQJob extends Job implements JobContract
      */
     public function getName(): string
     {
-        return $this->decoded()['displayName'] ?? $this->decoded()['job'] ?? 'Unknown';
+        $name = $this->diagnosticPayload()['displayName'] ?? $this->diagnosticPayload()['job'] ?? 'Unknown';
+
+        return is_string($name) ? $name : 'Unknown';
     }
 
     /**
@@ -378,7 +454,17 @@ class RabbitMQJob extends Job implements JobContract
      */
     public function resolveName(): string
     {
-        return $this->decoded()['displayName'] ?? $this->decoded()['data']['commandName'] ?? 'Unknown';
+        $name = $this->diagnosticPayload()['displayName'] ?? $this->diagnosticPayload()['data']['commandName'] ?? 'Unknown';
+
+        return is_string($name) ? $name : 'Unknown';
+    }
+
+    /** @return array<string, mixed> */
+    private function diagnosticPayload(): array
+    {
+        $payload = $this->decoded ?? json_decode($this->getRawBody(), true);
+
+        return is_array($payload) ? $payload : [];
     }
 
     /**

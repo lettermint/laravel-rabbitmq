@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Lettermint\RabbitMQ\Console\Commands;
 
 use Illuminate\Console\Command;
-use Illuminate\Support\Facades\Log;
 use Lettermint\RabbitMQ\Actions\Dlq\ReplayDlqMessages;
 use Lettermint\RabbitMQ\Actions\Dlq\Results\DlqMessageData;
 use Lettermint\RabbitMQ\Exceptions\DlqOperationException;
@@ -23,10 +22,11 @@ class ReplayDlqCommand extends Command
     protected $signature = 'rabbitmq:replay-dlq
         {queue : The original queue name (not the DLQ name)}
         {--id= : Replay a specific message by ID}
-        {--limit=0 : Maximum number of messages to replay (0 = all)}
+        {--limit=0 : Maximum messages to replay within configured scan limits (0 = scan limit)}
         {--rate=0 : Maximum messages per second (0 = unlimited)}
         {--batch=0 : Process in batches of N messages with 1s pause between (0 = no batching)}
-        {--dry-run : Show what would be replayed without making changes}';
+        {--dry-run : Show what would be replayed without making changes}
+        {--json : Write one machine-readable result}';
 
     protected $description = 'Replay messages from a dead letter queue back to the original queue';
 
@@ -34,6 +34,18 @@ class ReplayDlqCommand extends Command
 
     public function handle(ReplayDlqMessages $replayDlq): int
     {
+        foreach (['limit', 'rate', 'batch'] as $option) {
+            if (filter_var($this->option($option), FILTER_VALIDATE_INT, ['options' => ['min_range' => 0]]) === false) {
+                $error = "The --{$option} option must be a non-negative integer.";
+                $this->option('json') ? $this->line((string) json_encode(['error' => $error])) : $this->error($error);
+
+                return self::FAILURE;
+            }
+        }
+
+        if ($this->option('json')) {
+            return $this->handleJson($replayDlq);
+        }
         $queueName = $this->argument('queue');
         $targetId = $this->option('id');
         $limit = (int) $this->option('limit');
@@ -91,6 +103,18 @@ class ReplayDlqCommand extends Command
             return self::FAILURE;
         }
 
+        if ($result->incomplete) {
+            $this->components->warn('The scan limit was reached. The operation is incomplete.');
+        }
+
+        if ($result->uncertain) {
+            $this->components->warn('A transfer is uncertain. Check the destination before replaying again.');
+        }
+
+        foreach ($result->failures as $failure) {
+            $this->components->error($failure['error']);
+        }
+
         // Display results for dry-run or single message
         if ($dryRun || $targetId !== null) {
             foreach ($result->replayedMessages as $msg) {
@@ -115,16 +139,28 @@ class ReplayDlqCommand extends Command
             }
         }
 
-        // Log bulk replays
-        if (! $dryRun && $targetId === null && $result->replayedCount > 0) {
-            Log::info('DLQ bulk replay completed', [
-                'queue' => $queueName,
-                'replayed_count' => $result->replayedCount,
-                'failed_count' => $result->failedCount,
-            ]);
-        }
+        return $result->hasFailures() || $result->incomplete || $result->uncertain ? self::FAILURE : self::SUCCESS;
+    }
 
-        return $result->hasFailures() ? self::FAILURE : self::SUCCESS;
+    private function handleJson(ReplayDlqMessages $replayDlq): int
+    {
+        try {
+            $result = $replayDlq(
+                queueName: $this->argument('queue'),
+                messageId: $this->option('id'),
+                limit: (int) $this->option('limit'),
+                rate: (int) $this->option('rate'),
+                batchSize: (int) $this->option('batch'),
+                dryRun: (bool) $this->option('dry-run'),
+            );
+            $this->line((string) json_encode($result, JSON_INVALID_UTF8_SUBSTITUTE | JSON_UNESCAPED_SLASHES));
+
+            return $result->wasMessageNotFound() || $result->hasFailures() || $result->incomplete || $result->uncertain ? self::FAILURE : self::SUCCESS;
+        } catch (\Throwable $exception) {
+            $this->line((string) json_encode(['error' => $exception->getMessage()], JSON_INVALID_UTF8_SUBSTITUTE));
+
+            return self::FAILURE;
+        }
     }
 
     /**

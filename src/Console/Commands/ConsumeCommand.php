@@ -12,6 +12,10 @@ use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Queue\Worker;
 use Illuminate\Support\Facades\Event;
 use Lettermint\RabbitMQ\Consumers\Consumer;
+use Lettermint\RabbitMQ\Events\JobReleased;
+use Lettermint\RabbitMQ\Queue\RabbitMQJob;
+use Lettermint\RabbitMQ\Support\ExceptionReporter;
+use Lettermint\RabbitMQ\Support\FailedJobDetails;
 use Throwable;
 
 /**
@@ -78,12 +82,10 @@ class ConsumeCommand extends Command
 
             return self::SUCCESS;
         } catch (Throwable $e) {
-            $handler->report($e);
+            ExceptionReporter::report($e);
 
-            $this->components->error("Consumer error: {$e->getMessage()}");
-
-            if ($this->option('quiet-exit')) {
-                return self::SUCCESS;
+            if (! $this->option('quiet-exit')) {
+                $this->components->error("Consumer error: {$e->getMessage()}");
             }
 
             return self::FAILURE;
@@ -106,6 +108,10 @@ class ConsumeCommand extends Command
             $duration = $this->formatDuration($jobId);
             unset($this->jobStartTimes[$jobId]);
 
+            if ($event->job->isReleased() || $event->job->hasFailed()) {
+                return;
+            }
+
             $this->line("  <fg=green>DONE</> in {$duration}");
         });
 
@@ -120,21 +126,21 @@ class ConsumeCommand extends Command
                 $this->line("    <fg=red>Error:</> {$event->exception->getMessage()}");
             }
 
-            if ($this->laravel->bound('queue.failer')) {
-                $this->laravel['queue.failer']->log(
-                    $event->connectionName,
-                    $event->job->getQueue(),
-                    $event->job->getRawBody(),
-                    $event->exception,
-                );
+            if ($event->job instanceof RabbitMQJob) {
+                app(FailedJobDetails::class)->record($event);
             }
+        });
+
+        Event::listen(JobReleased::class, function (JobReleased $event): void {
+            unset($this->jobStartTimes[$event->jobId]);
+            $this->line('  RELEASED');
         });
     }
 
     /**
      * Format the duration for a job based on its start time.
      */
-    protected function formatDuration(string $jobId): string
+    protected function formatDuration(?string $jobId): string
     {
         $startTime = $this->jobStartTimes[$jobId] ?? null;
 

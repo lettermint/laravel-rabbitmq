@@ -206,7 +206,7 @@ test('release publishes the next attempt before it acknowledges the original mes
 
             expect(json_decode($published->getBody(), true)['uuid'])->toBe('test-uuid')
                 ->and($exchange)->toBe('')
-                ->and($routingKey)->toContain('delay:test-queue:15000:')
+                ->and($routingKey)->toContain('delay-v2:test-queue:15000:')
                 ->and($published->get('message_id'))->toBe('message-123')
                 ->and($published->get('correlation_id'))->toBe('correlation-456')
                 ->and($published->get('timestamp'))->toBe(123456789)

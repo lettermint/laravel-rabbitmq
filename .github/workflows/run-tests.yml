@@ -81,3 +81,26 @@ jobs:
 
       - name: Execute tests
         run: vendor/bin/pest --ci --exclude-group=integration
+
+  without-filament:
+    name: Core without Filament or a failed-job database
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v7
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: mbstring, sockets, pcntl, posix, pdo_sqlite
+          coverage: none
+      - name: Remove the optional UI dependency
+        run: composer remove filament/filament --dev --no-update --no-interaction
+      - name: Install dependencies
+        run: composer update --prefer-dist --no-interaction
+      - name: Confirm that Filament is absent
+        run: |
+          php -r 'require "vendor/autoload.php"; exit(class_exists("Filament\\Panel") ? 1 : 0);'
+      - name: Test core processing and DLQ actions
+        env:
+          QUEUE_FAILED_DRIVER: 'null'
+        run: vendor/bin/pest tests/Feature/ServiceProviderTest.php tests/Feature/DeliverySettlementTest.php tests/Unit/Actions/DlqActionsTest.php --ci

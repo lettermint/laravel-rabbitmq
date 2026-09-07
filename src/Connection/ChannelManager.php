@@ -4,13 +4,14 @@ declare(strict_types=1);
 
 namespace Lettermint\RabbitMQ\Connection;
 
-use Illuminate\Support\Facades\Log;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
+use Lettermint\RabbitMQ\Support\ExceptionReporter;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Connection\AbstractConnection;
 use PhpAmqpLib\Exception\AMQPConnectionClosedException;
 use PhpAmqpLib\Exception\AMQPIOException;
 use PhpAmqpLib\Exception\AMQPRuntimeException;
+use Throwable;
 
 /**
  * Manages RabbitMQ channels for php-amqplib.
@@ -100,7 +101,7 @@ class ChannelManager
             try {
                 $channel->confirm_select();
                 $this->publisherConfirmChannels[$channelId] = true;
-            } catch (\Throwable $exception) {
+            } catch (Throwable $exception) {
                 $this->closeChannel('publish', $connection);
 
                 throw new ConnectionException(
@@ -147,15 +148,11 @@ class ChannelManager
                 if ($this->channels[$key]->is_open()) {
                     $this->channels[$key]->close();
                 }
-            } catch (AMQPIOException|AMQPConnectionClosedException $e) {
-                Log::debug('Channel close during cleanup (expected)', [
-                    'purpose' => $purpose,
-                    'error' => $e->getMessage(),
-                ]);
+            } catch (Throwable $e) {
+                ExceptionReporter::report($e);
+            } finally {
+                unset($this->channels[$key], $this->channelMetadata[$key]);
             }
-
-            unset($this->channels[$key]);
-            unset($this->channelMetadata[$key]);
         }
     }
 

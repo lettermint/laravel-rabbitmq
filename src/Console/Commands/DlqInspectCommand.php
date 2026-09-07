@@ -27,44 +27,48 @@ class DlqInspectCommand extends Command
 
     public function handle(InspectDlqMessages $inspectDlq): int
     {
-        $queueName = $this->argument('queue');
-        $targetId = $this->option('id');
-        $limit = (int) $this->option('limit');
-        $format = $this->option('format');
-
-        $this->components->info("Inspecting DLQ for queue: {$queueName}");
+        $queueName = (string) $this->argument('queue');
+        $format = (string) $this->option('format');
 
         try {
-            $result = $inspectDlq(
-                queueName: $queueName,
-                messageId: $targetId,
-                limit: $limit,
-            );
-        } catch (DlqOperationException $e) {
-            $this->showQueueNotFoundError($e);
+            $limit = filter_var($this->option('limit'), FILTER_VALIDATE_INT);
 
-            return self::FAILURE;
-        } catch (\Exception $e) {
-            $this->components->error("Failed to inspect DLQ: {$e->getMessage()}");
+            if ($limit === false || $limit < 1 || ! in_array($format, ['table', 'json'], true)) {
+                throw new \InvalidArgumentException('Use a positive limit and table or json output.');
+            }
+
+            $result = $inspectDlq($queueName, messageId: $this->option('id'), limit: $limit);
+
+            if ($format === 'json') {
+                $this->line((string) json_encode([
+                    'queue' => $queueName,
+                    'messages' => $result->messages,
+                    'incomplete' => $result->incomplete,
+                    'not_found_id' => $result->wasMessageNotFound() ? $result->notFoundId : null,
+                ], JSON_PRETTY_PRINT | JSON_INVALID_UTF8_SUBSTITUTE));
+            } else {
+                $this->displayTable($result->messages);
+
+                if ($result->incomplete) {
+                    $this->components->warn('The scan limit was reached. The result is incomplete.');
+                }
+
+                if ($result->wasMessageNotFound()) {
+                    $this->components->error('The message was not found in the scanned queue.');
+                }
+            }
+
+            return $result->wasMessageNotFound() || ($this->option('id') !== null && $result->incomplete)
+                ? self::FAILURE : self::SUCCESS;
+        } catch (\Throwable $exception) {
+            if ($format === 'json') {
+                $this->line((string) json_encode(['error' => $exception->getMessage()], JSON_INVALID_UTF8_SUBSTITUTE));
+            } else {
+                $this->components->error($exception->getMessage());
+            }
 
             return self::FAILURE;
         }
-
-        if ($result->wasMessageNotFound()) {
-            $this->components->error("Message with ID '{$result->notFoundId}' not found in DLQ");
-
-            return self::FAILURE;
-        }
-
-        if ($result->isEmpty()) {
-            $this->components->info('No messages in DLQ');
-
-            return self::SUCCESS;
-        }
-
-        $this->displayMessages($result->messages, $format);
-
-        return self::SUCCESS;
     }
 
     /**

@@ -31,8 +31,8 @@ use Lettermint\RabbitMQ\Enums\RetryStrategy;
  * ```php
  * // Quorum queue (recommended for production - HA, durable)
  * #[ConsumesQueue(
- *     queue: 'email:outbound:transactional',
- *     bindings: ['emails.outbound' => 'transactional.*'],
+ *     queue: 'notifications:standard',
+ *     bindings: ['notifications' => 'standard.*'],
  *     quorum: true,
  *     messageTtl: 86400000,
  * )]
@@ -87,7 +87,7 @@ final class ConsumesQueue
     public readonly OverflowBehavior $overflowEnum;
 
     /**
-     * @param  string  $queue  Queue name (e.g., 'email:outbound:transactional')
+     * @param  string  $queue  Queue name (e.g., 'notifications:standard')
      * @param  array<string, string|array<string>>  $bindings  Exchange bindings: ['exchange' => 'routing.key'] or ['exchange' => ['key1', 'key2']]
      * @param  bool  $quorum  Use quorum queue for HA (default: true, recommended for production)
      * @param  int|null  $maxPriority  Enable priority queue with max level (0-255). NOT compatible with quorum queues.
@@ -226,7 +226,7 @@ final class ConsumesQueue
 
     /**
      * Get the DLQ queue name for this queue.
-     * Convention: 'email:outbound:transactional' -> 'dlq:email:outbound:transactional'
+     * Convention: 'notifications:standard' -> 'dlq:notifications:standard'
      */
     public function getDlqQueueName(): string
     {

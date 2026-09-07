@@ -9,7 +9,9 @@ use Lettermint\RabbitMQ\Actions\Dlq\Results\DlqMessageData;
 use Lettermint\RabbitMQ\Actions\Dlq\Results\DlqQueueConfig;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Exceptions\DlqOperationException;
+use Lettermint\RabbitMQ\Monitoring\ManagementClient;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
+use Lettermint\RabbitMQ\Support\DlqOperationAudit;
 use PhpAmqpLib\Channel\AMQPChannel;
 
 /**
@@ -34,17 +36,28 @@ final class InspectDlqMessages
         ?string $messageId = null,
         int $limit = 10,
     ): DlqInspectResult {
+        return DlqOperationAudit::run('inspect', $queueName, $messageId, false, fn () => $this->execute($queueName, $messageId, $limit));
+    }
+
+    private function execute(string $queueName, ?string $messageId, int $limit): DlqInspectResult
+    {
         $config = ($this->resolveDlqQueue)($queueName);
-        $channel = $this->channelManager->channel(
-            'dlq-inspect',
-            $this->rabbitmq->getBrokerConnectionName(),
-        );
+        app(ManagementClient::class)->assertSafeDeadLetterQueue($config->dlqQueueName, $this->rabbitmq->getBrokerConnectionName());
 
-        if ($messageId !== null) {
-            return $this->inspectById($channel, $config, $messageId);
+        try {
+            $channel = $this->channelManager->channel(
+                'dlq-inspect',
+                $this->rabbitmq->getBrokerConnectionName(),
+            );
+
+            if ($messageId !== null) {
+                return $this->inspectById($channel, $config, $messageId);
+            }
+
+            return $this->inspectMany($channel, $config, $limit);
+        } finally {
+            $this->channelManager->closeChannel('dlq-inspect', $this->rabbitmq->getBrokerConnectionName());
         }
-
-        return $this->inspectMany($channel, $config, $limit);
     }
 
     private function inspectById(
@@ -68,6 +81,7 @@ final class InspectDlqMessages
                 messages: [],
                 totalFound: 0,
                 notFoundId: $messageId,
+                incomplete: $result['incomplete'],
             );
         }
 
@@ -86,8 +100,11 @@ final class InspectDlqMessages
         int $limit,
     ): DlqInspectResult {
         $fetchedMessages = [];
+        $limit = max(1, min($limit, (int) config('rabbitmq.dlq.max_result_messages', 100)));
+        $bytes = 0;
+        $deadline = microtime(true) + (int) config('rabbitmq.dlq.max_runtime_seconds', 30);
 
-        while (count($fetchedMessages) < $limit) {
+        while (count($fetchedMessages) < $limit && $bytes < (int) config('rabbitmq.dlq.max_scan_bytes', 16777216) && microtime(true) < $deadline) {
             $message = $channel->basic_get($config->dlqQueueName, false);
 
             if ($message === null) {
@@ -95,6 +112,7 @@ final class InspectDlqMessages
             }
 
             $fetchedMessages[] = $message;
+            $bytes += strlen($message->getBody());
         }
 
         $messages = array_map(
@@ -110,6 +128,7 @@ final class InspectDlqMessages
         return new DlqInspectResult(
             messages: $messages,
             totalFound: count($messages),
+            incomplete: count($messages) >= $limit || $bytes >= (int) config('rabbitmq.dlq.max_scan_bytes', 16777216) || microtime(true) >= $deadline,
         );
     }
 }

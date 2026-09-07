@@ -20,11 +20,13 @@ final readonly class DlqReplayResult
         public ?string $notFoundId = null,
         public array $replayedMessages = [],
         public array $failures = [],
+        public bool $incomplete = false,
+        public bool $uncertain = false,
     ) {}
 
     public function wasMessageNotFound(): bool
     {
-        return $this->notFoundId !== null;
+        return $this->notFoundId !== null && ! $this->incomplete;
     }
 
     public function hasFailures(): bool

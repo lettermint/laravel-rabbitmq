@@ -218,22 +218,22 @@ test('uses a durable classic TTL queue for a delayed publish', function () {
         ->withArgs(function (string $queue, bool $passive, bool $durable, bool $exclusive, bool $autoDelete, bool $nowait, AMQPTable $arguments): bool {
             $values = $arguments->getNativeData();
 
-            return str_starts_with($queue, 'test.delay:default:15000:')
+            return str_starts_with($queue, 'test.delay-v2:default:15000:')
                 && ! $passive
                 && $durable
                 && ! $exclusive
                 && ! $autoDelete
                 && ! $nowait
-                && $values['x-queue-type'] === 'classic'
+                && $values['x-queue-type'] === 'quorum'
                 && $values['x-message-ttl'] === 15000
-                && $values['x-expires'] === 75000
+                && ! isset($values['x-expires']) && $values['x-dead-letter-strategy'] === 'at-least-once'
                 && $values['x-dead-letter-exchange'] === 'test.jobs'
                 && $values['x-dead-letter-routing-key'] === 'default';
         });
     $this->channel->shouldReceive('basic_publish')
         ->once()
         ->withArgs(fn (AMQPMessage $message, string $exchange, string $routingKey): bool => $exchange === ''
-            && str_starts_with($routingKey, 'test.delay:default:15000:'));
+            && str_starts_with($routingKey, 'test.delay-v2:default:15000:'));
 
     $this->queue->pushRaw('{"uuid":"job-1"}', 'default', ['delay' => 15]);
 });

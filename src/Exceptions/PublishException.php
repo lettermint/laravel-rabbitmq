@@ -18,6 +18,7 @@ class PublishException extends RuntimeException
         public readonly ?string $routingKey = null,
         int $code = 0,
         ?Throwable $previous = null,
+        public readonly bool $uncertain = false,
     ) {
         parent::__construct($message, $code, $previous);
     }

@@ -41,6 +41,7 @@ function makeConsumerForTest(): array
 
     $events = Mockery::mock(Dispatcher::class);
     $events->shouldReceive('dispatch')->andReturnNull()->byDefault();
+    $events->shouldReceive('until')->andReturnNull()->byDefault();
     $exceptions = Mockery::mock(ExceptionHandler::class);
     $exceptions->shouldReceive('report')->andReturnNull()->byDefault();
 
@@ -168,7 +169,7 @@ test('recovers a connection and rebuilds the consume channel', function () {
         ->with('broker')
         ->once()
         ->andReturn($workingChannel);
-    $channelManager->shouldReceive('recoverConnection')->once()->with('broker', 3);
+    $channelManager->shouldReceive('recoverConnection')->once()->with('broker', 1);
     $channelManager->shouldReceive('closeChannel')->andReturnNull()->byDefault();
 
     $queue = testRabbitMQQueue($channelManager, ['connection' => 'broker']);
@@ -176,6 +177,7 @@ test('recovers a connection and rebuilds the consume channel', function () {
     $queueManager->shouldReceive('connection')->with('rabbitmq')->andReturn($queue);
     $events = Mockery::mock(Dispatcher::class);
     $events->shouldReceive('dispatch')->andReturnNull()->byDefault();
+    $events->shouldReceive('until')->andReturnNull()->byDefault();
     $exceptions = Mockery::mock(ExceptionHandler::class);
     $exceptions->shouldReceive('report')->andReturnNull()->byDefault();
     $worker = new RabbitMQWorker($queueManager, $events, $exceptions, fn (): bool => false, fn (): null => null);
@@ -203,6 +205,7 @@ test('does not hide a failed replacement publish', function () {
     $queueManager = Mockery::mock(QueueManager::class);
     $events = Mockery::mock(Dispatcher::class);
     $events->shouldReceive('dispatch')->andReturnNull()->byDefault();
+    $events->shouldReceive('until')->andReturnNull()->byDefault();
     $exceptions = Mockery::mock(ExceptionHandler::class);
     $exceptions->shouldNotReceive('report');
     $worker = new RabbitMQWorker(

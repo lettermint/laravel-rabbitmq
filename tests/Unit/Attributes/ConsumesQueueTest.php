@@ -121,8 +121,8 @@ describe('ConsumesQueue attribute', function () {
 
     describe('DLQ derivation', function () {
         it('derives DLQ queue name from queue name', function () {
-            $attr = new ConsumesQueue(queue: 'email:outbound:transactional');
-            expect($attr->getDlqQueueName())->toBe('dlq:email:outbound:transactional');
+            $attr = new ConsumesQueue(queue: 'notifications:standard');
+            expect($attr->getDlqQueueName())->toBe('dlq:notifications:standard');
         });
 
         it('derives DLQ exchange name from first binding', function () {
@@ -156,8 +156,8 @@ describe('ConsumesQueue attribute', function () {
         });
 
         it('derives DLQ routing key from queue name', function () {
-            $attr = new ConsumesQueue(queue: 'email:outbound:transactional');
-            expect($attr->getDlqRoutingKey())->toBe('email.outbound.transactional');
+            $attr = new ConsumesQueue(queue: 'notifications:standard');
+            expect($attr->getDlqRoutingKey())->toBe('notifications.standard');
         });
     });
 
@@ -192,8 +192,8 @@ describe('ConsumesQueue attribute', function () {
         });
 
         it('derives publish routing key from queue name when no bindings', function () {
-            $attr = new ConsumesQueue(queue: 'email:outbound');
-            expect($attr->getPublishRoutingKey())->toBe('email.outbound');
+            $attr = new ConsumesQueue(queue: 'notifications');
+            expect($attr->getPublishRoutingKey())->toBe('notifications');
         });
     });
 
@@ -346,7 +346,7 @@ describe('ConsumesQueue attribute', function () {
 
         it('includes dead letter exchange arguments when bindings exist', function () {
             $attr = new ConsumesQueue(
-                queue: 'email:outbound',
+                queue: 'notifications',
                 bindings: ['emails' => 'outbound.*']
             );
             $args = $attr->getQueueArguments();
@@ -354,7 +354,7 @@ describe('ConsumesQueue attribute', function () {
             expect($args)->toHaveKey('x-dead-letter-exchange');
             expect($args['x-dead-letter-exchange'])->toBe('emails.dlq');
             expect($args)->toHaveKey('x-dead-letter-routing-key');
-            expect($args['x-dead-letter-routing-key'])->toBe('email.outbound');
+            expect($args['x-dead-letter-routing-key'])->toBe('notifications');
         });
 
         it('does not include dead letter args when no bindings', function () {

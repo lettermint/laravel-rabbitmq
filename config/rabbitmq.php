@@ -19,6 +19,20 @@ return [
 
     'default' => env('RABBITMQ_CONNECTION', 'default'),
 
+    'management' => [
+        'url' => env('RABBITMQ_MANAGEMENT_URL'),
+        'user' => env('RABBITMQ_MANAGEMENT_USER'),
+        'password' => env('RABBITMQ_MANAGEMENT_PASSWORD'),
+        'ca_file' => env('RABBITMQ_MANAGEMENT_CA_FILE'),
+    ],
+
+    'dlq' => [
+        'max_scan_messages' => 1000,
+        'max_scan_bytes' => 16777216,
+        'max_result_messages' => 100,
+        'max_runtime_seconds' => 30,
+    ],
+
     /*
     |--------------------------------------------------------------------------
     | RabbitMQ Connections
@@ -42,10 +56,10 @@ return [
             ],
             'options' => [
                 'heartbeat' => env('RABBITMQ_HEARTBEAT', 60),
-                'connection_timeout' => env('RABBITMQ_CONNECTION_TIMEOUT', 30),
-                'read_timeout' => env('RABBITMQ_READ_TIMEOUT', 300),
-                'write_timeout' => env('RABBITMQ_WRITE_TIMEOUT', 300),
-                'channel_rpc_timeout' => env('RABBITMQ_CHANNEL_RPC_TIMEOUT', 0),
+                'connection_timeout' => env('RABBITMQ_CONNECTION_TIMEOUT', 5),
+                'read_timeout' => env('RABBITMQ_READ_TIMEOUT', 10),
+                'write_timeout' => env('RABBITMQ_WRITE_TIMEOUT', 10),
+                'channel_rpc_timeout' => env('RABBITMQ_CHANNEL_RPC_TIMEOUT', 5),
             ],
             'ssl' => [
                 'enabled' => env('RABBITMQ_SSL', false),
@@ -128,14 +142,13 @@ return [
     | Retry and Delayed Release
     |--------------------------------------------------------------------------
     |
-    | Delayed releases use durable classic TTL queues. The package does not
+    | Delayed releases use durable quorum TTL queues. The package does not
     | require the RabbitMQ delayed-message plug-in.
     |
     */
 
     'retry' => [
         'maximum_delay' => env('RABBITMQ_MAXIMUM_DELAY', 86400),
-        'delay_queue_cleanup_grace' => env('RABBITMQ_DELAY_QUEUE_CLEANUP_GRACE', 86400000),
     ],
 
     /*
@@ -148,6 +161,7 @@ return [
     */
 
     'consumer' => [
+        'status_file' => env('RABBITMQ_WORKER_STATUS_FILE'),
         'prefetch_count' => env('RABBITMQ_PREFETCH_COUNT', 1),
         'timeout' => 30,
         'heartbeat_sender' => env('RABBITMQ_HEARTBEAT_SENDER', true),

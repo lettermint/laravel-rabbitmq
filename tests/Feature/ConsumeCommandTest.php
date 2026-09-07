@@ -34,6 +34,7 @@ function commandConsumer(array $expectedQueues): Consumer
     $queueManager->shouldReceive('connection')->with('rabbitmq')->andReturn($queue);
     $events = Mockery::mock(Dispatcher::class);
     $events->shouldReceive('dispatch')->andReturnNull()->byDefault();
+    $events->shouldReceive('until')->andReturnNull()->byDefault();
     $exceptions = Mockery::mock(ExceptionHandler::class);
     $exceptions->shouldReceive('report')->andReturnNull()->byDefault();
     $worker = new RabbitMQWorker($queueManager, $events, $exceptions, fn (): bool => false, fn (): null => null);
@@ -48,6 +49,7 @@ it('forwards multiple queue arguments to the consumer', function () {
         'queue' => ['default', 'reporting'],
         '--connection' => 'rabbitmq',
         '--stop-when-empty' => true,
+        '--max-memory' => 1024,
     ])->assertExitCode(0);
 });
 
@@ -58,5 +60,6 @@ it('accepts a single queue argument', function () {
         'queue' => ['default'],
         '--connection' => 'rabbitmq',
         '--stop-when-empty' => true,
+        '--max-memory' => 1024,
     ])->assertExitCode(0);
 });
