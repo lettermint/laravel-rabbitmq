@@ -4,6 +4,12 @@ This file records notable changes. The project uses [Semantic Versioning](https:
 
 ## Unreleased
 
+- Isolate consumer tests from shared test-process memory and verify memory-limit shutdown.
+- Update the changelog through a dedicated deploy key and backfill missing published releases.
+- Simplify installation instructions and move operating details into linked guides.
+
+## 1.3.1 - 2026-09-07
+
 - Separate broker settlement from Laravel job flags. Stop or recover after settlement failure.
 - Confirm retries before acknowledgement and keep retries within the originating queue.
 - Retain malformed deliveries and keep optional failure-history errors visible.
@@ -12,7 +18,28 @@ This file records notable changes. The project uses [Semantic Versioning](https:
 - Preserve Laravel retries, deadlines, middleware, unique locks, chains, batches, restart, and maintenance behavior.
 - Add local worker status, timeout and settlement events, shared operator audit events, and current-run probe completion.
 - Stop heartbeat helpers after forced worker termination. Bound connection I/O defaults and recovery.
-- Require a pinned three-broker test fixture for broker failure tests. See the README for upgrade requirements.
+- Require a pinned three-broker test fixture for broker failure tests. See the [upgrade guide](docs/operations.md#upgrade-and-worker-health) for upgrade requirements.
+
+[Release notes](https://github.com/lettermint/laravel-rabbitmq/releases/tag/v1.3.1)
+
+## 1.3.0 - 2026-08-23
+
+- Improve the Filament dead-letter queue tools. [#41](https://github.com/lettermint/laravel-rabbitmq/pull/41)
+
+[Release notes](https://github.com/lettermint/laravel-rabbitmq/releases/tag/v1.3.0)
+
+## 1.2.1 - 2026-08-23
+
+- Support backoff values stored in Laravel job payloads. [#40](https://github.com/lettermint/laravel-rabbitmq/pull/40)
+- Update the checkout action to version 7. [#39](https://github.com/lettermint/laravel-rabbitmq/pull/39)
+
+[Release notes](https://github.com/lettermint/laravel-rabbitmq/releases/tag/v1.2.1)
+
+## 1.2.0 - 2026-08-22
+
+- Compile topology attributes for runtime use. [#38](https://github.com/lettermint/laravel-rabbitmq/pull/38)
+
+[Release notes](https://github.com/lettermint/laravel-rabbitmq/releases/tag/v1.2.0)
 
 ## 1.1.0 - 2026-08-22
 
@@ -56,3 +83,21 @@ This file records notable changes. The project uses [Semantic Versioning](https:
 - Added the first stable package release.
 - Added the Laravel RabbitMQ connector and queue implementation.
 - Added attribute-based topology, dead-letter commands, priority support, quorum queues, a circuit breaker, and worker commands.
+
+## 0.2.0 - 2025-12-22 (pre-release)
+
+Pre-release. [Changes since 0.1.1](https://github.com/lettermint/laravel-rabbitmq/compare/0.1.1...0.2.0).
+
+[Release notes](https://github.com/lettermint/laravel-rabbitmq/releases/tag/0.2.0)
+
+## 0.1.1 - 2025-12-21 (pre-release)
+
+Pre-release. [Changes since 0.1](https://github.com/lettermint/laravel-rabbitmq/compare/0.1...0.1.1).
+
+[Release notes](https://github.com/lettermint/laravel-rabbitmq/releases/tag/0.1.1)
+
+## 0.1 - 2025-12-21 (pre-release)
+
+- Update the Pint action to version 2.6. [#3](https://github.com/lettermint/laravel-rabbitmq/pull/3)
+
+[Release notes](https://github.com/lettermint/laravel-rabbitmq/releases/tag/0.1)

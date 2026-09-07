@@ -1,101 +1,69 @@
-# Contributing to Laravel RabbitMQ
+# Contributing
 
-Thank you for considering contributing to Laravel RabbitMQ! We welcome contributions from the community.
+Use synthetic jobs and neutral queue names in tests and examples. Keep application topology, credentials, deployment files, and private incident evidence outside this package.
 
-## Development Setup
-
-1. **Clone the repository**:
-   ```bash
-   git clone https://github.com/lettermint/laravel-rabbitmq.git
-   cd laravel-rabbitmq
-   ```
-
-2. **Install dependencies**:
-   ```bash
-   composer install
-   ```
-
-3. **Start RabbitMQ** (for integration tests):
-   ```bash
-   docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
-   ```
-
-## Running Tests
+## Local checks
 
 ```bash
-# Run all tests
-vendor/bin/pest
-
-# Run specific test file
-vendor/bin/pest tests/Unit/AttributeScannerTest.php
-
-# Run with coverage
-vendor/bin/pest --coverage
+composer install
+composer test
+composer analyse
+composer format
+node --test .github/scripts/update-changelog.test.cjs
 ```
 
-## Code Style
+The PHP test process has a 512 MiB memory limit. Functional consumer tests use a separate worker threshold because all tests share one PHP process. A dedicated test verifies shutdown at the worker memory limit. These test settings do not change the runtime worker default.
 
-This project follows Laravel coding standards. Run the formatter before committing:
+To repeat a CI test order:
 
 ```bash
-vendor/bin/pint
+vendor/bin/pest --ci --order-by=random --random-order-seed=1788758977 --exclude-group=integration
 ```
 
-## Static Analysis
+## Broker integration tests
 
-We use PHPStan for static analysis. Ensure your changes pass:
+The integration suite requires the pinned three-node Docker Compose fixture. Each broker has a separate test volume. Missing brokers fail the suite. Check the published ports before starting the fixture; do not point fault tests at an application broker.
 
 ```bash
-vendor/bin/phpstan analyse
+docker compose -f tests/Integration/docker/compose.yaml up -d --wait --wait-timeout 120
+RABBITMQ_HOST=127.0.0.1 \
+RABBITMQ_PORT=25672 \
+RABBITMQ_MANAGEMENT_URL=http://127.0.0.1:25673 \
+RABBITMQ_USER=guest \
+RABBITMQ_PASSWORD=guest \
+RABBITMQ_VHOST=/ \
+composer test-integration
+docker compose -f tests/Integration/docker/compose.yaml down --volumes
 ```
 
-## Pull Request Process
+Remove the fixture after the tests, including when a test fails. The cleanup command deletes its test data. Fault tests verify three online queue members before leader loss, majority loss, and network partitions. They do not establish independent host or cloud-storage recovery or production capacity.
 
-1. **Fork** the repository and create your branch from `main`.
+## Changelog updates
 
-2. **Write tests** for any new functionality or bug fixes.
+The `Update Changelog` workflow runs when a release is published. It reads all published GitHub releases, adds missing versions to `CHANGELOG.md`, and commits that file directly to the default branch. It uses release tags and publication dates. It includes published pre-releases and skips drafts.
 
-3. **Update documentation** if you're changing behavior or adding features.
+Existing summaries and `Unreleased` entries remain unchanged. Edit an existing entry through a normal pull request when its release notes need correction. When preparing a release, move its completed `Unreleased` entries under the dated version heading. Later automation will preserve that summary.
 
-4. **Run the test suite** and ensure all tests pass.
+Repeated runs do not add duplicate versions. Run the workflow manually with `workflow_dispatch` to restore missing entries after a failed run. A normal push is used; the workflow does not force-push over other changes.
 
-5. **Run code formatting** with Pint.
+The update job uses a dedicated write-enabled deploy key for this repository. The organization and enterprise policies must allow deploy keys before you can create one. Store its private key in the `CHANGELOG_DEPLOY_KEY` Actions secret and permit deploy keys to bypass the applicable branch rules. The workflow checks out the default branch with that key and limits its commit to `CHANGELOG.md`. The GitHub API token only needs read access.
 
-6. **Submit a pull request** with a clear description of your changes.
+A deploy key grants repository access, not access to one file or workflow. Keep it dedicated to this automation. Pull-request test jobs do not receive the key. Normal contributor changes continue through pull requests.
 
-## Commit Messages
+To add missing release entries locally without a commit or push:
 
-We follow conventional commit messages:
-
-- `feat:` New features
-- `fix:` Bug fixes
-- `docs:` Documentation changes
-- `refactor:` Code refactoring
-- `test:` Test additions or changes
-- `chore:` Maintenance tasks
-
-Example:
-```
-feat: add support for custom exchange arguments
-
-Add ability to pass arbitrary arguments to exchange declarations
-via the Exchange attribute.
+```bash
+gh api --paginate --slurp repos/lettermint/laravel-rabbitmq/releases \
+    > /tmp/rabbitmq-releases.json
+node .github/scripts/update-changelog.cjs /tmp/rabbitmq-releases.json
 ```
 
-## Reporting Issues
+Review the resulting diff before committing it. The generator reads JSON as data; it does not run release-note text as shell commands.
 
-When reporting issues, please include:
+## Pull requests and issues
 
-1. Laravel and PHP versions
-2. RabbitMQ version
-3. Steps to reproduce
-4. Expected vs actual behavior
-5. Relevant logs or error messages
+Start a branch from `main`. Add tests for changed behavior, update the related documentation, and run the checks above. Use Conventional Commits, such as `fix: preserve retry routing`. Explain the changed behavior and test results in the pull request.
 
-## Security Vulnerabilities
+For a bug report, include PHP, Laravel, and RabbitMQ versions, steps to reproduce, expected and actual results, and relevant logs without credentials or private payloads.
 
-If you discover a security vulnerability, please email security@lettermint.co instead of using the issue tracker. All security vulnerabilities will be promptly addressed.
-
-## Questions?
-
-Feel free to open an issue for questions about contributing or reach out to the maintainers.
+Report security vulnerabilities to security@lettermint.co rather than a public issue.

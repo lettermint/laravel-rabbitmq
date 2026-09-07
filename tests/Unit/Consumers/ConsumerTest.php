@@ -54,7 +54,8 @@ function makeConsumerForTest(): array
     );
 
     return [
-        new Consumer($channelManager, $queueManager, $worker),
+        // The suite shares one process; earlier tests can exceed the worker's default limit.
+        (new Consumer($channelManager, $queueManager, $worker))->setMaxMemory(1024),
         $channel,
         $channelManager,
     ];
@@ -123,7 +124,7 @@ test('uses the configured physical queue names', function () {
     $queueManager = Mockery::mock(QueueManager::class);
     $queueManager->shouldReceive('connection')->with('rabbitmq')->andReturn($queue);
     $worker = app(RabbitMQWorker::class);
-    $consumer = new Consumer($channelManager, $queueManager, $worker);
+    $consumer = (new Consumer($channelManager, $queueManager, $worker))->setMaxMemory(1024);
 
     $channel->shouldReceive('basic_consume')
         ->once()
@@ -183,9 +184,20 @@ test('recovers a connection and rebuilds the consume channel', function () {
     $worker = new RabbitMQWorker($queueManager, $events, $exceptions, fn (): bool => false, fn (): null => null);
 
     (new Consumer($channelManager, $queueManager, $worker))
+        ->setMaxMemory(1024)
         ->setConnection('rabbitmq')
         ->setStopWhenEmpty(true)
         ->consume();
+});
+
+test('stops before registration when the memory limit is reached', function () {
+    [$consumer, $channel, $channelManager] = makeConsumerForTest();
+    $channelManager->shouldNotReceive('consumeChannel');
+    $channel->shouldNotReceive('basic_consume');
+
+    $limit = (int) floor(memory_get_usage(true) / 1024 / 1024);
+
+    $consumer->setConnection('rabbitmq')->setMaxMemory($limit)->consume();
 });
 
 test('rejects a Laravel connection that does not use this driver', function () {
