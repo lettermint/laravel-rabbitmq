@@ -16,7 +16,8 @@ use Throwable;
 
 final class RabbitMQWorker extends Worker
 {
-    private ?int $restartTimestamp = null;
+    // Keep the raw cache value for Laravel's restart comparison; stores can return strings.
+    private mixed $restartTimestamp = null;
 
     public function startSession(): void
     {
