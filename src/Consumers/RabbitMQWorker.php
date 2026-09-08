@@ -12,11 +12,13 @@ use Lettermint\RabbitMQ\Exceptions\PublishException;
 use Lettermint\RabbitMQ\Exceptions\SettlementException;
 use Lettermint\RabbitMQ\Queue\RabbitMQJob;
 use Lettermint\RabbitMQ\Support\ExceptionReporter;
+use ReflectionMethod;
 use Throwable;
 
 final class RabbitMQWorker extends Worker
 {
-    private ?int $restartTimestamp = null;
+    // Keep the raw cache value for Laravel's restart comparison; stores can return strings.
+    private mixed $restartTimestamp = null;
 
     public function startSession(): void
     {
@@ -34,9 +36,15 @@ final class RabbitMQWorker extends Worker
         return $this->daemonShouldRun($options, $connection, $queue);
     }
 
-    protected function registerTimeoutHandler($job, WorkerOptions $options)
+    private function registerMessageTimeoutHandler(Job $job, string $connectionName, WorkerOptions $options): void
     {
-        parent::registerTimeoutHandler($job, $options);
+        // Laravel 13.31 adds connection and queue arguments to the timeout handler.
+        $timeoutHandler = new ReflectionMethod(Worker::class, 'registerTimeoutHandler');
+        $arguments = $timeoutHandler->getNumberOfParameters() === 4
+            ? [$connectionName, $job->getQueue(), $job, $options]
+            : [$job, $options];
+
+        $timeoutHandler->invokeArgs($this, $arguments);
         $handler = pcntl_signal_get_handler(SIGALRM);
 
         pcntl_signal(SIGALRM, function () use ($handler, $options): void {
@@ -98,7 +106,7 @@ final class RabbitMQWorker extends Worker
             ($this->resetScope)();
 
             if ($supportsAsyncSignals) {
-                $this->registerTimeoutHandler($job, $options);
+                $this->registerMessageTimeoutHandler($job, $connectionName, $options);
             }
 
             $this->process($connectionName, $job, $options);
