@@ -11,6 +11,10 @@ use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Queue\Events\JobTimedOut;
 use Illuminate\Support\Facades\Log;
+use Lettermint\RabbitMQ\Events\BatchInterrupted;
+use Lettermint\RabbitMQ\Events\BatchItemSettled;
+use Lettermint\RabbitMQ\Events\BatchProcessed;
+use Lettermint\RabbitMQ\Events\BatchProcessing;
 use Lettermint\RabbitMQ\Events\ConnectionRecovered;
 use Lettermint\RabbitMQ\Events\DlqMessageReplayed;
 use Lettermint\RabbitMQ\Events\DlqOperationFinished;
@@ -31,6 +35,73 @@ final class QueueLifecycleSubscriber
 
     public function subscribe(Dispatcher $events): void
     {
+        $events->listen(BatchProcessing::class, function (BatchProcessing $event): void {
+            Log::info('RabbitMQ batch processing', [
+                'event' => 'rabbitmq.batch.processing',
+                'batch_id' => $event->batchId,
+                'connection' => $event->connection,
+                'queue' => $event->queue,
+                'handler_class' => $event->handler,
+                'batch_size' => $event->size,
+                'payload_bytes' => $event->payloadBytes,
+                'collection_ms' => round($event->collectionMilliseconds, 2),
+            ]);
+        });
+        $events->listen(BatchProcessed::class, function (BatchProcessed $event): void {
+            Log::info('RabbitMQ batch processed', [
+                'event' => 'rabbitmq.batch.processed',
+                'batch_id' => $event->batchId,
+                'connection' => $event->connection,
+                'queue' => $event->queue,
+                'handler_class' => $event->handler,
+                'batch_size' => $event->size,
+                'payload_bytes' => $event->payloadBytes,
+                'collection_ms' => round($event->collectionMilliseconds, 2),
+                'processing_ms' => round($event->processingMilliseconds, 2),
+                'settlement_ms' => round($event->settlementMilliseconds, 2),
+                'successes' => $event->successes,
+                'retries' => $event->retries,
+                'failures' => $event->failures,
+                'invalid_results' => $event->invalidResults,
+                'handler_exception_class' => $event->handlerExceptionClass,
+            ]);
+        });
+        $events->listen(BatchInterrupted::class, function (BatchInterrupted $event): void {
+            Log::warning('RabbitMQ batch interrupted', [
+                'event' => 'rabbitmq.batch.interrupted',
+                'batch_id' => $event->batchId,
+                'connection' => $event->connection,
+                'queue' => $event->queue,
+                'batch_size' => $event->size,
+                'payload_bytes' => $event->payloadBytes,
+                'settled' => $event->settled,
+                'unacknowledged' => $event->unacknowledged,
+                'reason' => $event->reason,
+                'collection_ms' => round($event->collectionMilliseconds, 2),
+                'processing_ms' => round($event->processingMilliseconds, 2),
+                'settlement_ms' => round($event->settlementMilliseconds, 2),
+                'exception_class' => $event->exceptionClass,
+            ]);
+        });
+        $events->listen(BatchItemSettled::class, function (BatchItemSettled $event): void {
+            Log::info('RabbitMQ batch item settled', [
+                'event' => 'rabbitmq.batch.item_settled',
+                'batch_id' => $event->batchId,
+                'connection' => $event->connection,
+                'queue' => $event->queue,
+                'job_class' => $event->jobClass,
+                'job_id' => $event->jobId,
+                'attempt' => $event->attempt,
+                'broker_delivery_count' => $event->brokerDeliveryCount,
+                'redelivered' => $event->redelivered,
+                'queue_wait_ms' => $this->queueWaitMilliseconds($event->messageTimestamp),
+                'payload_bytes' => $event->payloadBytes,
+                'outcome' => $event->outcome->value,
+                'reason' => $event->reason,
+                'processing_ms' => round($event->processingMilliseconds, 2),
+                'settlement_ms' => round($event->settlementMilliseconds, 2),
+            ]);
+        });
         $events->listen(JobProcessing::class, $this->processing(...));
         $events->listen(JobProcessed::class, $this->processed(...));
         $events->listen(JobExceptionOccurred::class, $this->exceptionOccurred(...));

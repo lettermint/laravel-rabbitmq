@@ -28,6 +28,7 @@ use Lettermint\RabbitMQ\Exceptions\SettlementException;
 use Lettermint\RabbitMQ\Monitoring\ManagementClient;
 use Lettermint\RabbitMQ\Queue\RabbitMQJob;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
+use Lettermint\RabbitMQ\Tests\Fixtures\Batch\BatchStorageJob;
 use Lettermint\RabbitMQ\Tests\Fixtures\Jobs\LifecycleJob;
 use Lettermint\RabbitMQ\Tests\Fixtures\Jobs\ProcessMarkerJob;
 use Lettermint\RabbitMQ\Tests\Fixtures\Jobs\ThrowingJob;
@@ -471,6 +472,233 @@ test('a process exit after retry confirmation preserves both copies with the sam
     }
 });
 
+test('the batch consumer flushes on count and does not call each job handle method', function () {
+    $path = tempnam(sys_get_temp_dir(), 'rabbitmq-batch-');
+    $this->queue->push(new BatchStorageJob($path, 'one'));
+    $this->queue->push(new BatchStorageJob($path, 'two'));
+    $process = integrationBatchConsumerProcess([
+        'RABBITMQ_TEST_MAX_COUNT' => '2',
+        'RABBITMQ_TEST_MAX_JOBS' => '2',
+        'RABBITMQ_TEST_MAX_WAIT' => '10',
+    ]);
+
+    try {
+        $process->mustRun();
+        expect(file_get_contents($path))->toBe("batch:one,two\nwrite:one\nwrite:two\n")
+            ->and($this->queue->size('default'))->toBe(0);
+    } finally {
+        $process->stop();
+        unlink($path);
+    }
+});
+
+test('the batch consumer flushes on bytes and elapsed time at low traffic', function () {
+    $path = tempnam(sys_get_temp_dir(), 'rabbitmq-batch-');
+    $first = new BatchStorageJob($path, 'bytes-one');
+    $second = new BatchStorageJob($path, 'bytes-two');
+    $byteLimit = rabbitPayloadBytes($this->queue, $first) + 5;
+    $this->queue->push($first);
+    $this->queue->push($second);
+    $byteProcess = integrationBatchConsumerProcess([
+        'RABBITMQ_TEST_MAX_BYTES' => (string) $byteLimit,
+        'RABBITMQ_TEST_MAX_JOBS' => '2',
+        'RABBITMQ_TEST_MAX_WAIT' => '10',
+    ]);
+    $timeProcess = null;
+
+    try {
+        $byteProcess->mustRun();
+        expect(file_get_contents($path))->toContain("batch:bytes-one\n", "batch:bytes-two\n");
+
+        file_put_contents($path, '');
+        $this->queue->push(new BatchStorageJob($path, 'low-traffic'));
+        $timeProcess = integrationBatchConsumerProcess([
+            'RABBITMQ_TEST_MAX_JOBS' => '1',
+            'RABBITMQ_TEST_MAX_WAIT' => '0.2',
+        ]);
+        $timeProcess->mustRun();
+        expect(file_get_contents($path))->toBe("batch:low-traffic\nwrite:low-traffic\n");
+    } finally {
+        $byteProcess->stop();
+        $timeProcess?->stop();
+        unlink($path);
+    }
+});
+
+test('the batch consumer settles mixed results and preserves retry data', function () {
+    $path = tempnam(sys_get_temp_dir(), 'rabbitmq-batch-');
+    $retryId = $this->queue->push(new BatchStorageJob($path, 'retry', 'retry'));
+    $this->queue->push(new BatchStorageJob($path, 'success'));
+    $this->queue->push(new BatchStorageJob($path, 'failure', 'failure'));
+    $process = integrationBatchConsumerProcess([
+        'RABBITMQ_TEST_MAX_COUNT' => '3',
+        'RABBITMQ_TEST_MAX_JOBS' => '3',
+    ]);
+
+    try {
+        $process->mustRun();
+        expect(file_get_contents($path))->toBe("batch:retry,success,failure\nwrite:success\n");
+        $retry = waitForRabbitJob($this->queue, 'default', 4);
+        expect($retry)->toBeInstanceOf(RabbitMQJob::class)
+            ->and($retry->getJobId())->toBe($retryId)
+            ->and($retry->attempts())->toBe(2)
+            ->and($retry->brokerDeliveryCount())->toBe(0);
+        $payload = json_decode($retry->getRawBody(), true, flags: JSON_THROW_ON_ERROR);
+        $restored = unserialize($payload['data']['command']);
+        expect($restored)->toBeInstanceOf(BatchStorageJob::class)
+            ->and($restored->marker)->toBe($path)
+            ->and($restored->id)->toBe('retry')
+            ->and($restored->outcome)->toBe('retry')
+            ->and($payload['exception']['class'])->toBe(RuntimeException::class);
+        $retry->delete();
+        waitForQueueDepth($this->channels, $this->registry->queue('default')->deadLetterQueue, 1);
+    } finally {
+        $process->stop();
+        unlink($path);
+    }
+});
+
+test('invalid batch deliveries are rejected without blocking a valid delivery', function () {
+    $path = tempnam(sys_get_temp_dir(), 'rabbitmq-batch-');
+    $valid = new BatchStorageJob($path, 'valid');
+    $maxBytes = rabbitPayloadBytes($this->queue, $valid) + 10;
+    $this->queue->pushRaw('{', 'default');
+    $this->queue->push(new ProcessMarkerJob($path, 'unsupported'));
+    $this->queue->push(new BatchStorageJob($path, str_repeat('x', $maxBytes * 2)));
+    $this->queue->push($valid);
+    $process = integrationBatchConsumerProcess([
+        'RABBITMQ_TEST_MAX_BYTES' => (string) $maxBytes,
+        'RABBITMQ_TEST_MAX_JOBS' => '4',
+    ]);
+
+    try {
+        $process->mustRun();
+        expect(file_get_contents($path))->toBe("batch:valid\nwrite:valid\n");
+        waitForQueueDepth($this->channels, $this->registry->queue('default')->deadLetterQueue, 3);
+    } finally {
+        $process->stop();
+        unlink($path);
+    }
+});
+
+test('terminating a partial batch leaves its delivery for redelivery', function () {
+    $path = tempnam(sys_get_temp_dir(), 'rabbitmq-batch-');
+    $this->queue->push(new BatchStorageJob($path, 'pending'));
+    $process = integrationBatchConsumerProcess([
+        'RABBITMQ_TEST_MAX_JOBS' => '10',
+        'RABBITMQ_TEST_MAX_WAIT' => '30',
+    ]);
+
+    try {
+        $process->start();
+        waitForUnacknowledgedBatchMessage($this->registry->queue('default')->physicalName, $process);
+        $process->signal(SIGTERM);
+        $process->wait();
+        expect($process->getExitCode())->toBe(0)
+            ->and(file_get_contents($path))->toBe('');
+        $redelivered = waitForRabbitJob($this->queue, 'default', 5);
+        expect($redelivered)->toBeInstanceOf(RabbitMQJob::class)
+            ->and($redelivered->getMessage()->isRedelivered())->toBeTrue();
+        $redelivered->delete();
+    } finally {
+        $process->stop();
+        unlink($path);
+    }
+});
+
+test('a batch timeout leaves active deliveries for redelivery', function () {
+    $path = tempnam(sys_get_temp_dir(), 'rabbitmq-batch-');
+    $this->queue->push(new BatchStorageJob($path, 'slow', sleepSeconds: 10));
+    $process = integrationBatchConsumerProcess([
+        'RABBITMQ_TEST_MAX_COUNT' => '1',
+        'RABBITMQ_TEST_TIMEOUT' => '1',
+    ]);
+
+    try {
+        try {
+            $process->run();
+        } catch (ProcessSignaledException $exception) {
+            expect($exception->getSignal())->toBe(SIGKILL);
+        }
+
+        expect($process->isSuccessful())->toBeFalse();
+        $redelivered = waitForRabbitJob($this->queue, 'default', 5);
+        expect($redelivered)->toBeInstanceOf(RabbitMQJob::class);
+        $redelivered->delete();
+    } finally {
+        $process->stop();
+        unlink($path);
+    }
+});
+
+test('killing an active batch handler leaves its delivery for redelivery', function () {
+    $path = tempnam(sys_get_temp_dir(), 'rabbitmq-batch-');
+    $this->queue->push(new BatchStorageJob($path, 'active', sleepSeconds: 10));
+    $process = integrationBatchConsumerProcess([
+        'RABBITMQ_TEST_MAX_COUNT' => '1',
+        'RABBITMQ_TEST_TIMEOUT' => '15',
+    ]);
+
+    try {
+        $process->start();
+        waitForMarker($path, 'batch:active', $process);
+        $process->signal(SIGKILL);
+        try {
+            $process->wait();
+        } catch (ProcessSignaledException) {
+        }
+
+        $redelivered = waitForRabbitJob($this->queue, 'default', 5);
+        expect($redelivered)->toBeInstanceOf(RabbitMQJob::class)
+            ->and($redelivered->getMessage()->isRedelivered())->toBeTrue()
+            ->and($redelivered->attempts())->toBe(1);
+        $redelivered->delete();
+    } finally {
+        $process->stop();
+        unlink($path);
+    }
+});
+
+test('a lost acknowledgement after a fake write permits redelivery', function () {
+    $path = tempnam(sys_get_temp_dir(), 'rabbitmq-batch-');
+    $this->queue->push(new BatchStorageJob($path, 'uncertain', disconnectBeforeReturn: true));
+    $process = integrationBatchConsumerProcess([
+        'RABBITMQ_TEST_MAX_COUNT' => '1',
+        'RABBITMQ_TEST_MAX_JOBS' => '1',
+    ]);
+
+    try {
+        $process->run();
+        expect(file_get_contents($path))->toContain("write:uncertain\n");
+        $redelivered = waitForRabbitJob($this->queue, 'default', 5);
+        expect($redelivered)->toBeInstanceOf(RabbitMQJob::class)
+            ->and($redelivered->getMessage()->isRedelivered())->toBeTrue();
+        $redelivered->delete();
+    } finally {
+        $process->stop();
+        unlink($path);
+    }
+});
+
+test('heartbeats keep a slow batch handler connected', function () {
+    config(['rabbitmq.consumer.heartbeat_sender' => true, 'rabbitmq.connections.default.options.heartbeat' => 2]);
+    $path = tempnam(sys_get_temp_dir(), 'rabbitmq-batch-');
+    $this->queue->push(new BatchStorageJob($path, 'heartbeat', sleepSeconds: 8));
+    $process = integrationBatchConsumerProcess([
+        'RABBITMQ_TEST_MAX_COUNT' => '1',
+        'RABBITMQ_TEST_TIMEOUT' => '15',
+    ]);
+
+    try {
+        $process->mustRun();
+        expect(file_get_contents($path))->toBe("batch:heartbeat\nwrite:heartbeat\n")
+            ->and($this->queue->size('default'))->toBe(0);
+    } finally {
+        $process->stop();
+        unlink($path);
+    }
+});
+
 /** @param array<string, string> $environment */
 function integrationConsumerProcess(array $environment = []): Process
 {
@@ -483,6 +711,48 @@ function integrationConsumerProcess(array $environment = []): Process
         array_merge(['RABBITMQ_TEST_CONFIG' => json_encode($settings, JSON_THROW_ON_ERROR)], $environment),
         timeout: 30,
     );
+}
+
+/** @param array<string, string> $environment */
+function integrationBatchConsumerProcess(array $environment = []): Process
+{
+    $settings = config('rabbitmq');
+    $settings['consumer']['heartbeat_sender'] ??= false;
+
+    return new Process(
+        [PHP_BINARY, dirname(__DIR__).'/Fixtures/batch-consumer-process.php'],
+        dirname(__DIR__, 2),
+        array_merge(['RABBITMQ_TEST_CONFIG' => json_encode($settings, JSON_THROW_ON_ERROR)], $environment),
+        timeout: 30,
+    );
+}
+
+function rabbitPayloadBytes(RabbitMQQueue $queue, object $job): int
+{
+    $method = new ReflectionMethod($queue, 'createPayload');
+
+    return strlen($method->invoke($queue, $job, 'default'));
+}
+
+function waitForUnacknowledgedBatchMessage(string $physicalQueue, Process $process): void
+{
+    $deadline = microtime(true) + 10;
+
+    do {
+        $details = app(ManagementClient::class)->queue($physicalQueue);
+
+        if (($details['messages_unacknowledged'] ?? 0) >= 1) {
+            return;
+        }
+
+        if (! $process->isRunning()) {
+            throw new RuntimeException('Batch consumer exited before it buffered a message: '.$process->getErrorOutput());
+        }
+
+        usleep(50000);
+    } while (microtime(true) < $deadline);
+
+    throw new RuntimeException('Batch consumer did not buffer the expected message.');
 }
 
 function waitForMarker(string $path, string $marker, Process $process): void

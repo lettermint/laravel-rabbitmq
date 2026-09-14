@@ -8,11 +8,17 @@ use Illuminate\Contracts\Queue\Job as QueueJobContract;
 use Illuminate\Queue\Jobs\Job;
 use Illuminate\Queue\QueueManager;
 use Illuminate\Queue\WorkerOptions;
+use Lettermint\RabbitMQ\Batch\BatchOptions;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Consumers\Consumer;
 use Lettermint\RabbitMQ\Consumers\RabbitMQWorker;
+use Lettermint\RabbitMQ\Events\BatchInterrupted;
+use Lettermint\RabbitMQ\Events\BatchItemSettled;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
 use Lettermint\RabbitMQ\Exceptions\PublishException;
+use Lettermint\RabbitMQ\Tests\Fixtures\Batch\BatchMarkerHandler;
+use Lettermint\RabbitMQ\Tests\Fixtures\Jobs\ProcessMarkerJob;
+use Lettermint\RabbitMQ\Tests\Fixtures\Jobs\SimpleJob;
 use Mockery\MockInterface;
 use PhpAmqpLib\Exception\AMQPIOException;
 use PhpAmqpLib\Exception\AMQPTimeoutException;
@@ -59,6 +65,86 @@ function makeConsumerForTest(): array
         $channel,
         $channelManager,
     ];
+}
+
+function batchMessage(string $value, int $tag): MockInterface
+{
+    $job = new SimpleJob($value);
+
+    return mockAMQPMessage([
+        'deliveryTag' => $tag,
+        'messageId' => 'batch-'.$tag,
+        'body' => json_encode([
+            'uuid' => 'batch-'.$tag,
+            'displayName' => SimpleJob::class,
+            'job' => 'Illuminate\\Queue\\CallQueuedHandler@call',
+            'maxTries' => null,
+            'maxExceptions' => null,
+            'backoff' => null,
+            'timeout' => null,
+            'retryUntil' => null,
+            'data' => [
+                'commandName' => SimpleJob::class,
+                'command' => serialize($job),
+            ],
+        ], JSON_THROW_ON_ERROR),
+    ]);
+}
+
+/**
+ * @param  list<MockInterface>  $messages
+ * @return array{Consumer, MockInterface}
+ */
+function makeBatchConsumerForTest(
+    array $messages,
+    bool $delayAfterDelivery = false,
+    ?Throwable $finalException = null,
+    bool $expectRegistration = true,
+): array {
+    config()->set('rabbitmq.recovery.max_attempts', 0);
+    $callback = null;
+    $waits = 0;
+    $channel = mockAMQPChannel();
+    if ($expectRegistration) {
+        $channel->shouldReceive('basic_consume')->once()->andReturnUsing(function (...$arguments) use (&$callback): string {
+            $callback = $arguments[6];
+
+            return 'batch-tag';
+        });
+    } else {
+        $channel->shouldNotReceive('basic_consume');
+    }
+    $channel->shouldReceive('wait')->andReturnUsing(function () use (&$messages, &$callback, &$waits, $delayAfterDelivery, $finalException): void {
+        $waits++;
+
+        if ($messages !== []) {
+            $message = array_shift($messages);
+            $callback($message);
+
+            return;
+        }
+
+        if ($delayAfterDelivery && $waits === 2) {
+            usleep(60000);
+        }
+
+        throw $finalException ?? new AMQPTimeoutException('empty');
+    });
+
+    $channelManager = Mockery::mock(ChannelManager::class);
+    $channelManager->shouldReceive('consumeChannel')->with('broker')->andReturn($channel);
+    $channelManager->shouldReceive('closeChannel')->with('consume', 'broker')->andReturnNull();
+    $queue = testRabbitMQQueue($channelManager, ['connection' => 'broker', 'strict_topology' => false]);
+    $queueManager = Mockery::mock(QueueManager::class);
+    $queueManager->shouldReceive('connection')->with('rabbitmq')->andReturn($queue);
+    $events = Mockery::mock(Dispatcher::class);
+    $events->shouldReceive('dispatch')->andReturnNull()->byDefault();
+    $events->shouldReceive('until')->andReturnNull()->byDefault();
+    $exceptions = Mockery::mock(ExceptionHandler::class);
+    $exceptions->shouldReceive('report')->andReturnNull()->byDefault();
+    $worker = new RabbitMQWorker($queueManager, $events, $exceptions, fn (): bool => false, fn (): null => null);
+
+    return [(new Consumer($channelManager, $queueManager, $worker))->setMaxMemory(1024), $channel];
 }
 
 test('rejects an empty queue list', function () {
@@ -257,4 +343,142 @@ test('does not hide a failed replacement publish', function () {
 
     expect(fn () => $worker->processMessage($job, 'rabbitmq', new WorkerOptions(maxTries: 0)))
         ->toThrow(PublishException::class, 'replacement publish failed');
+});
+
+test('batch mode derives prefetch from count and max jobs', function () {
+    BatchMarkerHandler::reset();
+    [$consumer, $channel] = makeBatchConsumerForTest([batchMessage('one', 1), batchMessage('two', 2)]);
+    $channel->shouldReceive('basic_qos')->once()->with(0, 2, false);
+
+    $consumer->setConnection('rabbitmq')
+        ->setQueue('default')
+        ->setMaxJobs(2)
+        ->consumeBatch(BatchMarkerHandler::class, new BatchOptions(10, 100000, 1));
+
+    expect(BatchMarkerHandler::$calls)->toBe(1)
+        ->and(BatchMarkerHandler::$sizes)->toBe([2]);
+});
+
+test('batch mode applies the memory limit before broker registration', function () {
+    BatchMarkerHandler::reset();
+    [$consumer] = makeBatchConsumerForTest([], expectRegistration: false);
+
+    $consumer->setConnection('rabbitmq')
+        ->setQueue('default')
+        ->setMaxMemory(1)
+        ->consumeBatch(BatchMarkerHandler::class, new BatchOptions(10, 100000, 1));
+
+    expect(BatchMarkerHandler::$calls)->toBe(0);
+});
+
+test('batch mode flushes before the next item exceeds the byte limit', function () {
+    BatchMarkerHandler::reset();
+    $first = batchMessage('one', 1);
+    $second = batchMessage('two', 2);
+    $limit = strlen($first->getBody()) + 1;
+    [$consumer] = makeBatchConsumerForTest([$first, $second]);
+
+    $consumer->setConnection('rabbitmq')
+        ->setQueue('default')
+        ->setMaxJobs(2)
+        ->consumeBatch(BatchMarkerHandler::class, new BatchOptions(10, $limit, 1));
+
+    expect(BatchMarkerHandler::$sizes)->toBe([1, 1]);
+});
+
+test('batch mode flushes a low-traffic item after its elapsed-time limit', function () {
+    BatchMarkerHandler::reset();
+    [$consumer] = makeBatchConsumerForTest([batchMessage('one', 1)], true);
+
+    $consumer->setConnection('rabbitmq')
+        ->setQueue('default')
+        ->setMaxJobs(1)
+        ->setWaitTimeout(1)
+        ->consumeBatch(BatchMarkerHandler::class, new BatchOptions(10, 100000, 0.05));
+
+    expect(BatchMarkerHandler::$sizes)->toBe([1]);
+});
+
+test('batch mode rejects malformed and unsupported deliveries without blocking a valid item', function () {
+    BatchMarkerHandler::reset();
+    $unsupportedJob = new ProcessMarkerJob('/tmp/not-used', 'unsupported');
+    $unsupported = mockAMQPMessage([
+        'deliveryTag' => 2,
+        'body' => json_encode([
+            'uuid' => 'unsupported',
+            'job' => 'Illuminate\\Queue\\CallQueuedHandler@call',
+            'data' => [
+                'commandName' => ProcessMarkerJob::class,
+                'command' => serialize($unsupportedJob),
+            ],
+        ], JSON_THROW_ON_ERROR),
+    ]);
+    $malformed = mockAMQPMessage(['deliveryTag' => 1, 'body' => '{']);
+    [$consumer] = makeBatchConsumerForTest([$malformed, $unsupported, batchMessage('valid', 3)]);
+    $reasons = [];
+    Event::listen(BatchItemSettled::class, function (BatchItemSettled $event) use (&$reasons): void {
+        $reasons[] = $event->reason;
+    });
+
+    $consumer->setConnection('rabbitmq')
+        ->setQueue('default')
+        ->setMaxJobs(3)
+        ->consumeBatch(BatchMarkerHandler::class, new BatchOptions(10, 100000, 1));
+
+    expect(BatchMarkerHandler::$sizes)->toBe([1])
+        ->and($reasons)->toContain('malformed', 'unsupported', 'handler_success');
+});
+
+test('batch mode rejects an oversized delivery without calling the handler', function () {
+    BatchMarkerHandler::reset();
+    [$consumer] = makeBatchConsumerForTest([batchMessage(str_repeat('x', 100), 1)]);
+    $reason = null;
+    Event::listen(BatchItemSettled::class, function (BatchItemSettled $event) use (&$reason): void {
+        $reason = $event->reason;
+    });
+
+    $consumer->setConnection('rabbitmq')
+        ->setQueue('default')
+        ->setMaxJobs(1)
+        ->consumeBatch(BatchMarkerHandler::class, new BatchOptions(10, 10, 1));
+
+    expect(BatchMarkerHandler::$calls)->toBe(0)
+        ->and($reason)->toBe('oversized');
+});
+
+test('batch mode leaves a partial batch unacknowledged after connection loss', function () {
+    BatchMarkerHandler::reset();
+    [$consumer] = makeBatchConsumerForTest(
+        [batchMessage('pending', 1)],
+        finalException: new AMQPIOException('connection lost'),
+    );
+    $interrupted = null;
+    Event::listen(BatchInterrupted::class, function (BatchInterrupted $event) use (&$interrupted): void {
+        $interrupted = $event;
+    });
+
+    expect(fn () => $consumer->setConnection('rabbitmq')
+        ->setQueue('default')
+        ->consumeBatch(BatchMarkerHandler::class, new BatchOptions(10, 100000, 30)))
+        ->toThrow(ConnectionException::class);
+
+    expect(BatchMarkerHandler::$calls)->toBe(0)
+        ->and($interrupted)->toBeInstanceOf(BatchInterrupted::class)
+        ->and($interrupted->settled)->toBe(0)
+        ->and($interrupted->unacknowledged)->toBe(1);
+});
+
+test('batch mode requires one queue and a non-shared handler', function () {
+    [$consumer] = makeBatchConsumerForTest([], expectRegistration: false);
+    expect(fn () => $consumer->setQueues(['one', 'two'])->consumeBatch(
+        BatchMarkerHandler::class,
+        new BatchOptions(1, 1, 1),
+    ))->toThrow(InvalidArgumentException::class, 'exactly one queue');
+
+    app()->singleton(BatchMarkerHandler::class);
+    [$consumer] = makeBatchConsumerForTest([], expectRegistration: false);
+    expect(fn () => $consumer->setQueue('one')->consumeBatch(
+        BatchMarkerHandler::class,
+        new BatchOptions(1, 1, 1),
+    ))->toThrow(InvalidArgumentException::class, 'cannot be a singleton');
 });
