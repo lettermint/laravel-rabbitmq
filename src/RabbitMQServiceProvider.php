@@ -9,10 +9,13 @@ use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Queue\QueueManager;
 use Illuminate\Support\Facades\Facade;
 use Illuminate\Support\ServiceProvider;
+use Lettermint\RabbitMQ\Batch\BatchItemFactory;
+use Lettermint\RabbitMQ\Batch\BatchProcessor;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Connection\ConnectionManager;
 use Lettermint\RabbitMQ\Console\Commands\AuditCommand;
 use Lettermint\RabbitMQ\Console\Commands\CacheTopologyCommand;
+use Lettermint\RabbitMQ\Console\Commands\ConsumeBatchCommand;
 use Lettermint\RabbitMQ\Console\Commands\ConsumeCommand;
 use Lettermint\RabbitMQ\Console\Commands\DeclareCommand;
 use Lettermint\RabbitMQ\Console\Commands\DelayCleanupCommand;
@@ -202,11 +205,26 @@ class RabbitMQServiceProvider extends ServiceProvider
             return $worker;
         });
 
+        $this->app->bind(BatchItemFactory::class, function ($app) {
+            return new BatchItemFactory($app);
+        });
+
+        $this->app->bind(BatchProcessor::class, function ($app) {
+            return new BatchProcessor(
+                container: $app,
+                events: $app['events'],
+                worker: $app[RabbitMQWorker::class],
+            );
+        });
+
         $this->app->singleton(Consumer::class, function ($app) {
             return new Consumer(
                 channelManager: $app[ChannelManager::class],
                 queueManager: $app['queue'],
                 worker: $app[RabbitMQWorker::class],
+                batchProcessor: $app[BatchProcessor::class],
+                batchItemFactory: $app[BatchItemFactory::class],
+                events: $app['events'],
             );
         });
     }
@@ -253,6 +271,7 @@ class RabbitMQServiceProvider extends ServiceProvider
         if ($this->app->runningInConsole()) {
             $this->commands([
                 ConsumeCommand::class,
+                ConsumeBatchCommand::class,
                 DelayCleanupCommand::class,
                 WorkerStatusCommand::class,
                 AuditCommand::class,

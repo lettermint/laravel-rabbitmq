@@ -8,6 +8,7 @@ use Illuminate\Queue\QueueManager;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Consumers\Consumer;
 use Lettermint\RabbitMQ\Consumers\RabbitMQWorker;
+use Lettermint\RabbitMQ\Tests\Fixtures\Batch\BatchMarkerHandler;
 use PhpAmqpLib\Exception\AMQPTimeoutException;
 
 /** @param list<string> $expectedQueues */
@@ -62,4 +63,30 @@ it('accepts a single queue argument', function () {
         '--stop-when-empty' => true,
         '--max-memory' => 1024,
     ])->assertExitCode(0);
+});
+
+it('keeps batch consumption behind a separate command with explicit limits', function () {
+    $consumer = commandConsumer(['default']);
+    app()->instance(Consumer::class, $consumer);
+
+    $this->artisan('rabbitmq:consume-batch', [
+        'queue' => 'default',
+        '--handler' => BatchMarkerHandler::class,
+        '--max-count' => 25,
+        '--max-bytes' => 4096,
+        '--max-wait' => 0.25,
+        '--stop-when-empty' => true,
+        '--max-memory' => 1024,
+    ])->assertExitCode(0);
+});
+
+it('requires a batch handler and all batch limits', function () {
+    $this->artisan('rabbitmq:consume-batch', [
+        'queue' => 'default',
+    ])->assertExitCode(2);
+
+    $this->artisan('rabbitmq:consume-batch', [
+        'queue' => 'default',
+        '--handler' => BatchMarkerHandler::class,
+    ])->assertExitCode(1);
 });
