@@ -319,7 +319,7 @@ class ConnectionManager
             if (isset($this->connections[$name]) && $this->connections[$name]->isConnected()) {
                 $this->connections[$name]->close();
             }
-        } catch (AMQPIOException|AMQPConnectionClosedException $e) {
+        } catch (AMQPIOException|AMQPConnectionClosedException|AMQPRuntimeException $e) {
             Log::debug('Connection close during disconnect (expected during cleanup)', [
                 'connection' => $name,
                 'error' => $e->getMessage(),

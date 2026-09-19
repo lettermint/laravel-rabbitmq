@@ -94,6 +94,7 @@ class ChannelManager
      */
     public function publishChannel(?string $connection = null): AMQPChannel
     {
+        $this->refreshIdlePublisherConnection($connection);
         $channel = $this->channel('publish', $connection);
         $channelId = spl_object_id($channel);
 
@@ -131,7 +132,47 @@ class ChannelManager
      */
     public function topologyChannel(?string $connection = null): AMQPChannel
     {
+        $this->refreshIdlePublisherConnection($connection);
+
         return $this->channel('topology', $connection);
+    }
+
+    /**
+     * A publisher has no consumer loop to send heartbeats while it is idle.
+     * Replace its connection before an operation if a heartbeat interval passed.
+     * Other channel purposes can hold unacknowledged deliveries and must retain
+     * their connection until the consumer settles them or handles its failure.
+     */
+    protected function refreshIdlePublisherConnection(?string $connection): void
+    {
+        $connection ??= $this->connectionManager->getDefaultConnection();
+
+        foreach ($this->channelMetadata as $metadata) {
+            if ($metadata['connection'] === $connection
+                && ! in_array($metadata['purpose'], ['publish', 'topology'], true)) {
+                return;
+            }
+        }
+
+        $amqpConnection = $this->connectionManager->connection($connection);
+        $heartbeat = $amqpConnection->getHeartbeat();
+
+        if ($heartbeat <= 0
+            || microtime(true) - $amqpConnection->getLastActivity() < $heartbeat / 2) {
+            return;
+        }
+
+        foreach ($this->channelMetadata as $key => $metadata) {
+            if ($metadata['connection'] === $connection) {
+                unset(
+                    $this->publisherConfirmChannels[spl_object_id($this->channels[$key])],
+                    $this->channels[$key],
+                    $this->channelMetadata[$key],
+                );
+            }
+        }
+
+        $this->connectionManager->recover($connection);
     }
 
     /**

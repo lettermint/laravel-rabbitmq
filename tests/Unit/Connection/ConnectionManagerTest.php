@@ -6,6 +6,7 @@ use Illuminate\Support\Facades\Log;
 use Lettermint\RabbitMQ\Connection\ConnectionManager;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
 use PhpAmqpLib\Connection\AbstractConnection;
+use PhpAmqpLib\Exception\AMQPHeartbeatMissedException;
 use PhpAmqpLib\Exception\AMQPIOException;
 
 test('returns default connection name from config', function () {
@@ -197,4 +198,26 @@ test('disconnects specific connection', function () {
     $manager->disconnect('test');
 
     expect($manager->isConnected('test'))->toBeFalse();
+});
+
+test('recovers after the stale connection throws a heartbeat error during close', function () {
+    $stale = mockAMQPConnection();
+    $stale->shouldReceive('close')->once()->andThrow(new AMQPHeartbeatMissedException('Missed server heartbeat'));
+    $replacement = mockAMQPConnection();
+    $manager = new class([], [$stale, $replacement]) extends ConnectionManager
+    {
+        public function __construct(array $config, private array $connectionsToCreate)
+        {
+            parent::__construct($config);
+        }
+
+        protected function createConnection(string $name): AbstractConnection
+        {
+            return array_shift($this->connectionsToCreate);
+        }
+    };
+    $manager->connection();
+
+    expect($manager->recover())->toBe($replacement)
+        ->and($manager->connection())->toBe($replacement);
 });

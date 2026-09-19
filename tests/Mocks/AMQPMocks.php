@@ -30,6 +30,7 @@ class AMQPMocks
         $mock->shouldReceive('close')->andReturn(null)->byDefault();
 
         $mock->shouldReceive('getHeartbeat')->andReturn($heartbeat)->byDefault();
+        $mock->shouldReceive('getLastActivity')->andReturnUsing(fn (): float => microtime(true))->byDefault();
         $mock->shouldReceive('channel')->andReturn(self::channel($mock))->byDefault();
 
         return $mock;
