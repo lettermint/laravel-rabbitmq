@@ -308,6 +308,14 @@ class RabbitMQJob extends Job implements JobContract
 
     public function rejectMalformed(Throwable $exception): void
     {
+        $this->rejectWithoutHandling($exception);
+    }
+
+    /**
+     * Reject a delivery that cannot enter either processing path.
+     */
+    public function rejectWithoutHandling(Throwable $exception): void
+    {
         $this->failureException = $exception;
         $this->markAsFailed();
         $this->delete();

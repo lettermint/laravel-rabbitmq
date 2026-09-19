@@ -4,16 +4,29 @@ declare(strict_types=1);
 
 namespace Lettermint\RabbitMQ\Consumers;
 
+use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Queue\Events\WorkerStopping;
 use Illuminate\Queue\QueueManager;
 use Illuminate\Queue\WorkerOptions;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Log;
 use InvalidArgumentException;
+use Lettermint\RabbitMQ\Batch\BatchBuffer;
+use Lettermint\RabbitMQ\Batch\BatchItemFactory;
+use Lettermint\RabbitMQ\Batch\BatchOptions;
+use Lettermint\RabbitMQ\Batch\BatchProcessor;
+use Lettermint\RabbitMQ\Batch\PendingBatchItem;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Connection\HeartbeatSender;
+use Lettermint\RabbitMQ\Contracts\BatchHandler;
+use Lettermint\RabbitMQ\Enums\BatchItemOutcome;
+use Lettermint\RabbitMQ\Events\BatchInterrupted;
+use Lettermint\RabbitMQ\Events\BatchItemSettled;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
+use Lettermint\RabbitMQ\Exceptions\MalformedBatchMessageException;
+use Lettermint\RabbitMQ\Exceptions\OversizedBatchMessageException;
 use Lettermint\RabbitMQ\Exceptions\PublishException;
+use Lettermint\RabbitMQ\Exceptions\UnsupportedBatchJobException;
 use Lettermint\RabbitMQ\Monitoring\WorkerStatus;
 use Lettermint\RabbitMQ\Queue\RabbitMQJob;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
@@ -26,6 +39,8 @@ use PhpAmqpLib\Exception\AMQPProtocolChannelException;
 use PhpAmqpLib\Exception\AMQPRuntimeException;
 use PhpAmqpLib\Exception\AMQPTimeoutException;
 use PhpAmqpLib\Message\AMQPMessage;
+use ReflectionClass;
+use ReflectionMethod;
 use Throwable;
 
 final class Consumer
@@ -78,11 +93,45 @@ final class Consumer
 
     protected bool $heartbeatStopListenerRegistered = false;
 
+    protected ?BatchOptions $batchOptions = null;
+
+    /** @var class-string<BatchHandler>|null */
+    protected ?string $batchHandler = null;
+
+    /** @var list<class-string> */
+    protected array $supportedBatchJobs = [];
+
+    protected ?BatchBuffer $batchBuffer = null;
+
     public function __construct(
         protected ChannelManager $channelManager,
         protected QueueManager $queueManager,
         protected RabbitMQWorker $worker,
+        protected ?BatchProcessor $batchProcessor = null,
+        protected ?BatchItemFactory $batchItemFactory = null,
+        protected ?Dispatcher $events = null,
     ) {}
+
+    /**
+     * Consume one queue through an explicit application batch handler.
+     *
+     * @param  class-string<BatchHandler>  $handler
+     */
+    public function consumeBatch(string $handler, BatchOptions $options): void
+    {
+        $this->validateBatchConfiguration($handler);
+        $this->batchHandler = $handler;
+        $this->batchOptions = $options;
+
+        try {
+            $this->consume();
+        } finally {
+            $this->batchHandler = null;
+            $this->batchOptions = null;
+            $this->supportedBatchJobs = [];
+            $this->batchBuffer = null;
+        }
+    }
 
     /**
      * Consume messages and recover a failed broker connection within configured limits.
@@ -123,7 +172,7 @@ final class Consumer
                         return;
                     }
                 } catch (AMQPIOException|AMQPChannelClosedException|AMQPConnectionClosedException|AMQPProtocolChannelException|AMQPRuntimeException|ConnectionException|PublishException $exception) {
-                    $this->cleanup();
+                    $this->cleanup('connection_loss');
 
                     if ($this->shouldQuit) {
                         return;
@@ -155,7 +204,7 @@ final class Consumer
                 }
             }
         } finally {
-            $this->cleanup();
+            $this->cleanup($this->stopReason());
             app(WorkerStatus::class)->write('stopping', false);
         }
     }
@@ -164,8 +213,10 @@ final class Consumer
     {
         $this->channel = $this->channelManager->consumeChannel($this->brokerConnection);
         $this->startHeartbeatSender();
-        $this->channel->basic_qos(0, $this->prefetch, false);
+        $prefetch = $this->batchOptions === null ? $this->prefetch : $this->batchPrefetch();
+        $this->channel->basic_qos(0, $prefetch, false);
         $this->consumerTags = [];
+        $this->batchBuffer = $this->batchOptions === null ? null : new BatchBuffer($this->batchOptions);
 
         foreach ($this->queues as $queue) {
             $physicalQueue = $this->rabbitmq()->physicalQueue($queue);
@@ -177,6 +228,12 @@ final class Consumer
                 false,
                 false,
                 function (AMQPMessage $message) use ($queue): void {
+                    if ($this->batchOptions !== null) {
+                        $this->handleBatchMessage($message, $queue);
+
+                        return;
+                    }
+
                     $this->handleMessage($message, $queue);
                 },
             );
@@ -185,26 +242,40 @@ final class Consumer
         Log::info('RabbitMQ consumer started', [
             'connection' => $this->connection,
             'queues' => $this->queues,
-            'prefetch' => $this->prefetch,
+            'prefetch' => $prefetch,
+            'batch' => $this->batchOptions !== null,
         ]);
 
         while ($this->channel->is_consuming() && ! $this->shouldQuit) {
-            app(WorkerStatus::class)->write('idle', true);
+            app(WorkerStatus::class)->write($this->batchBuffer?->isEmpty() === false ? 'buffering' : 'idle', true);
             if ($this->shouldStop()) {
                 break;
             }
 
             if (! $this->worker->mayRun($this->workerOptions(), $this->connection, $this->queueLabel())) {
-                $this->cleanup();
+                $this->cleanup('paused');
                 app(WorkerStatus::class)->write('paused', false);
 
                 return false;
             }
 
+            if ($this->batchBuffer?->expired()) {
+                $this->flushBatch();
+
+                if ($this->shouldStop()) {
+                    break;
+                }
+            }
+
             try {
-                $this->channel->wait(null, false, $this->waitTimeout);
+                $timeout = $this->batchBuffer?->nextWaitTimeout($this->waitTimeout) ?? $this->waitTimeout;
+                $this->channel->wait(null, false, $timeout);
             } catch (AMQPTimeoutException) {
                 if ($this->stopWhenEmpty) {
+                    if ($this->batchBuffer?->isEmpty() === false) {
+                        $this->flushBatch();
+                    }
+
                     break;
                 }
             }
@@ -242,6 +313,131 @@ final class Consumer
         if ($this->rest > 0) {
             $this->sleep($this->rest);
         }
+    }
+
+    protected function handleBatchMessage(AMQPMessage $message, string $queue): void
+    {
+        if ($this->shouldQuit || $this->worker->paused || $this->shouldStop() || (app()->isDownForMaintenance() && ! $this->force)) {
+            return;
+        }
+
+        $job = $this->makeJob($message, $queue);
+        $payloadBytes = strlen($job->getRawBody());
+
+        if ($payloadBytes > $this->batchOptions()->maxBytes) {
+            $this->rejectBatchDelivery(
+                $job,
+                new OversizedBatchMessageException('The delivery is larger than the batch payload byte limit.'),
+                'oversized',
+            );
+
+            return;
+        }
+
+        try {
+            $item = $this->batchItemFactory()->make($job, $this->supportedBatchJobs);
+        } catch (UnsupportedBatchJobException $exception) {
+            $this->rejectBatchDelivery($job, $exception, 'unsupported');
+
+            return;
+        } catch (Throwable $exception) {
+            $malformed = $exception instanceof MalformedBatchMessageException
+                ? $exception
+                : new MalformedBatchMessageException('The batch delivery cannot be restored.', previous: $exception);
+            $this->rejectBatchDelivery($job, $malformed, 'malformed');
+
+            return;
+        }
+
+        if (! in_array($item->job::class, $this->supportedBatchJobs, true)) {
+            $this->rejectBatchDelivery(
+                $job,
+                new UnsupportedBatchJobException('The configured batch handler does not support this job class.'),
+                'unsupported',
+            );
+
+            return;
+        }
+
+        if ($this->batchBuffer()->wouldExceedBytes($item->payloadBytes)) {
+            $this->flushBatch();
+        }
+
+        if ($this->maximumBatchCount() < 1) {
+            return;
+        }
+
+        $this->batchBuffer()->append(new PendingBatchItem($job, $item));
+        app(WorkerStatus::class)->write('buffering', true);
+
+        if ($this->batchBuffer()->reachedLimit($this->maximumBatchCount())) {
+            $this->flushBatch();
+        }
+    }
+
+    protected function flushBatch(): void
+    {
+        if ($this->batchBuffer?->isEmpty() !== false) {
+            return;
+        }
+
+        $batch = $this->batchBuffer->drain();
+        $timeout = $this->jobTimeout;
+        app(WorkerStatus::class)->write('processing', true, time() + $timeout);
+
+        $this->batchProcessor()->process(
+            batch: $batch,
+            handlerClass: $this->batchHandler(),
+            connection: $this->connection,
+            workerOptions: $this->workerOptions(),
+            batchOptions: $this->batchOptions(),
+            afterSettlement: function (PendingBatchItem $_pending, BatchItemOutcome $_outcome): void {
+                $this->jobsProcessed++;
+            },
+        );
+
+        app(WorkerStatus::class)->write('idle', true);
+
+        if ($this->rest > 0) {
+            $this->sleep($this->rest);
+        }
+    }
+
+    protected function rejectBatchDelivery(RabbitMQJob $job, Throwable $exception, string $reason): void
+    {
+        $started = hrtime(true);
+        $job->rejectWithoutHandling($exception);
+        $settlementMilliseconds = (hrtime(true) - $started) / 1_000_000;
+        $this->jobsProcessed++;
+
+        $this->dispatch(new BatchItemSettled(
+            batchId: null,
+            connection: $this->connection,
+            queue: $job->getQueue(),
+            jobId: $job->getJobId(),
+            jobClass: $job->resolveName(),
+            attempt: $job->attempts(),
+            brokerDeliveryCount: $job->brokerDeliveryCount(),
+            redelivered: $job->getMessage()->isRedelivered(),
+            messageTimestamp: $job->getTimestamp(),
+            payloadBytes: strlen($job->getRawBody()),
+            outcome: BatchItemOutcome::Failure,
+            reason: $reason,
+            processingMilliseconds: 0,
+            settlementMilliseconds: $settlementMilliseconds,
+        ));
+    }
+
+    protected function makeJob(AMQPMessage $message, string $queue): RabbitMQJob
+    {
+        return new RabbitMQJob(
+            container: app(),
+            rabbitmq: $this->rabbitmq(),
+            channel: $message->getChannel(),
+            message: $message,
+            connectionName: $this->connection,
+            queueName: $queue,
+        );
     }
 
     protected function resolveQueueConnection(): void
@@ -288,8 +484,9 @@ final class Consumer
         );
     }
 
-    protected function cleanup(): void
+    protected function cleanup(string $reason = 'consumer_stopped'): void
     {
+        $this->abandonBufferedBatch($reason);
         $this->stopHeartbeatSender();
 
         if ($this->channel !== null && $this->channel->is_open()) {
@@ -325,6 +522,31 @@ final class Consumer
         }
 
         return (memory_get_usage(true) / 1024 / 1024) >= $this->maxMemory;
+    }
+
+    protected function stopReason(): string
+    {
+        if ($this->shouldQuit) {
+            return 'signal';
+        }
+
+        if ($this->worker->restartRequested()) {
+            return 'restart';
+        }
+
+        if ($this->maxJobs > 0 && $this->jobsProcessed >= $this->maxJobs) {
+            return 'max_jobs';
+        }
+
+        if ($this->maxTime > 0 && $this->startTime?->diffInSeconds(Carbon::now()) >= $this->maxTime) {
+            return 'max_time';
+        }
+
+        if ((memory_get_usage(true) / 1024 / 1024) >= $this->maxMemory) {
+            return 'max_memory';
+        }
+
+        return $this->stopWhenEmpty ? 'queue_empty' : 'consumer_stopped';
     }
 
     protected function sleep(int $seconds): void
@@ -413,6 +635,118 @@ final class Consumer
     protected function queueLabel(): string
     {
         return implode(', ', $this->queues);
+    }
+
+    /** @param class-string<BatchHandler> $handler */
+    protected function validateBatchConfiguration(string $handler): void
+    {
+        if (count($this->queues) !== 1) {
+            throw new InvalidArgumentException('A batch consumer must consume exactly one queue.');
+        }
+
+        if (! class_exists($handler) || ! is_subclass_of($handler, BatchHandler::class)) {
+            throw new InvalidArgumentException("Batch handler [{$handler}] must implement ".BatchHandler::class.'.');
+        }
+
+        if (! (new ReflectionClass($handler))->isInstantiable()) {
+            throw new InvalidArgumentException("Batch handler [{$handler}] must be instantiable.");
+        }
+
+        if (app()->isShared($handler)) {
+            throw new InvalidArgumentException("Batch handler [{$handler}] cannot be a singleton or scoped binding.");
+        }
+
+        $jobs = (new ReflectionMethod($handler, 'jobClasses'))->invoke(null);
+
+        if (! is_array($jobs) || ! array_is_list($jobs) || $jobs === []) {
+            throw new InvalidArgumentException('A batch handler must support at least one job class.');
+        }
+
+        foreach ($jobs as $job) {
+            if (! is_string($job) || $job === '' || ! class_exists($job)) {
+                throw new InvalidArgumentException('Each supported batch job must be an existing class name.');
+            }
+        }
+
+        if (count(array_unique($jobs)) !== count($jobs)) {
+            throw new InvalidArgumentException('Supported batch job classes must be unique.');
+        }
+
+        $this->supportedBatchJobs = $jobs;
+    }
+
+    protected function batchPrefetch(): int
+    {
+        return max(1, $this->maximumBatchCount());
+    }
+
+    protected function maximumBatchCount(): int
+    {
+        if ($this->maxJobs === 0) {
+            return $this->batchOptions()->maxCount;
+        }
+
+        return min($this->batchOptions()->maxCount, $this->remainingJobs());
+    }
+
+    protected function remainingJobs(): int
+    {
+        return $this->maxJobs > 0 ? max(0, $this->maxJobs - $this->jobsProcessed) : 0;
+    }
+
+    protected function abandonBufferedBatch(string $reason): void
+    {
+        if ($this->batchBuffer?->isEmpty() !== false) {
+            return;
+        }
+
+        $batch = $this->batchBuffer->drain();
+        $this->dispatch(new BatchInterrupted(
+            batchId: $batch->id,
+            connection: $this->connection,
+            queue: $batch->items[0]->item->queue,
+            size: count($batch->items),
+            payloadBytes: $batch->payloadBytes,
+            settled: 0,
+            unacknowledged: count($batch->items),
+            reason: $reason,
+            collectionMilliseconds: $batch->collectionMilliseconds,
+        ));
+    }
+
+    protected function batchOptions(): BatchOptions
+    {
+        return $this->batchOptions ?? throw new InvalidArgumentException('Batch options are not configured.');
+    }
+
+    /** @return class-string<BatchHandler> */
+    protected function batchHandler(): string
+    {
+        return $this->batchHandler ?? throw new InvalidArgumentException('A batch handler is not configured.');
+    }
+
+    protected function batchBuffer(): BatchBuffer
+    {
+        return $this->batchBuffer ?? throw new InvalidArgumentException('The batch buffer is not active.');
+    }
+
+    protected function batchProcessor(): BatchProcessor
+    {
+        return $this->batchProcessor ??= app(BatchProcessor::class);
+    }
+
+    protected function batchItemFactory(): BatchItemFactory
+    {
+        return $this->batchItemFactory ??= app(BatchItemFactory::class);
+    }
+
+    protected function dispatch(object $event): void
+    {
+        try {
+            ($this->events ??= app(Dispatcher::class))->dispatch($event);
+        } catch (Throwable $exception) {
+            ExceptionReporter::report($exception);
+        }
     }
 
     public function setQueue(string $queue): self

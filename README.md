@@ -77,6 +77,8 @@ php artisan rabbitmq:declare
 php artisan rabbitmq:consume default --connection=rabbitmq --tries=3 --timeout=60
 ```
 
+For an explicit application batch handler, use the separate `rabbitmq:consume-batch` command. Normal consumers keep their current single-job behavior. See [batch consumption](docs/batch-consumption.md).
+
 Dispatch your existing Laravel jobs:
 
 ```php
@@ -117,7 +119,7 @@ php artisan rabbitmq:probe --all --connection=rabbitmq --wait=60 --json
 
 Health checks test broker access. Probes with `--wait` require replies from the current run. For process readiness and liveness, configure a separate `RABBITMQ_WORKER_STATUS_FILE` for each worker and use `rabbitmq:worker-status`.
 
-Use broker metrics for queue state and structured lifecycle logs for job outcomes. The package includes no metric storage or monitoring dashboard. See [worker and queue operations](docs/operations.md) for shutdown, retries, delayed queues, health checks, and delivery limits.
+Use broker metrics for queue state and structured lifecycle logs for job outcomes. The package includes no metric storage or monitoring dashboard. See [worker and queue operations](docs/operations.md) for shutdown, retries, delayed queues, health checks, and delivery limits. See [batch consumption](docs/batch-consumption.md) for optional collection and batch settlement.
 
 ## Upgrading
 
