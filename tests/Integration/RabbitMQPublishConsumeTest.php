@@ -22,6 +22,7 @@ use Lettermint\RabbitMQ\Consumers\Consumer;
 use Lettermint\RabbitMQ\Consumers\RabbitMQWorker;
 use Lettermint\RabbitMQ\Diagnostics\QueueProbeJob;
 use Lettermint\RabbitMQ\Events\MessagePublished;
+use Lettermint\RabbitMQ\Events\MessagePublishFailed;
 use Lettermint\RabbitMQ\Events\QueueProbeProcessed;
 use Lettermint\RabbitMQ\Exceptions\PublishException;
 use Lettermint\RabbitMQ\Exceptions\SettlementException;
@@ -190,6 +191,50 @@ test('a delayed publish uses a TTL queue and returns to the main route', functio
         ->and(json_decode($job->getRawBody(), true)['uuid'])->toBe('delayed-1');
     $job->delete();
 });
+
+test('an idle publisher resumes confirmed publishing without losing or duplicating jobs', function (int $delay, int $heartbeat) {
+    $heartbeatOverride = getenv('RABBITMQ_TEST_PUBLISHER_HEARTBEAT');
+    $heartbeat = $heartbeatOverride === false ? $heartbeat : (int) $heartbeatOverride;
+    config(['rabbitmq.connections.default.options.heartbeat' => $heartbeat]);
+    $this->channels->closeAll();
+    app(ConnectionManager::class)->disconnectAll();
+    $publisher = integrationQueueAtPort((int) env('RABBITMQ_PORT', 5672));
+    $signals = [SIGALRM, SIGTERM, SIGUSR1, SIGUSR2];
+    $signalHandlers = array_map(pcntl_signal_get_handler(...), $signals);
+    $failures = [];
+    Event::listen(MessagePublishFailed::class, function (MessagePublishFailed $event) use (&$failures): void {
+        $failures[] = $event;
+    });
+
+    if ($delay > 0) {
+        $exchange = $this->registry->exchanges()['jobs']['name'];
+        $suffix = substr(hash('sha256', $exchange."\0default"), 0, 12);
+        $this->cleanupQueues[] = $this->integrationPrefix.'delay-v2:default:1000:'.$suffix;
+    }
+
+    try {
+        foreach (['before-idle', 'after-idle', 'after-second-idle'] as $index => $id) {
+            if ($index > 0) {
+                sleep(max(6, $heartbeat * 2 + 2));
+            }
+
+            $publisher->pushRaw(json_encode(['uuid' => $id], JSON_THROW_ON_ERROR), 'default', ['delay' => $delay]);
+        }
+
+        foreach (['before-idle', 'after-idle', 'after-second-idle'] as $id) {
+            $job = waitForRabbitJob($this->queue, 'default');
+            expect($job)->toBeInstanceOf(RabbitMQJob::class)
+                ->and($job->getJobId())->toBe($id);
+            $job->delete();
+        }
+
+        expect($this->queue->pop('default'))->toBeNull()
+            ->and($failures)->toBeEmpty()
+            ->and(array_map(pcntl_signal_get_handler(...), $signals))->toBe($signalHandlers);
+    } finally {
+        $publisher->getChannelManager()->closeAll();
+    }
+})->with(['immediate' => [0, 2], 'delayed' => [1, 2], 'heartbeats disabled' => [0, 0]]);
 
 test('a Laravel retry preserves its exception in the replacement message', function () {
     $this->queue->push(new ThrowingJob, '', 'default');
@@ -681,6 +726,26 @@ test('heartbeats keep a long job connected until its single acknowledgement', fu
         $process->mustRun();
         expect(file_get_contents($path))->toBe("started:long\ncompleted:long\n")
             ->and($this->queue->size('default'))->toBe(0);
+    } finally {
+        $process->stop();
+        unlink($path);
+    }
+});
+
+test('a native consumer can publish after a long job and acknowledge its original delivery', function () {
+    config(['rabbitmq.consumer.heartbeat_sender' => true, 'rabbitmq.connections.default.options.heartbeat' => 2]);
+    $path = tempnam(sys_get_temp_dir(), 'rabbitmq-marker-');
+    $this->queue->push(new ProcessMarkerJob($path, 'native-publisher', 8, publishId: 'native-follow-up'));
+    $process = integrationConsumerProcess(['RABBITMQ_TEST_TIMEOUT' => '15']);
+
+    try {
+        $process->mustRun();
+        expect(file_get_contents($path))->toBe("started:native-publisher\ncompleted:native-publisher\n");
+        $followUp = waitForRabbitJob($this->queue, 'default');
+        expect($followUp)->toBeInstanceOf(RabbitMQJob::class)
+            ->and($followUp->getJobId())->toBe('native-follow-up');
+        $followUp->delete();
+        expect($this->queue->pop('default'))->toBeNull();
     } finally {
         $process->stop();
         unlink($path);

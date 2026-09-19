@@ -5,6 +5,7 @@ declare(strict_types=1);
 use Illuminate\Container\Container;
 use Illuminate\Contracts\Events\Dispatcher;
 use Lettermint\RabbitMQ\Connection\ChannelManager;
+use Lettermint\RabbitMQ\Connection\ConnectionManager;
 use Lettermint\RabbitMQ\Contracts\HasPriority;
 use Lettermint\RabbitMQ\Events\MessagePublished;
 use Lettermint\RabbitMQ\Events\MessagePublishFailed;
@@ -17,6 +18,7 @@ use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
 use Lettermint\RabbitMQ\Tests\Fixtures\Jobs\PriorityJob;
 use Lettermint\RabbitMQ\Tests\Fixtures\Jobs\RoutedJob;
 use Lettermint\RabbitMQ\Tests\Fixtures\Jobs\SimpleJob;
+use PhpAmqpLib\Exception\AMQPHeartbeatMissedException;
 use PhpAmqpLib\Exception\AMQPIOException;
 use PhpAmqpLib\Exception\AMQPTimeoutException;
 use PhpAmqpLib\Message\AMQPMessage;
@@ -120,6 +122,37 @@ test('reuses the publisher channel for multiple confirmed publishes', function (
 
     $this->queue->pushRaw('{"uuid":"job-1"}', 'default');
     $this->queue->pushRaw('{"uuid":"job-2"}', 'default');
+});
+
+test('does not repeat a publish when the write reports a missed heartbeat', function () {
+    $this->channel->shouldReceive('basic_publish')->once()->andThrow(new AMQPHeartbeatMissedException('Missed server heartbeat'));
+    $this->channel->shouldNotReceive('wait_for_pending_acks_returns');
+
+    try {
+        $this->queue->pushRaw('{"uuid":"uncertain-heartbeat"}', 'default');
+        $this->fail('A failed write must not report a successful publish.');
+    } catch (PublishException $exception) {
+        expect($exception->uncertain)->toBeTrue()
+            ->and($exception->getPrevious())->toBeInstanceOf(AMQPHeartbeatMissedException::class);
+    }
+});
+
+test('a failed idle reconnect is a definite failure before publication', function () {
+    $stale = mockAMQPConnection();
+    $stale->shouldReceive('getLastActivity')->andReturn(microtime(true) - 180);
+    $stale->shouldNotReceive('channel');
+    $connections = Mockery::mock(ConnectionManager::class);
+    $connections->shouldReceive('connection')->with('broker')->andReturn($stale);
+    $connections->shouldReceive('recover')->once()->with('broker')->andThrow(new ConnectionException('Broker unavailable'));
+    $queue = testRabbitMQQueue(new ChannelManager($connections), $this->config, $this->registry);
+
+    try {
+        $queue->pushRaw('{"uuid":"not-published"}', 'default');
+        $this->fail('A failed reconnect must not report a successful publish.');
+    } catch (PublishException $exception) {
+        expect($exception->uncertain)->toBeFalse()
+            ->and($exception->getPrevious())->toBeInstanceOf(ConnectionException::class);
+    }
 });
 
 test('fails a returned unroutable publish and emits a failure event', function () {

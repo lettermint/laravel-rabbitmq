@@ -6,6 +6,7 @@ use Lettermint\RabbitMQ\Connection\ChannelManager;
 use Lettermint\RabbitMQ\Connection\ConnectionManager;
 use Lettermint\RabbitMQ\Exceptions\ConnectionException;
 use PhpAmqpLib\Channel\AMQPChannel;
+use PhpAmqpLib\Connection\AbstractConnection;
 use PhpAmqpLib\Exception\AMQPIOException;
 
 beforeEach(function () {
@@ -187,6 +188,62 @@ test('enables publisher confirmations on a replacement publish channel', functio
     expect($channelManager->publishChannel())->toBe($closedChannel)
         ->and($channelManager->publishChannel())->toBe($replacementChannel);
 });
+
+test('replaces idle publisher and topology channels before the next operation', function (float $idleSeconds) {
+    $lastActivity = microtime(true);
+    $this->mockConnection->shouldReceive('getLastActivity')->andReturnUsing(function () use (&$lastActivity): float {
+        return $lastActivity;
+    });
+    $oldPublish = mockAMQPChannel($this->mockConnection);
+    $oldTopology = mockAMQPChannel($this->mockConnection);
+    $this->mockConnection->shouldReceive('channel')->andReturn($oldPublish, $oldTopology);
+    $oldPublish->shouldReceive('confirm_select')->once();
+    $oldPublish->shouldNotReceive('close');
+    $oldTopology->shouldNotReceive('close');
+    $replacement = mockAMQPConnection();
+    $newPublish = mockAMQPChannel($replacement);
+    $newTopology = mockAMQPChannel($replacement);
+    $replacement->shouldReceive('channel')->andReturn($newPublish, $newTopology);
+    $newPublish->shouldReceive('confirm_select')->once();
+    $activeConnection = $this->mockConnection;
+    $this->connectionManager->shouldReceive('connection')->with('default')->andReturnUsing(function () use (&$activeConnection): AbstractConnection {
+        return $activeConnection;
+    });
+    $this->connectionManager->shouldReceive('recover')->once()->with('default')->andReturnUsing(function () use (&$activeConnection, $replacement): AbstractConnection {
+        return $activeConnection = $replacement;
+    });
+    $channels = new ChannelManager($this->connectionManager);
+    $channels->publishChannel('default');
+    $channels->topologyChannel('default');
+    $lastActivity -= $idleSeconds;
+
+    expect($channels->publishChannel('default'))->toBe($newPublish)
+        ->and($channels->topologyChannel('default'))->toBe($newTopology)
+        ->and($channels->publishChannel('default'))->toBe($newPublish);
+})->with(['heartbeat interval passed' => 45.0, 'server heartbeat expired' => 180.0]);
+
+test('reuses publisher connections while active or with heartbeats disabled', function (int $heartbeat, float $idleSeconds) {
+    $this->mockConnection->shouldReceive('getHeartbeat')->andReturn($heartbeat);
+    $this->mockConnection->shouldReceive('getLastActivity')->andReturn(microtime(true) - $idleSeconds);
+    $this->connectionManager->shouldNotReceive('recover');
+    $channels = new ChannelManager($this->connectionManager);
+    $first = $channels->publishChannel('default');
+
+    expect($channels->publishChannel('default'))->toBe($first);
+})->with(['active publisher' => [60, 5.0], 'disabled heartbeats' => [0, 180.0]]);
+
+test('does not replace a connection that can hold an unsettled delivery', function (string $purpose) {
+    $this->mockConnection->shouldReceive('getLastActivity')->andReturn(microtime(true) - 180);
+    $this->connectionManager->shouldNotReceive('recover');
+    $this->mockConnection->shouldNotReceive('close');
+    $channels = new ChannelManager($this->connectionManager);
+    $consumer = $channels->channel($purpose, 'default');
+
+    $channels->publishChannel('default');
+    $channels->topologyChannel('default');
+
+    expect($channels->channel($purpose, 'default'))->toBe($consumer);
+})->with(['native consumer' => 'consume', 'DLQ inspection' => 'dlq-inspect']);
 
 test('provides consume channel', function () {
     $channelManager = new class($this->connectionManager, $this->mockChannel) extends ChannelManager
