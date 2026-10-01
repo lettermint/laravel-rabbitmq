@@ -12,6 +12,7 @@ use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use Lettermint\RabbitMQ\Actions\Dlq\InspectDlqMessages;
@@ -155,6 +156,8 @@ afterEach(function () {
 });
 
 test('the driver publishes with confirms and processes a Laravel job', function () {
+    $this->travelTo(now()->startOfSecond());
+    $availableAt = now()->getTimestampMs();
     $processedProbe = null;
     Event::listen(QueueProbeProcessed::class, function (QueueProbeProcessed $event) use (&$processedProbe): void {
         $processedProbe = $event;
@@ -163,7 +166,10 @@ test('the driver publishes with confirms and processes a Laravel job', function 
     $this->queue->push($probe, '', 'default');
 
     $job = waitForRabbitJob($this->queue, 'default');
-    expect($job)->toBeInstanceOf(RabbitMQJob::class);
+    expect($job)->toBeInstanceOf(RabbitMQJob::class)
+        ->and($job->getAvailableAtMilliseconds())->toBe($availableAt);
+    $this->travel(1250)->milliseconds();
+    Log::spy();
 
     app(RabbitMQWorker::class)->processMessage(
         $job,
@@ -175,9 +181,16 @@ test('the driver publishes with confirms and processes a Laravel job', function 
         ->and($processedProbe->probeId)->toBe('probe-1')
         ->and($this->queue->size('default'))->toBe(0)
         ->and($this->topology->audit()['healthy'])->toBeTrue();
+
+    Log::shouldHaveReceived('info')->with(
+        'RabbitMQ job processing',
+        Mockery::on(fn (array $context): bool => $context['ready_wait_ms'] === 1250),
+    )->once();
 });
 
 test('a delayed publish uses a TTL queue and returns to the main route', function () {
+    $this->travelTo(now()->startOfSecond());
+    $availableAt = now()->getTimestampMs() + 1000;
     $exchange = $this->registry->exchanges()['jobs']['name'];
     $suffix = substr(hash('sha256', $exchange."\0default"), 0, 12);
     $delayQueue = $this->integrationPrefix.'delay-v2:default:1000:'.$suffix;
@@ -188,8 +201,39 @@ test('a delayed publish uses a TTL queue and returns to the main route', functio
 
     $job = waitForRabbitJob($this->queue, 'default', 4.0);
     expect($job)->toBeInstanceOf(RabbitMQJob::class)
-        ->and(json_decode($job->getRawBody(), true)['uuid'])->toBe('delayed-1');
+        ->and(json_decode($job->getRawBody(), true)['uuid'])->toBe('delayed-1')
+        ->and($job->getAvailableAtMilliseconds())->toBe($availableAt);
+    $this->travel(1)->seconds();
+    expect($job->getReadyWaitMilliseconds())->toBe(0);
+    $this->travel(250)->milliseconds();
+    expect($job->getReadyWaitMilliseconds())->toBe(250);
     $job->delete();
+});
+
+test('broker redelivery keeps the due time but a delayed release starts a new wait', function () {
+    $this->travelTo(now()->startOfSecond());
+    $availableAt = now()->getTimestampMs();
+    $this->queue->pushRaw('{"uuid":"wait-redelivery"}', 'default');
+    $job = waitForRabbitJob($this->queue, 'default');
+    $this->travel(10)->seconds();
+    $this->queue->reject($job->getMessage(), $job->getChannel(), true);
+
+    $redelivered = waitForRabbitJob($this->queue, 'default');
+    expect($redelivered->getAvailableAtMilliseconds())->toBe($availableAt)
+        ->and($redelivered->getReadyWaitMilliseconds())->toBe(10000)
+        ->and($redelivered->getMessage()->isRedelivered())->toBeTrue();
+
+    $suffix = substr(hash('sha256', "\0".$this->registry->queue('default')->physicalName), 0, 12);
+    $this->cleanupQueues[] = $this->integrationPrefix.'delay-v2:default:1000:'.$suffix;
+    $redelivered->release(1);
+    expect($this->queue->pop('default'))->toBeNull();
+
+    $released = waitForRabbitJob($this->queue, 'default', 4.0);
+    expect($released->getAvailableAtMilliseconds())->toBe($availableAt + 11000)
+        ->and($released->attempts())->toBe(2);
+    $this->travel(1)->seconds();
+    expect($released->getReadyWaitMilliseconds())->toBe(0);
+    $released->delete();
 });
 
 test('an idle publisher resumes confirmed publishing without losing or duplicating jobs', function (int $delay, int $heartbeat) {
@@ -263,6 +307,7 @@ test('a Laravel retry preserves its exception in the replacement message', funct
 });
 
 test('a final rejection reaches the quorum DLQ and can be replayed', function () {
+    $this->travelTo(now()->startOfSecond());
     $this->queue->pushRaw('{"uuid":"failed-1","displayName":"ExampleJob"}', 'default');
     $job = waitForRabbitJob($this->queue, 'default');
     expect($job)->toBeInstanceOf(RabbitMQJob::class);
@@ -273,6 +318,8 @@ test('a final rejection reaches the quorum DLQ and can be replayed', function ()
         $this->registry->queue('default')->deadLetterQueue,
         1,
     );
+    $this->travel(1)->hours();
+    $replayedAt = now()->getTimestampMs();
 
     $result = app(ReplayDlqMessages::class)('default', messageId: 'failed-1');
     expect($result->replayedCount)->toBe(1)
@@ -281,6 +328,8 @@ test('a final rejection reaches the quorum DLQ and can be replayed', function ()
     $replayed = waitForRabbitJob($this->queue, 'default');
     expect($replayed)->toBeInstanceOf(RabbitMQJob::class)
         ->and($replayed->attempts())->toBe(1)
+        ->and($replayed->getAvailableAtMilliseconds())->toBe($replayedAt)
+        ->and($replayed->getReadyWaitMilliseconds())->toBe(0)
         ->and(json_decode($replayed->getRawBody(), true)['uuid'])->toBe('failed-1');
     $replayed->delete();
 });

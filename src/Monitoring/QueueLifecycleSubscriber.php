@@ -70,7 +70,7 @@ final class QueueLifecycleSubscriber
         }
 
         $key = $this->key($event->job);
-        $this->startedAt[$key] = microtime(true);
+        $this->startedAt[$key] = now()->getPreciseTimestamp() / 1_000_000;
 
         Log::info('RabbitMQ job processing', $this->jobContext($event->job, 'processing'));
     }
@@ -239,8 +239,9 @@ final class QueueLifecycleSubscriber
             'job_id' => $job->getJobId(),
             'attempt' => $job->attempts(),
             'result' => $result,
-            'processing_ms' => $startedAt === null ? null : round((microtime(true) - $startedAt) * 1000, 2),
+            'processing_ms' => $startedAt === null ? null : round((now()->getPreciseTimestamp() / 1_000_000 - $startedAt) * 1000, 2),
             'queue_wait_ms' => $timestamp > 0 && $startedAt !== null ? max(0, (int) (($startedAt - $timestamp) * 1000)) : null,
+            'ready_wait_ms' => $startedAt === null ? null : $job->getReadyWaitMilliseconds((int) round($startedAt * 1000)),
             'redelivered' => $job->getMessage()->isRedelivered(),
             'broker_delivery_count' => $job->brokerDeliveryCount(),
         ];
@@ -257,7 +258,7 @@ final class QueueLifecycleSubscriber
             return null;
         }
 
-        return round((microtime(true) - $this->startedAt[$jobId]) * 1000, 2);
+        return round((now()->getPreciseTimestamp() / 1_000_000 - $this->startedAt[$jobId]) * 1000, 2);
     }
 
     private function queueWaitMilliseconds(int $timestamp): ?int

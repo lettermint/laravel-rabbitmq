@@ -117,6 +117,7 @@ test('a standalone DLQ search protects the queue and closes its channel after a 
 });
 
 test('replay confirms the replacement before it acknowledges the DLQ message', function () {
+    $this->travelTo(now()->startOfSecond());
     $dlq = mockAMQPChannel();
     $dlq->shouldReceive('queue_declare')->andReturn(['test.dlq:default', 1, 0])->byDefault();
     $publisher = mockAMQPChannel();
@@ -129,6 +130,7 @@ test('replay confirms the replacement before it acknowledges the DLQ message', f
     $message = dlqActionMessage([
         'custom' => 'keep',
         RabbitMQJob::ATTEMPT_HEADER => 5,
+        RabbitMQJob::AVAILABLE_AT_HEADER => now()->subHour()->getTimestampMs(),
         'x-delivery-count' => 4,
         'x-death' => [['count' => 1]],
         'x-first-death-queue' => 'test.default',
@@ -149,6 +151,7 @@ test('replay confirms the replacement before it acknowledges the DLQ message', f
                 ->and($published->get('priority'))->toBe(7)
                 ->and($headers['custom'])->toBe('keep')
                 ->and($headers[RabbitMQJob::ATTEMPT_HEADER])->toBe(1)
+                ->and($headers[RabbitMQJob::AVAILABLE_AT_HEADER])->toBe(now()->getTimestampMs())
                 ->and($headers)->not->toHaveKeys([
                     'x-delivery-count',
                     'x-death',
