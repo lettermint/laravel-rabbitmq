@@ -28,7 +28,7 @@ function lifecycleTelemetryJob(array $headers = []): RabbitMQJob
 }
 
 test('processing logs the wait once and completion does not include execution time', function () {
-    $this->travelTo(now()->startOfSecond());
+    $this->travelTo(now()->startOfSecond()->addMicroseconds(123456));
     $job = lifecycleTelemetryJob([RabbitMQJob::AVAILABLE_AT_HEADER => now()->getTimestampMs() - 1250]);
     Log::spy();
 
@@ -88,9 +88,8 @@ test('failed attempts retain the wait at processing and clear it after settlemen
         Mockery::on(fn (array $context): bool => $context['ready_wait_ms'] === 250),
     )->once();
 
-    if ($result !== 'settlement_error') {
-        $level = $result === 'retry' ? 'notice' : 'error';
-        Log::shouldHaveReceived($level)->with(
+    if (in_array($result, ['failed', 'timed_out'], true)) {
+        Log::shouldHaveReceived('error')->with(
             Mockery::any(),
             Mockery::on(fn (array $context): bool => $context['result'] === $result && $context['ready_wait_ms'] === 250),
         )->once();

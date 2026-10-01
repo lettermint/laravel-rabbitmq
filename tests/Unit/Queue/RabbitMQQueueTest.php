@@ -113,7 +113,7 @@ test('publishing records when a job becomes due and preserves its payload and pr
                 ->and($message->get('correlation_id'))->toBe('correlation-1')
                 ->and($message->get('application_headers')->getNativeData())->toBe([
                     'custom' => 'keep',
-                    RabbitMQJob::AVAILABLE_AT_HEADER => $publishedAt + max(0, $delay) * 1000,
+                    'x-available-at-ms' => $publishedAt + max(0, $delay) * 1000,
                 ]);
 
             return true;

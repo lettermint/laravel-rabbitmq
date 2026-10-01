@@ -32,7 +32,7 @@ class RabbitMQJob extends Job implements JobContract
 {
     public const ATTEMPT_HEADER = 'x-lettermint-attempt';
 
-    public const AVAILABLE_AT_HEADER = 'x-lettermint-available-at-ms';
+    public const AVAILABLE_AT_HEADER = 'x-available-at-ms';
 
     /**
      * The RabbitMQ message.

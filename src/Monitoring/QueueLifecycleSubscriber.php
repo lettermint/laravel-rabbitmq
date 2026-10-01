@@ -26,8 +26,8 @@ use Lettermint\RabbitMQ\Queue\RabbitMQJob;
 
 final class QueueLifecycleSubscriber
 {
-    /** @var array<string, array{started_at: float, ready_wait_ms: int|null}> */
-    private array $startedJobs = [];
+    /** @var array<string, float> */
+    private array $startedAt = [];
 
     public function subscribe(Dispatcher $events): void
     {
@@ -38,13 +38,13 @@ final class QueueLifecycleSubscriber
         $events->listen(JobTimedOut::class, function (JobTimedOut $event): void {
             if ($event->job instanceof RabbitMQJob) {
                 Log::error('RabbitMQ job timed out', $this->jobContext($event->job, 'timed_out'));
-                unset($this->startedJobs[$this->key($event->job)]);
+                unset($this->startedAt[$this->key($event->job)]);
             }
         });
         $events->listen(JobReleased::class, $this->released(...));
         $events->listen(JobRetried::class, $this->retried(...));
         $events->listen(JobSettlementFailed::class, function (JobSettlementFailed $event): void {
-            unset($this->startedJobs[$event->jobId]);
+            unset($this->startedAt[$event->jobId]);
             Log::error('RabbitMQ delivery settlement failed', [
                 'event' => 'rabbitmq.job.settlement_error',
                 'queue' => $event->queue,
@@ -70,10 +70,7 @@ final class QueueLifecycleSubscriber
         }
 
         $key = $this->key($event->job);
-        $this->startedJobs[$key] = [
-            'started_at' => microtime(true),
-            'ready_wait_ms' => $event->job->getReadyWaitMilliseconds(),
-        ];
+        $this->startedAt[$key] = now()->getPreciseTimestamp() / 1_000_000;
 
         Log::info('RabbitMQ job processing', $this->jobContext($event->job, 'processing'));
     }
@@ -87,7 +84,7 @@ final class QueueLifecycleSubscriber
         if (! $event->job->isReleased() && ! $event->job->hasFailed()) {
             Log::info('RabbitMQ job processed', $this->jobContext($event->job, 'processed'));
         }
-        unset($this->startedJobs[$this->key($event->job)]);
+        unset($this->startedAt[$this->key($event->job)]);
     }
 
     private function exceptionOccurred(JobExceptionOccurred $event): void
@@ -112,7 +109,7 @@ final class QueueLifecycleSubscriber
             $this->jobContext($event->job, 'failed'),
             ['exception_class' => $event->exception::class],
         ));
-        unset($this->startedJobs[$this->key($event->job)]);
+        unset($this->startedAt[$this->key($event->job)]);
     }
 
     private function released(JobReleased $event): void
@@ -127,7 +124,6 @@ final class QueueLifecycleSubscriber
             'result' => 'released',
             'processing_ms' => $this->processingMilliseconds($event->jobId),
             'queue_wait_ms' => $this->queueWaitMilliseconds($event->messageTimestamp),
-            'ready_wait_ms' => $this->startedJobs[$event->jobId ?? '']['ready_wait_ms'] ?? null,
             'redelivered' => $event->redelivered,
             'broker_delivery_count' => $event->brokerDeliveryCount,
         ]);
@@ -145,13 +141,12 @@ final class QueueLifecycleSubscriber
             'result' => 'retry',
             'processing_ms' => $this->processingMilliseconds($event->jobId),
             'queue_wait_ms' => $this->queueWaitMilliseconds($event->messageTimestamp),
-            'ready_wait_ms' => $this->startedJobs[$event->jobId ?? '']['ready_wait_ms'] ?? null,
             'redelivered' => $event->redelivered,
             'broker_delivery_count' => $event->brokerDeliveryCount,
         ]);
 
         if ($event->jobId !== null) {
-            unset($this->startedJobs[$event->jobId]);
+            unset($this->startedAt[$event->jobId]);
         }
     }
 
@@ -167,7 +162,6 @@ final class QueueLifecycleSubscriber
             'exception_class' => $event->exception::class,
             'processing_ms' => $this->processingMilliseconds($event->jobId),
             'queue_wait_ms' => $this->queueWaitMilliseconds($event->messageTimestamp),
-            'ready_wait_ms' => $this->startedJobs[$event->jobId ?? '']['ready_wait_ms'] ?? null,
             'redelivered' => $event->redelivered,
             'broker_delivery_count' => $event->brokerDeliveryCount,
         ]);
@@ -235,8 +229,7 @@ final class QueueLifecycleSubscriber
     /** @return array<string, mixed> */
     private function jobContext(RabbitMQJob $job, string $result): array
     {
-        $startedJob = $this->startedJobs[$this->key($job)] ?? null;
-        $startedAt = $startedJob['started_at'] ?? null;
+        $startedAt = $this->startedAt[$this->key($job)] ?? null;
         $timestamp = $job->getTimestamp();
 
         return [
@@ -246,9 +239,9 @@ final class QueueLifecycleSubscriber
             'job_id' => $job->getJobId(),
             'attempt' => $job->attempts(),
             'result' => $result,
-            'processing_ms' => $startedAt === null ? null : round((microtime(true) - $startedAt) * 1000, 2),
+            'processing_ms' => $startedAt === null ? null : round((now()->getPreciseTimestamp() / 1_000_000 - $startedAt) * 1000, 2),
             'queue_wait_ms' => $timestamp > 0 && $startedAt !== null ? max(0, (int) (($startedAt - $timestamp) * 1000)) : null,
-            'ready_wait_ms' => $startedJob['ready_wait_ms'] ?? null,
+            'ready_wait_ms' => $startedAt === null ? null : $job->getReadyWaitMilliseconds((int) round($startedAt * 1000)),
             'redelivered' => $job->getMessage()->isRedelivered(),
             'broker_delivery_count' => $job->brokerDeliveryCount(),
         ];
@@ -261,11 +254,11 @@ final class QueueLifecycleSubscriber
 
     private function processingMilliseconds(?string $jobId): ?float
     {
-        if ($jobId === null || ! isset($this->startedJobs[$jobId])) {
+        if ($jobId === null || ! isset($this->startedAt[$jobId])) {
             return null;
         }
 
-        return round((microtime(true) - $this->startedJobs[$jobId]['started_at']) * 1000, 2);
+        return round((now()->getPreciseTimestamp() / 1_000_000 - $this->startedAt[$jobId]) * 1000, 2);
     }
 
     private function queueWaitMilliseconds(int $timestamp): ?int
