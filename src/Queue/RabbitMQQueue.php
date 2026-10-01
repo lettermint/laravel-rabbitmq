@@ -317,7 +317,16 @@ final class RabbitMQQueue extends Queue implements QueueContract
             payload: $payload,
             priority: $priority,
             properties: $properties,
+            delaySeconds: $delaySeconds,
         );
+    }
+
+    private function setAvailableAt(AMQPMessage $message, int $delaySeconds): void
+    {
+        $headers = $message->has('application_headers') ? $message->get('application_headers') : [];
+        $headers = $headers instanceof AMQPTable ? clone $headers : new AMQPTable($headers);
+        $headers->set(RabbitMQJob::AVAILABLE_AT_HEADER, now()->getTimestampMs() + $delaySeconds * 1000);
+        $message->set('application_headers', $headers);
     }
 
     /**
@@ -330,6 +339,7 @@ final class RabbitMQQueue extends Queue implements QueueContract
         string $payload,
         ?int $priority = null,
         array $properties = [],
+        int $delaySeconds = 0,
     ): void {
         $message = $this->buildMessage($payload, $priority, $properties);
         $messageId = (string) $message->get('message_id');
@@ -350,6 +360,7 @@ final class RabbitMQQueue extends Queue implements QueueContract
                 $nacked = true;
             });
 
+            $this->setAvailableAt($message, $delaySeconds);
             $publishStarted = true;
             $channel->basic_publish($message, $exchange, $routingKey, $this->mandatory);
             $channel->wait_for_pending_acks_returns($this->confirmTimeout);

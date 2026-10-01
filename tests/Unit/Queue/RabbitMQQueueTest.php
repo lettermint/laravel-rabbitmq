@@ -96,6 +96,62 @@ test('uses logical names and a physical prefix', function () {
         ->and($this->queue->getBrokerConnectionName())->toBe('broker');
 });
 
+test('publishing records when a job becomes due and preserves its payload and properties', function (int $delay, bool $tableHeaders) {
+    $this->travelTo(now()->startOfSecond());
+    $publishedAt = now()->getTimestampMs();
+    $payload = '{"uuid":"timed-1","displayName":"ExampleJob"}';
+    $headers = [
+        'custom' => 'keep',
+        RabbitMQJob::AVAILABLE_AT_HEADER => $publishedAt - 60000,
+    ];
+    $originalHeaders = $tableHeaders ? new AMQPTable($headers) : $headers;
+
+    $this->channel->shouldReceive('basic_publish')->once()->withArgs(
+        function (AMQPMessage $message) use ($delay, $publishedAt, $payload): bool {
+            expect($message->getBody())->toBe($payload)
+                ->and($message->get('timestamp'))->toBe(123456789)
+                ->and($message->get('correlation_id'))->toBe('correlation-1')
+                ->and($message->get('application_headers')->getNativeData())->toBe([
+                    'custom' => 'keep',
+                    RabbitMQJob::AVAILABLE_AT_HEADER => $publishedAt + max(0, $delay) * 1000,
+                ]);
+
+            return true;
+        },
+    );
+
+    $this->queue->pushRaw($payload, 'default', [
+        'delay' => $delay,
+        'properties' => [
+            'timestamp' => 123456789,
+            'correlation_id' => 'correlation-1',
+            'application_headers' => $originalHeaders,
+        ],
+    ]);
+
+    expect($tableHeaders ? $originalHeaders->getNativeData() : $originalHeaders)->toBe($headers);
+})->with([0, 30, -1])->with([true, false]);
+
+test('publisher connection setup is excluded from ready wait', function (int $delay) {
+    $this->travelTo(now()->startOfSecond());
+    $beforeSetup = now()->getTimestampMs();
+    $this->channelManager->shouldReceive('publishChannel')->with('broker')->andReturnUsing(function () {
+        $this->travel(10)->seconds();
+
+        return $this->channel;
+    });
+    $this->channel->shouldReceive('basic_publish')->once()->withArgs(
+        function (AMQPMessage $message) use ($beforeSetup, $delay): bool {
+            expect($message->get('application_headers')->getNativeData()[RabbitMQJob::AVAILABLE_AT_HEADER])
+                ->toBe($beforeSetup + 10000 + $delay * 1000);
+
+            return true;
+        },
+    );
+
+    $this->queue->pushRaw('{"uuid":"connection-setup"}', 'default', ['delay' => $delay]);
+})->with([0, 30]);
+
 test('rejects an unknown queue in strict mode', function () {
     expect(fn () => $this->queue->getQueue('missing'))
         ->toThrow(UnknownQueueException::class, 'missing');

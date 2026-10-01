@@ -181,6 +181,7 @@ test('uses legacy payload attempts when the package header is absent', function 
 });
 
 test('release publishes the next attempt before it acknowledges the original message', function () {
+    $this->travelTo(now()->startOfSecond());
     $message = mockAMQPMessage([
         'deliveryTag' => 42,
         'messageId' => 'message-123',
@@ -190,6 +191,7 @@ test('release publishes the next attempt before it acknowledges the original mes
         'headers' => [
             'x-custom' => 'keep-me',
             'x-delivery-count' => 4,
+            RabbitMQJob::AVAILABLE_AT_HEADER => now()->subMinute()->getTimestampMs(),
         ],
     ]);
 
@@ -214,6 +216,7 @@ test('release publishes the next attempt before it acknowledges the original mes
                 ->and($headers)->toBeInstanceOf(AMQPTable::class)
                 ->and($headers->getNativeData()['x-custom'])->toBe('keep-me')
                 ->and($headers->getNativeData()[RabbitMQJob::ATTEMPT_HEADER])->toBe(2)
+                ->and($headers->getNativeData()[RabbitMQJob::AVAILABLE_AT_HEADER])->toBe(now()->getTimestampMs() + 15000)
                 ->and($headers->getNativeData())->not->toHaveKey('x-delivery-count');
 
             return true;
@@ -233,6 +236,53 @@ test('release publishes the next attempt before it acknowledges the original mes
 
     expect($job->isReleased())->toBeTrue();
 });
+
+test('ready wait starts when a job becomes due', function (int $dueOffset, int $expectedWait) {
+    $this->travelTo(now()->startOfSecond());
+    $job = new RabbitMQJob(
+        $this->container,
+        $this->rabbitmq,
+        $this->mockChannel,
+        mockAMQPMessage([
+            'timestamp' => now()->subHour()->timestamp,
+            'headers' => [RabbitMQJob::AVAILABLE_AT_HEADER => now()->getTimestampMs() + $dueOffset],
+        ]),
+        'rabbitmq',
+        'test-queue',
+    );
+
+    expect($job->getReadyWaitMilliseconds())->toBe($expectedWait)
+        ->and($job->getReadyWaitMilliseconds(now()->getTimestampMs() + 5000))->toBe(max(0, 5000 - $dueOffset));
+})->with([
+    'immediate' => [0, 0],
+    'overdue' => [-1250, 1250],
+    'future due time or clock skew' => [30000, 0],
+]);
+
+test('ready wait is unknown without a valid due timestamp', function (mixed $availableAt) {
+    $job = new RabbitMQJob(
+        $this->container,
+        $this->rabbitmq,
+        $this->mockChannel,
+        mockAMQPMessage([
+            'timestamp' => time() - 3600,
+            'headers' => [RabbitMQJob::AVAILABLE_AT_HEADER => $availableAt],
+        ]),
+        'rabbitmq',
+        'test-queue',
+    );
+
+    expect($job->getAvailableAtMilliseconds())->toBeNull()
+        ->and($job->getReadyWaitMilliseconds())->toBeNull();
+})->with([
+    'missing' => [null],
+    'zero' => [0],
+    'negative' => [-1],
+    'numeric string' => ['1234567890000'],
+    'float' => [1234567890000.5],
+    'boolean' => [true],
+    'invalid string' => ['invalid'],
+]);
 
 test('release preserves a recorded exception in the replacement payload', function () {
     $message = mockAMQPMessage(['deliveryTag' => 42]);

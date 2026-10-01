@@ -32,6 +32,8 @@ class RabbitMQJob extends Job implements JobContract
 {
     public const ATTEMPT_HEADER = 'x-lettermint-attempt';
 
+    public const AVAILABLE_AT_HEADER = 'x-lettermint-available-at-ms';
+
     /**
      * The RabbitMQ message.
      */
@@ -509,6 +511,27 @@ class RabbitMQJob extends Job implements JobContract
     public function getTimestamp(): int
     {
         return (int) ($this->getMessageProperty('timestamp') ?? 0);
+    }
+
+    public function getAvailableAtMilliseconds(): ?int
+    {
+        $availableAt = $this->getHeaders()[self::AVAILABLE_AT_HEADER] ?? null;
+
+        return is_int($availableAt) && $availableAt > 0 ? $availableAt : null;
+    }
+
+    /**
+     * Old messages have no due timestamp, so their ready wait is unknown.
+     */
+    public function getReadyWaitMilliseconds(?int $startedAtMilliseconds = null): ?int
+    {
+        $availableAt = $this->getAvailableAtMilliseconds();
+
+        if ($availableAt === null) {
+            return null;
+        }
+
+        return max(0, ($startedAtMilliseconds ?? now()->getTimestampMs()) - $availableAt);
     }
 
     /**
