@@ -259,15 +259,14 @@ test('uses custom failure threshold', function () {
 });
 
 test('uses custom recovery timeout', function () {
-    $breaker = new CircuitBreaker(failureThreshold: 1, recoveryTimeout: 0.05);
+    // A long timeout keeps the open check independent of runner speed.
+    $open = new CircuitBreaker(failureThreshold: 1, recoveryTimeout: 60.0);
+    $open->recordFailure();
+    expect($open->isAvailable())->toBeFalse();
 
-    $breaker->recordFailure();
-
-    // Before timeout
-    usleep(10000); // 10ms
-    expect($breaker->isAvailable())->toBeFalse();
-
-    // After timeout
-    usleep(50000); // 50ms more
-    expect($breaker->isAvailable())->toBeTrue();
+    // The default 30s timeout would keep this breaker open.
+    $recovering = new CircuitBreaker(failureThreshold: 1, recoveryTimeout: 0.05);
+    $recovering->recordFailure();
+    usleep(60000); // 60ms
+    expect($recovering->isAvailable())->toBeTrue();
 });
