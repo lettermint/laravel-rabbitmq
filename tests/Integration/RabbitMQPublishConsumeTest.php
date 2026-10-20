@@ -1387,9 +1387,12 @@ test('concurrent batch consumers write every event exactly once under sustained 
         $expected[] = $id;
     }
 
+    // A slow broker can take longer than the default 0.1s fixture wait to
+    // refill prefetch, which a stop-when-empty consumer reads as an empty queue.
     $processes = array_map(static fn (): Process => batchIngestProcess([
         'RABBITMQ_TEST_MAX_COUNT' => '250',
         'RABBITMQ_TEST_MAX_WAIT' => '0.5',
+        'RABBITMQ_TEST_WAIT' => '1',
         'RABBITMQ_TEST_STOP_WHEN_EMPTY' => '1',
     ]), range(1, 3));
 
@@ -1502,11 +1505,7 @@ test('stopping a batch consumer under load loses and duplicates no events', func
         'RABBITMQ_TEST_MAX_WAIT' => '0.5',
         'RABBITMQ_TEST_HANDLER_DELAY_MS' => '100',
     ]);
-    $second = batchIngestProcess([
-        'RABBITMQ_TEST_MAX_COUNT' => '100',
-        'RABBITMQ_TEST_MAX_WAIT' => '0.5',
-        'RABBITMQ_TEST_STOP_WHEN_EMPTY' => '1',
-    ]);
+    $second = null;
 
     try {
         $first->start();
@@ -1519,6 +1518,13 @@ test('stopping a batch consumer under load loses and duplicates no events', func
         $partial = count(batchIngestRows($path)['rows']);
         expect($partial)->toBeGreaterThan(0)->toBeLessThan(1500);
 
+        // The second consumer stops after the remaining events. A lost event
+        // keeps it waiting until its time limit, and a duplicate stops it early.
+        $second = batchIngestProcess([
+            'RABBITMQ_TEST_MAX_COUNT' => '100',
+            'RABBITMQ_TEST_MAX_WAIT' => '0.5',
+            'RABBITMQ_TEST_MAX_JOBS' => (string) (1500 - $partial),
+        ]);
         $second->mustRun();
         $written = batchIngestRows($path);
         $ids = array_keys($written['rows']);
@@ -1530,7 +1536,7 @@ test('stopping a batch consumer under load loses and duplicates no events', func
             ->and($this->queue->size('default'))->toBe(0);
     } finally {
         $first->stop();
-        $second->stop();
+        $second?->stop();
         unlink($path);
     }
 });
