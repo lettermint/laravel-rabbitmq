@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Filament\Notifications\NotificationMailbox;
 use Illuminate\Auth\GenericUser;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Queue\Failed\FailedJobProviderInterface;
@@ -249,10 +250,44 @@ function deadLetterPage(ChannelManager $channels): RabbitMQDeadLetters
     app()->instance(PurgeDlqMessages::class, new PurgeDlqMessages($channels, $resolve, $find, $queue));
     app()->instance(InspectDlqMessages::class, new InspectDlqMessages($channels, $resolve, $find, $queue));
 
+    recordDeadLetterPageNotifications();
+
     $page = new RabbitMQDeadLetters;
     $page->queue = 'default';
 
     return $page;
+}
+
+/**
+ * Record sent notifications. Filament 5.10 and later buffer them in a
+ * NotificationMailbox; earlier releases push them to the session.
+ */
+function recordDeadLetterPageNotifications(): void
+{
+    if (! class_exists(NotificationMailbox::class)) {
+        return;
+    }
+
+    app()->instance(NotificationMailbox::class, new class extends NotificationMailbox
+    {
+        /** @var list<array<string, mixed>> */
+        public array $sent = [];
+
+        public function push(array $notification): void
+        {
+            $this->sent[] = $notification;
+        }
+    });
+}
+
+/** @return list<array<string, mixed>> */
+function sentDeadLetterPageNotifications(): array
+{
+    if (class_exists(NotificationMailbox::class)) {
+        return app(NotificationMailbox::class)->sent;
+    }
+
+    return array_values(session('filament.notifications', []));
 }
 
 function invokeDeadLetterPage(RabbitMQDeadLetters $page, string $method, mixed ...$arguments): mixed
@@ -281,7 +316,7 @@ test('bulk forget sends one summary notification', function () {
         ['id' => 'job-3'],
     ]));
 
-    $notifications = session('filament.notifications');
+    $notifications = sentDeadLetterPageNotifications();
 
     expect($notifications)->toHaveCount(1)
         ->and($notifications[0]['title'])->toBe('Removed 3 of 3 jobs')
@@ -304,7 +339,7 @@ test('bulk forget stops at the first failure and reports it in one notification'
         ['id' => 'job-3'],
     ]));
 
-    $notifications = session('filament.notifications');
+    $notifications = sentDeadLetterPageNotifications();
 
     expect($notifications)->toHaveCount(1)
         ->and($notifications[0]['title'])->toBe('Removed 1 of 3 jobs')
@@ -330,7 +365,7 @@ test('retry all replays the messages that are in the dead-letter queue when it s
 
     invokeDeadLetterPage($page, 'retryAll');
 
-    $notifications = session('filament.notifications');
+    $notifications = sentDeadLetterPageNotifications();
 
     expect($notifications)->toHaveCount(1)
         ->and($notifications[0]['title'])->toBe('Retried 2 jobs')
@@ -353,7 +388,7 @@ test('retry all reports the jobs that remain after the scan limit', function () 
 
     invokeDeadLetterPage($page, 'retryAll');
 
-    $notifications = session('filament.notifications');
+    $notifications = sentDeadLetterPageNotifications();
 
     expect($notifications)->toHaveCount(1)
         ->and($notifications[0]['title'])->toBe('Retried 1 job')
@@ -370,7 +405,7 @@ test('retry all reports a broker failure instead of failing the request', functi
 
     invokeDeadLetterPage($page, 'retryAll');
 
-    $notifications = session('filament.notifications');
+    $notifications = sentDeadLetterPageNotifications();
 
     expect($notifications)->toHaveCount(1)
         ->and($notifications[0]['title'])->toBe('Retry all did not finish')
