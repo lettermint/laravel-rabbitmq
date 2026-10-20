@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Lettermint\RabbitMQ\Batch\BatchOptions;
 use Lettermint\RabbitMQ\Consumers\Consumer;
+use Lettermint\RabbitMQ\Contracts\BatchHandler;
 use Lettermint\RabbitMQ\Tests\Fixtures\Batch\BatchStorageHandler;
 use Lettermint\RabbitMQ\Tests\TestCase;
 
@@ -31,6 +32,9 @@ $test = new class('bootBatchWorker') extends TestCase
 
 $test->bootBatchWorker();
 
+/** @var class-string<BatchHandler> $handler */
+$handler = getenv('RABBITMQ_TEST_BATCH_HANDLER') ?: BatchStorageHandler::class;
+
 try {
     app(Consumer::class)
         ->setConnection('rabbitmq-integration')
@@ -41,7 +45,8 @@ try {
         ->setTimeout((int) (getenv('RABBITMQ_TEST_TIMEOUT') ?: 10))
         ->setWaitTimeout(0.1)
         ->setTries((int) (getenv('RABBITMQ_TEST_TRIES') ?: 3))
-        ->consumeBatch(BatchStorageHandler::class, new BatchOptions(
+        ->setStopWhenEmpty(getenv('RABBITMQ_TEST_STOP_WHEN_EMPTY') === '1')
+        ->consumeBatch($handler, new BatchOptions(
             maxCount: (int) (getenv('RABBITMQ_TEST_MAX_COUNT') ?: 10),
             maxBytes: (int) (getenv('RABBITMQ_TEST_MAX_BYTES') ?: 1048576),
             maxWaitSeconds: (float) (getenv('RABBITMQ_TEST_MAX_WAIT') ?: 1),

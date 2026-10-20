@@ -30,6 +30,9 @@ use Lettermint\RabbitMQ\Exceptions\SettlementException;
 use Lettermint\RabbitMQ\Monitoring\ManagementClient;
 use Lettermint\RabbitMQ\Queue\RabbitMQJob;
 use Lettermint\RabbitMQ\Queue\RabbitMQQueue;
+use Lettermint\RabbitMQ\Tests\Fixtures\Batch\BatchDeadlineJob;
+use Lettermint\RabbitMQ\Tests\Fixtures\Batch\BatchIngestHandler;
+use Lettermint\RabbitMQ\Tests\Fixtures\Batch\BatchMetricJob;
 use Lettermint\RabbitMQ\Tests\Fixtures\Batch\BatchStorageJob;
 use Lettermint\RabbitMQ\Tests\Fixtures\Jobs\LifecycleJob;
 use Lettermint\RabbitMQ\Tests\Fixtures\Jobs\ProcessMarkerJob;
@@ -1329,3 +1332,251 @@ test('retry and replay do not send another copy to other queues on a shared exch
     $retry->delete();
     expect($channel->basic_get($observer, false))->toBeNull();
 })->with(['retry' => false, 'replay' => true]);
+
+/**
+ * Read the rows that BatchIngestHandler wrote.
+ *
+ * @return array{rows: array<string, list<int>>, statements: int, outages: int}
+ */
+function batchIngestRows(string $path): array
+{
+    $rows = [];
+    $statements = 0;
+    $outages = 0;
+
+    foreach (file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
+        if (str_starts_with($line, 'outage:')) {
+            $outages++;
+
+            continue;
+        }
+
+        if (! str_starts_with($line, 'insert:')) {
+            throw new RuntimeException("Unexpected marker line [{$line}].");
+        }
+
+        $statements++;
+        [, , $values] = explode(':', $line, 3);
+
+        foreach (explode(',', $values) as $value) {
+            [$id, $attempt] = explode('@', $value);
+            $rows[$id][] = (int) $attempt;
+        }
+    }
+
+    return ['rows' => $rows, 'statements' => $statements, 'outages' => $outages];
+}
+
+/** @param array<string, string> $environment */
+function batchIngestProcess(array $environment = []): Process
+{
+    return integrationBatchConsumerProcess(array_merge([
+        'RABBITMQ_TEST_BATCH_HANDLER' => BatchIngestHandler::class,
+        'RABBITMQ_TEST_MAX_JOBS' => '1000000',
+        'RABBITMQ_TEST_MAX_TIME' => '25',
+    ], $environment));
+}
+
+test('concurrent batch consumers write every event exactly once under sustained volume', function () {
+    $path = tempnam(sys_get_temp_dir(), 'rabbitmq-batch-');
+    $expected = [];
+
+    for ($index = 0; $index < 3000; $index++) {
+        $id = "event-{$index}";
+        $this->queue->push($index % 3 === 0 ? new BatchMetricJob($path, $id) : new BatchStorageJob($path, $id));
+        $expected[] = $id;
+    }
+
+    $processes = array_map(static fn (): Process => batchIngestProcess([
+        'RABBITMQ_TEST_MAX_COUNT' => '250',
+        'RABBITMQ_TEST_MAX_WAIT' => '0.5',
+        'RABBITMQ_TEST_STOP_WHEN_EMPTY' => '1',
+    ]), range(1, 3));
+
+    try {
+        foreach ($processes as $process) {
+            $process->start();
+        }
+
+        foreach ($processes as $process) {
+            $process->wait();
+            expect($process->getExitCode())->toBe(0, $process->getErrorOutput());
+        }
+
+        $written = batchIngestRows($path);
+        $ids = array_keys($written['rows']);
+        sort($ids);
+        sort($expected);
+
+        expect($ids)->toBe($expected)
+            ->and(array_filter($written['rows'], static fn (array $attempts): bool => $attempts !== [1]))->toBe([])
+            ->and($written['statements'])->toBeLessThan(100)
+            ->and($this->queue->size('default'))->toBe(0);
+        waitForQueueDepth($this->channels, $this->registry->queue('default')->deadLetterQueue, 0);
+    } finally {
+        foreach ($processes as $process) {
+            $process->stop();
+        }
+
+        unlink($path);
+    }
+});
+
+test('a storage outage retries the whole batch and writes each event once after recovery', function () {
+    $path = tempnam(sys_get_temp_dir(), 'rabbitmq-batch-');
+    $outage = tempnam(sys_get_temp_dir(), 'rabbitmq-outage-');
+    $expected = [];
+
+    for ($index = 0; $index < 40; $index++) {
+        $this->queue->push(new BatchStorageJob($path, "event-{$index}"));
+        $expected[] = "event-{$index}";
+    }
+
+    $process = batchIngestProcess([
+        'RABBITMQ_TEST_OUTAGE_FILE' => $outage,
+        'RABBITMQ_TEST_MAX_COUNT' => '40',
+        'RABBITMQ_TEST_MAX_WAIT' => '2',
+        'RABBITMQ_TEST_MAX_JOBS' => '80',
+    ]);
+
+    try {
+        $process->start();
+        waitForMarker($path, 'outage:', $process);
+        unlink($outage);
+        $process->wait();
+        expect($process->getExitCode())->toBe(0, $process->getErrorOutput());
+
+        $written = batchIngestRows($path);
+        $ids = array_keys($written['rows']);
+        sort($ids);
+        sort($expected);
+
+        expect($written['outages'])->toBe(1)
+            ->and($ids)->toBe($expected)
+            ->and(array_filter($written['rows'], static fn (array $attempts): bool => $attempts !== [2]))->toBe([])
+            ->and($this->queue->size('default'))->toBe(0);
+        waitForQueueDepth($this->channels, $this->registry->queue('default')->deadLetterQueue, 0);
+    } finally {
+        $process->stop();
+        @unlink($outage);
+        unlink($path);
+    }
+});
+
+test('an item that keeps asking for a retry reaches the dead-letter queue after its tries', function () {
+    $path = tempnam(sys_get_temp_dir(), 'rabbitmq-batch-');
+    $this->queue->push(new BatchStorageJob($path, 'stubborn', 'retry'));
+    $this->queue->push(new BatchStorageJob($path, 'healthy'));
+    $process = batchIngestProcess([
+        'RABBITMQ_TEST_TRIES' => '3',
+        'RABBITMQ_TEST_MAX_COUNT' => '10',
+        'RABBITMQ_TEST_MAX_WAIT' => '0.3',
+        'RABBITMQ_TEST_MAX_JOBS' => '4',
+    ]);
+
+    try {
+        $process->mustRun();
+        $written = batchIngestRows($path);
+
+        expect($written['rows']['healthy'])->toBe([1])
+            ->and($written['rows']['stubborn'])->toBe([1, 2, 3])
+            ->and($this->queue->size('default'))->toBe(0);
+        waitForQueueDepth($this->channels, $this->registry->queue('default')->deadLetterQueue, 1);
+    } finally {
+        $process->stop();
+        unlink($path);
+    }
+});
+
+test('stopping a batch consumer under load loses and duplicates no events', function () {
+    $path = tempnam(sys_get_temp_dir(), 'rabbitmq-batch-');
+    $expected = [];
+
+    for ($index = 0; $index < 1500; $index++) {
+        $this->queue->push(new BatchStorageJob($path, "event-{$index}"));
+        $expected[] = "event-{$index}";
+    }
+
+    $first = batchIngestProcess([
+        'RABBITMQ_TEST_MAX_COUNT' => '100',
+        'RABBITMQ_TEST_MAX_WAIT' => '0.5',
+        'RABBITMQ_TEST_HANDLER_DELAY_MS' => '100',
+    ]);
+    $second = batchIngestProcess([
+        'RABBITMQ_TEST_MAX_COUNT' => '100',
+        'RABBITMQ_TEST_MAX_WAIT' => '0.5',
+        'RABBITMQ_TEST_STOP_WHEN_EMPTY' => '1',
+    ]);
+
+    try {
+        $first->start();
+        waitForMarker($path, 'insert:', $first);
+        usleep(300000);
+        $first->signal(SIGTERM);
+        $first->wait();
+        expect($first->getExitCode())->toBe(0, $first->getErrorOutput());
+
+        $partial = count(batchIngestRows($path)['rows']);
+        expect($partial)->toBeGreaterThan(0)->toBeLessThan(1500);
+
+        $second->mustRun();
+        $written = batchIngestRows($path);
+        $ids = array_keys($written['rows']);
+        sort($ids);
+        sort($expected);
+
+        expect($ids)->toBe($expected)
+            ->and(array_filter($written['rows'], static fn (array $attempts): bool => count($attempts) !== 1))->toBe([])
+            ->and($this->queue->size('default'))->toBe(0);
+    } finally {
+        $first->stop();
+        $second->stop();
+        unlink($path);
+    }
+});
+
+test('retryUntil and unlimited tries on the job govern batch retries instead of the worker tries', function () {
+    $path = tempnam(sys_get_temp_dir(), 'rabbitmq-batch-');
+    $id = $this->queue->push(new BatchDeadlineJob($path, 'unlimited', time() + 300, 'retry'));
+    $process = batchIngestProcess([
+        'RABBITMQ_TEST_TRIES' => '1',
+        'RABBITMQ_TEST_MAX_WAIT' => '0.3',
+        'RABBITMQ_TEST_MAX_JOBS' => '3',
+    ]);
+
+    try {
+        $process->mustRun();
+
+        expect(batchIngestRows($path)['rows']['unlimited'])->toBe([1, 2, 3]);
+        $next = waitForRabbitJob($this->queue, 'default', 5);
+        expect($next)->toBeInstanceOf(RabbitMQJob::class)
+            ->and($next->getJobId())->toBe($id)
+            ->and($next->attempts())->toBe(4);
+        $next->delete();
+        waitForQueueDepth($this->channels, $this->registry->queue('default')->deadLetterQueue, 0);
+    } finally {
+        $process->stop();
+        unlink($path);
+    }
+});
+
+test('an expired retryUntil fails the item before the batch handler runs', function () {
+    $path = tempnam(sys_get_temp_dir(), 'rabbitmq-batch-');
+    $this->queue->push(new BatchDeadlineJob($path, 'expired', time() - 1));
+    $this->queue->push(new BatchStorageJob($path, 'healthy'));
+    $process = batchIngestProcess([
+        'RABBITMQ_TEST_MAX_WAIT' => '0.3',
+        'RABBITMQ_TEST_MAX_JOBS' => '2',
+    ]);
+
+    try {
+        $process->mustRun();
+
+        expect(array_keys(batchIngestRows($path)['rows']))->toBe(['healthy'])
+            ->and($this->queue->size('default'))->toBe(0);
+        waitForQueueDepth($this->channels, $this->registry->queue('default')->deadLetterQueue, 1);
+    } finally {
+        $process->stop();
+        unlink($path);
+    }
+});
