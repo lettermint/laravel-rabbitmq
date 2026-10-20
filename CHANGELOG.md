@@ -4,6 +4,7 @@ This file records notable changes. The project uses [Semantic Versioning](https:
 
 ## Unreleased
 
+- Add optional, bounded batch consumption with typed per-item outcomes and individual broker settlement.
 - Isolate consumer tests from shared test-process memory and verify memory-limit shutdown.
 - Update the changelog through a dedicated deploy key and backfill missing published releases.
 - Simplify installation instructions and move operating details into linked guides.
