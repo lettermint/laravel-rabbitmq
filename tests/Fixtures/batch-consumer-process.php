@@ -43,7 +43,7 @@ try {
         ->setMaxTime((int) (getenv('RABBITMQ_TEST_MAX_TIME') ?: 20))
         ->setMaxMemory((int) (getenv('RABBITMQ_TEST_MAX_MEMORY') ?: 128))
         ->setTimeout((int) (getenv('RABBITMQ_TEST_TIMEOUT') ?: 10))
-        ->setWaitTimeout(0.1)
+        ->setWaitTimeout((float) (getenv('RABBITMQ_TEST_WAIT') ?: 0.1))
         ->setTries((int) (getenv('RABBITMQ_TEST_TRIES') ?: 3))
         ->setStopWhenEmpty(getenv('RABBITMQ_TEST_STOP_WHEN_EMPTY') === '1')
         ->consumeBatch($handler, new BatchOptions(
