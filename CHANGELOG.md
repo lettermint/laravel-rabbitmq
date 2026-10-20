@@ -7,6 +7,8 @@ This file records notable changes. The project uses [Semantic Versioning](https:
 - Isolate consumer tests from shared test-process memory and verify memory-limit shutdown.
 - Update the changelog through a dedicated deploy key and backfill missing published releases.
 - Simplify installation instructions and move operating details into linked guides.
+- Add a Retry all action to the Filament dead-letter page that replays every message in the queue, not only the 100 in the table.
+- Send one summary notification for Filament bulk retry and bulk forget. One notification per record exceeded the Livewire call limit and caused a server error.
 
 ## 1.3.1 - 2026-09-07
 

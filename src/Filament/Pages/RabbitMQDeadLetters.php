@@ -21,12 +21,15 @@ use Filament\Tables\Columns\TextColumn;
 use Filament\Tables\Table;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Gate;
+use Illuminate\Support\Str;
 use Lettermint\RabbitMQ\Actions\Dlq\InspectDlqMessages;
 use Lettermint\RabbitMQ\Actions\Dlq\PurgeDlqMessages;
 use Lettermint\RabbitMQ\Actions\Dlq\ReplayDlqMessages;
 use Lettermint\RabbitMQ\Monitoring\QueueMetrics;
+use Lettermint\RabbitMQ\Support\ExceptionReporter;
 use Lettermint\RabbitMQ\Support\FailedJobDetails;
 use Lettermint\RabbitMQ\Topology\TopologyRegistry;
+use Throwable;
 
 final class RabbitMQDeadLetters extends Page implements Tables\Contracts\HasTable
 {
@@ -300,6 +303,14 @@ final class RabbitMQDeadLetters extends Page implements Tables\Contracts\HasTabl
                 ->label('All queues')
                 ->icon('heroicon-m-arrow-left')
                 ->url(self::getUrl()),
+            Action::make('retryAll')
+                ->label('Retry all')
+                ->icon('heroicon-m-arrow-path')
+                ->requiresConfirmation()
+                ->modalHeading('Retry all dead-lettered jobs')
+                ->modalDescription(fn (): string => $this->retryAllDescription())
+                ->modalSubmitActionLabel('Retry all')
+                ->action(fn () => $this->retryAll()),
             Action::make('selectQueue')
                 ->label('Select queue')
                 ->fillForm(['queue' => $this->queue])
@@ -341,58 +352,182 @@ final class RabbitMQDeadLetters extends Page implements Tables\Contracts\HasTabl
         return is_string($encoded) ? $encoded : $fallback;
     }
 
-    protected function retry(string $id): bool
+    protected function retry(string $id): void
     {
-        abort_unless(self::canAccess(), 403);
-        $result = app(ReplayDlqMessages::class)($this->queue, messageId: $id);
+        $error = $this->retryJob($id);
 
-        if ($result->replayedCount !== 1) {
-            Notification::make()->danger()->title('The job was not retried')
-                ->body($result->uncertain ? 'The transfer is uncertain. Check the destination before another replay.' : ($result->failures[0]['error'] ?? ($result->incomplete ? 'The search is incomplete.' : 'The message was not found.')))->send();
+        if ($error !== null) {
+            Notification::make()->danger()->title('The job was not retried')->body($error)->send();
 
-            return false;
+            return;
         }
 
         $this->resetTable();
         Notification::make()->success()->title('The job was sent to its queue')->send();
-
-        return true;
     }
 
-    protected function forget(string $id): bool
+    protected function forget(string $id): void
     {
-        abort_unless(self::canAccess(), 403);
-        $result = app(PurgeDlqMessages::class)($this->queue, messageId: $id);
+        $error = $this->forgetJob($id);
 
-        if ($result->purgedCount !== 1) {
-            Notification::make()->danger()->title('The job was not removed')
-                ->body($result->uncertain ? 'The acknowledgement is uncertain. Refresh the queue before another action.' : ($result->error ?? ($result->incomplete ? 'The search is incomplete.' : 'The message was not found.')))->send();
+        if ($error !== null) {
+            Notification::make()->danger()->title('The job was not removed')->body($error)->send();
 
-            return false;
+            return;
         }
 
         $this->resetTable();
         Notification::make()->success()->title('The job was removed')->send();
-
-        return true;
     }
 
     protected function retryMany(Collection $records): void
     {
-        foreach ($records as $record) {
-            if (! $this->retry((string) $record['id'])) {
-                break;
-            }
-        }
+        $this->runBulk($records, fn (string $id): ?string => $this->retryJob($id), 'retried');
     }
 
     protected function forgetMany(Collection $records): void
     {
+        $this->runBulk($records, fn (string $id): ?string => $this->forgetJob($id), 'removed');
+    }
+
+    /**
+     * Replay the messages that are in the DLQ when the operator confirms.
+     *
+     * The replay action bounds one run by the DLQ scan limits. A job that fails
+     * again during the run stays in the DLQ until the next run.
+     */
+    protected function retryAll(): void
+    {
+        abort_unless(self::canAccess(), 403);
+
+        try {
+            $result = app(ReplayDlqMessages::class)($this->queue);
+        } catch (Throwable $exception) {
+            ExceptionReporter::report($exception);
+            $this->resetTable();
+            Notification::make()
+                ->danger()
+                ->title('Retry all did not finish')
+                ->body('Some jobs may already be back in their queue. Check the logs for details.')
+                ->send();
+
+            return;
+        }
+
+        $this->resetTable();
+
+        if ($result->replayedCount === 0 && ! $result->hasFailures()) {
+            Notification::make()->info()->title('There are no jobs to retry')->send();
+
+            return;
+        }
+
+        $notification = Notification::make()
+            ->title('Retried '.$result->replayedCount.' '.Str::plural('job', $result->replayedCount));
+
+        if ($result->hasFailures()) {
+            ($result->replayedCount === 0 ? $notification->danger() : $notification->warning())
+                ->body($result->uncertain
+                    ? 'Retry all stopped. The transfer of one job is uncertain. Check the destination before another replay.'
+                    : 'Retry all stopped because a job was not sent: '.$result->failures[0]['error']);
+        } elseif ($result->incomplete) {
+            $notification->warning()->body('Some jobs remain. Run retry all again to continue.');
+        } else {
+            $notification->success();
+        }
+
+        $notification->send();
+    }
+
+    protected function retryAllDescription(): string
+    {
+        try {
+            $count = app(ReplayDlqMessages::class)->getQueueMessageCount($this->queue);
+        } catch (Throwable $exception) {
+            ExceptionReporter::report($exception);
+
+            return 'This sends every job in this dead-letter queue back to its queue.';
+        }
+
+        $description = 'This sends '.$count.' '.Str::plural('job', $count).' from this dead-letter queue back to their queue.';
+        $maximum = max(1, (int) config('rabbitmq.dlq.max_scan_messages', 1000));
+
+        if ($count > $maximum) {
+            $description .= ' One run retries at most '.$maximum.' jobs.';
+        }
+
+        return $description;
+    }
+
+    /**
+     * Run a bulk action and send one notification for the whole selection.
+     * One notification per record can exceed the Livewire call limit.
+     *
+     * @param  callable(string): ?string  $operation  Returns an error, or null on success
+     */
+    protected function runBulk(Collection $records, callable $operation, string $verb): void
+    {
+        $done = 0;
+        $error = null;
+
         foreach ($records as $record) {
-            if (! $this->forget((string) $record['id'])) {
+            $error = $operation((string) $record['id']);
+
+            if ($error !== null) {
                 break;
             }
+
+            $done++;
         }
+
+        $this->resetTable();
+
+        $total = $records->count();
+        $notification = Notification::make()
+            ->title(ucfirst($verb).' '.$done.' of '.$total.' '.Str::plural('job', $total));
+
+        if ($error === null) {
+            $notification->success();
+        } else {
+            ($done === 0 ? $notification->danger() : $notification->warning())
+                ->body("Stopped because a job was not {$verb}: {$error}");
+        }
+
+        $notification->send();
+    }
+
+    /**
+     * @return string|null An error for the operator, or null when the job was retried
+     */
+    protected function retryJob(string $id): ?string
+    {
+        abort_unless(self::canAccess(), 403);
+        $result = app(ReplayDlqMessages::class)($this->queue, messageId: $id);
+
+        if ($result->replayedCount === 1) {
+            return null;
+        }
+
+        return $result->uncertain
+            ? 'The transfer is uncertain. Check the destination before another replay.'
+            : ($result->failures[0]['error'] ?? ($result->incomplete ? 'The search is incomplete.' : 'The message was not found.'));
+    }
+
+    /**
+     * @return string|null An error for the operator, or null when the job was removed
+     */
+    protected function forgetJob(string $id): ?string
+    {
+        abort_unless(self::canAccess(), 403);
+        $result = app(PurgeDlqMessages::class)($this->queue, messageId: $id);
+
+        if ($result->purgedCount === 1) {
+            return null;
+        }
+
+        return $result->uncertain
+            ? 'The acknowledgement is uncertain. Refresh the queue before another action.'
+            : ($result->error ?? ($result->incomplete ? 'The search is incomplete.' : 'The message was not found.'));
     }
 
     /** @return list<string> */
