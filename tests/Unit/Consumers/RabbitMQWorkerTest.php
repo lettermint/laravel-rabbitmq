@@ -57,6 +57,60 @@ test('a new session resets the quit flag and reads the current restart marker', 
     expect($this->worker->restartRequested())->toBeFalse();
 });
 
+test('keeps running while the restart marker cannot be read', function () {
+    $this->restartCache->forever('illuminate:queue:restart', '1700000000');
+    $this->worker->startSession();
+    $store = new class extends ArrayStore
+    {
+        public bool $down = false;
+
+        public function get($key): mixed
+        {
+            if ($this->down) {
+                throw new RuntimeException('LOADING Redis is loading the dataset in memory');
+            }
+
+            return parent::get($key);
+        }
+    };
+    $store->forever('illuminate:queue:restart', '1700000000');
+    $this->worker->setCache(new Repository($store));
+
+    $store->down = true;
+    expect($this->worker->restartRequested())->toBeFalse();
+
+    $store->down = false;
+    $store->forever('illuminate:queue:restart', '1700000001');
+    expect($this->worker->restartRequested())->toBeTrue();
+});
+
+test('starts a session without the restart marker and adopts the first one it can read', function () {
+    $store = new class extends ArrayStore
+    {
+        public bool $down = true;
+
+        public function get($key): mixed
+        {
+            if ($this->down) {
+                throw new RuntimeException('Connection refused');
+            }
+
+            return parent::get($key);
+        }
+    };
+    $store->forever('illuminate:queue:restart', '1700000000');
+    $this->worker->setCache(new Repository($store));
+
+    $this->worker->startSession();
+    expect($this->worker->restartRequested())->toBeFalse();
+
+    $store->down = false;
+    expect($this->worker->restartRequested())->toBeFalse();
+
+    $store->forever('illuminate:queue:restart', '1700000001');
+    expect($this->worker->restartRequested())->toBeTrue();
+});
+
 test('a timeout stops the worker even when lifecycle callbacks fail', function (string $mode, string $marker) {
     $process = new Process([PHP_BINARY, dirname(__DIR__, 2).'/Fixtures/timeout-process.php', $mode], timeout: 15);
 

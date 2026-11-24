@@ -4,6 +4,7 @@ This file records notable changes. The project uses [Semantic Versioning](https:
 
 ## Unreleased
 
+- Keep consumers running when the queue restart marker can't be read from the cache, for example during a Redis failover. Previously the error stopped the consumer process.
 - Add optional, bounded batch consumption with typed per-item outcomes and individual broker settlement.
 - Isolate consumer tests from shared test-process memory and verify memory-limit shutdown.
 - Update the changelog through a dedicated deploy key and backfill missing published releases.
