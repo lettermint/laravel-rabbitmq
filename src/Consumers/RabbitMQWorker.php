@@ -24,15 +24,50 @@ final class RabbitMQWorker extends Worker
     // Keep the raw cache value for Laravel's restart comparison; stores can return strings.
     private mixed $restartTimestamp = null;
 
+    private bool $restartTimestampKnown = false;
+
     public function startSession(): void
     {
-        $this->restartTimestamp = $this->getTimestampOfLastQueueRestart();
         $this->shouldQuit = false;
+        $this->restartTimestampKnown = false;
+        $this->readRestartTimestamp();
     }
 
+    /**
+     * The restart marker lives in the cache, which is often Redis. A cache that is briefly unavailable, for example
+     * during a failover, must not stop the consumer: the check reports the error and answers "no restart", and the
+     * next check reads the cache again. When the session could not read its starting marker, the first successful
+     * read becomes the starting marker.
+     */
     public function restartRequested(): bool
     {
-        return $this->shouldQuit || $this->queueShouldRestart($this->restartTimestamp);
+        if ($this->shouldQuit) {
+            return true;
+        }
+
+        if (! $this->restartTimestampKnown) {
+            $this->readRestartTimestamp();
+
+            return false;
+        }
+
+        try {
+            return $this->queueShouldRestart($this->restartTimestamp);
+        } catch (Throwable $exception) {
+            ExceptionReporter::report($exception);
+
+            return false;
+        }
+    }
+
+    private function readRestartTimestamp(): void
+    {
+        try {
+            $this->restartTimestamp = $this->getTimestampOfLastQueueRestart();
+            $this->restartTimestampKnown = true;
+        } catch (Throwable $exception) {
+            ExceptionReporter::report($exception);
+        }
     }
 
     public function mayRun(WorkerOptions $options, string $connection, string $queue): bool
