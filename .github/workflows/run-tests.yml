@@ -42,7 +42,8 @@ jobs:
         stability: [prefer-lowest, prefer-stable]
         include:
           - laravel: 12.*
-            testbench: 10.*
+            # testbench-core before 10.6.1 breaks on PHPUnit 12.3+, which prefer-lowest installs.
+            testbench: ^10.5
           - laravel: 11.*
             testbench: 9.*
           - laravel: 13.*
