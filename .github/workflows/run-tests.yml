@@ -20,6 +20,15 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Composer 2.9+ refuses to install versions with security advisories, abandoned
+  # packages and (2.11+) releases still in their cooldown period. The matrix must
+  # install every supported Laravel version, and prefer-lowest must install the
+  # real lowest versions, so CI turns that blocking off. COMPOSER_NO_BLOCKING is
+  # the 2.11+ name; COMPOSER_NO_SECURITY_BLOCKING covers 2.9 and 2.10.
+  COMPOSER_NO_BLOCKING: 1
+  COMPOSER_NO_SECURITY_BLOCKING: 1
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}
@@ -33,7 +42,8 @@ jobs:
         stability: [prefer-lowest, prefer-stable]
         include:
           - laravel: 12.*
-            testbench: 10.*
+            # testbench-core before 10.6.1 breaks on PHPUnit 12.3+, which prefer-lowest installs.
+            testbench: ^10.5
           - laravel: 11.*
             testbench: 9.*
           - laravel: 13.*
